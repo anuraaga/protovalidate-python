@@ -212,12 +212,60 @@ wheels = [
 ]
 
 [[package]]
+name = "protobuf-py"
+version = "0.0.2"
+source = { editable = "../protobuf-py" }
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "buf-bin", specifier = "==1.70.0" },
+    { name = "example-plugin", editable = "../protobuf-py/examples/plugin" },
+    { name = "fix-protobuf-imports", specifier = "==0.1.7" },
+    { name = "license-header", editable = "../protobuf-py/packages/license-header" },
+    { name = "maturin", specifier = "==1.13.3" },
+    { name = "poethepoet", specifier = "==0.46.0" },
+    { name = "protobuf", specifier = "==7.35.0" },
+    { name = "protobuf-py-bench", editable = "../protobuf-py/packages/bench" },
+    { name = "protoc-gen-py", editable = "../protobuf-py/packages/protoc-gen-py" },
+    { name = "pyright", specifier = "==1.1.410" },
+    { name = "pytest", specifier = "==9.0.3" },
+    { name = "pytest-benchmark", specifier = "==5.2.3" },
+    { name = "pytest-cov", specifier = "==7.1.0" },
+    { name = "pyyaml", specifier = "==6.0.3" },
+    { name = "ruff", specifier = "==0.15.16" },
+    { name = "tombi", specifier = "==1.1.2" },
+    { name = "ty", specifier = "==0.0.44" },
+    { name = "upstream-protobuf", editable = "../protobuf-py/packages/upstream-protobuf" },
+]
+docs = [
+    { name = "mkdocstrings-python", specifier = "==2.0.4" },
+    { name = "zensical", specifier = "==0.0.44" },
+]
+
+[[package]]
+name = "protoc-gen-py"
+version = "0.0.1"
+source = { editable = "../protobuf-py/packages/protoc-gen-py" }
+dependencies = [
+    { name = "protobuf-py" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "protobuf-py", editable = "../protobuf-py" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "upstream-protobuf", editable = "../protobuf-py/packages/upstream-protobuf" }]
+
+[[package]]
 name = "protovalidate"
 source = { editable = "." }
 dependencies = [
     { name = "cel-expr-python" },
     { name = "google-re2" },
     { name = "protobuf" },
+    { name = "protobuf-py" },
 ]
 
 [package.dev-dependencies]
@@ -226,6 +274,7 @@ dev = [
     { name = "fix-protobuf-imports" },
     { name = "google-re2-stubs" },
     { name = "poethepoet" },
+    { name = "protoc-gen-py" },
     { name = "protovalidate-proto" },
     { name = "pytest" },
     { name = "pytest-benchmark" },
@@ -244,6 +293,7 @@ requires-dist = [
     { name = "google-re2", marker = "python_full_version == '3.14.*'", specifier = ">=1.1.20251105" },
     { name = "protobuf", specifier = ">=5" },
     { name = "protobuf", marker = "python_full_version >= '3.14'", specifier = ">=6.31.0" },
+    { name = "protobuf-py", editable = "../protobuf-py" },
 ]
 
 [package.metadata.requires-dev]
@@ -252,6 +302,7 @@ dev = [
     { name = "fix-protobuf-imports", specifier = "==0.1.7" },
     { name = "google-re2-stubs", specifier = "==0.1.1" },
     { name = "poethepoet", specifier = "==0.46.0" },
+    { name = "protoc-gen-py", editable = "../protobuf-py/packages/protoc-gen-py" },
     { name = "protovalidate-proto", editable = "packages/protovalidate-proto" },
     { name = "pytest", specifier = "==9.0.3" },
     { name = "pytest-benchmark", specifier = "==5.1.0" },

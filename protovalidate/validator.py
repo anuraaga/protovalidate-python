@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from google.protobuf import message
+import protobuf
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 from buf.validate import validate_pb2
 from protovalidate.internal import extra_func
@@ -25,19 +26,59 @@ Violation = _rules.Violation
 
 class Validator:
     """
-    Validates protobuf messages against static rules.
+    Validates protobuf-py messages against static rules.
 
     Each validator instance caches internal state generated from the static
     rules, so reusing the same instance for multiple validations
     significantly improves performance.
+
+    The rule engine evaluates CEL through cel-expr-python, which only ingests
+    ``google.protobuf`` descriptor pools and messages. Each validated message
+    type is therefore mirrored once into a private ``google.protobuf`` pool
+    (cold path), and every validated message crosses the boundary by a
+    serialize/parse round trip (hot path).
     """
 
     _factory: _rules.RuleFactory
 
     def __init__(self):
-        self._factory = _rules.RuleFactory(extra_func.make_extension())
+        # The bridge pool must be the process-wide default: google.protobuf
+        # parses descriptor options (where validation rules live) against the
+        # default pool only, so extensions mirrored anywhere else — notably
+        # predefined rules — would come back as unknown fields. The mirror
+        # therefore mutates global state, skipping files already present.
+        self._pool = descriptor_pool.Default()
+        self._factory = _rules.RuleFactory(extra_func.make_extension(), self._pool)
+        self._mirrored: set[str] = set()
+        self._classes: dict[str, type] = {}
 
-    def validate(self, message: message.Message, *, fail_fast: bool = False):
+    def _bridge(self, message: protobuf.Message):
+        """Re-creates a protobuf-py message as a google.protobuf message."""
+        desc = type(message).desc()
+        cls = self._classes.get(desc.type_name)
+        if cls is None:
+            self._mirror_file(desc.file)
+            google_desc = self._pool.FindMessageTypeByName(desc.type_name)
+            cls = message_factory.GetMessageClass(google_desc)
+            self._classes[desc.type_name] = cls
+        bridged = cls()
+        bridged.ParseFromString(message.to_binary())
+        return bridged
+
+    def _mirror_file(self, desc_file) -> None:
+        if desc_file.name in self._mirrored:
+            return
+        # Proto imports are acyclic; dependencies register first.
+        for dep in desc_file.dependencies:
+            self._mirror_file(dep)
+        try:
+            self._pool.FindFileByName(desc_file.name)
+        except KeyError:
+            proto = descriptor_pb2.FileDescriptorProto.FromString(desc_file.proto.to_binary())
+            self._pool.Add(proto)
+        self._mirrored.add(desc_file.name)
+
+    def validate(self, message: protobuf.Message, *, fail_fast: bool = False):
         """
         Validates the given message against the static rules defined in
         the message's descriptor.
@@ -52,12 +93,12 @@ class Validator:
         """
         violations = self.collect_violations(message, fail_fast=fail_fast)
         if len(violations) > 0:
-            msg = f"invalid {message.DESCRIPTOR.name}"
+            msg = f"invalid {type(message).desc().name}"
             raise ValidationError(msg, violations)
 
     def collect_violations(
         self,
-        message: message.Message,
+        message: protobuf.Message,
         *,
         fail_fast: bool = False,
     ) -> list[Violation]:
@@ -76,9 +117,10 @@ class Validator:
         Raises:
             CompilationError: If the static rules could not be compiled.
         """
+        bridged = self._bridge(message)
         ctx = _rules.RuleContext(fail_fast=fail_fast)
-        for rule in self._factory.get(message.DESCRIPTOR):
-            rule.validate(ctx, message)
+        for rule in self._factory.get(bridged.DESCRIPTOR):
+            rule.validate(ctx, bridged)
             if ctx.done:
                 break
         for violation in ctx.violations:

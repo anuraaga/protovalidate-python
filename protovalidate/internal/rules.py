@@ -811,9 +811,13 @@ class RuleFactory:
     _env: cel.Env
     _cache: dict[descriptor.Descriptor, list[Rules] | Exception]
 
-    def __init__(self, extension: cel.CelExtensionBase):
+    def __init__(
+        self,
+        extension: cel.CelExtensionBase,
+        pool: descriptor_pool.DescriptorPool | None = None,
+    ):
         self._env = cel.NewEnv(
-            descriptor_pool=descriptor_pool.Default(),
+            descriptor_pool=pool if pool is not None else descriptor_pool.Default(),
             variables={
                 "this": cel.Type.DYN,
                 "rules": cel.Type.DYN,

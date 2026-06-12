@@ -26,11 +26,15 @@ dependencies = [
   "google-re2>=1.1.20251105; python_version == '3.14'",
   # 1.1 started supporting 3.12.
   "google-re2>=1.1; python_version == '3.12'",
+  # google-protobuf remains required: cel-expr-python only ingests
+  # google.protobuf descriptor pools and messages, so protobuf-py values are
+  # bridged through it at the validation boundary.
   "protobuf>=5",
   # We need at least this version, which fixed Python 3.14 compatibility (tp_new metaclass issue).
   # The fix was never backported to the 5.x series.
   # Ref: https://github.com/protocolbuffers/protobuf/pull/20594
   "protobuf>=6.31.0; python_version >= '3.14'",
+  "protobuf-py",
 ]
 dynamic = ["version"]
 
@@ -46,6 +50,7 @@ dev = [
 
   "buf-bin==1.70.0",
   "fix-protobuf-imports==0.1.7",
+  "protoc-gen-py",
   "google-re2-stubs==0.1.1",
   "poethepoet==0.46.0",
   "pytest==9.0.3",
@@ -128,6 +133,8 @@ known-first-party = ["protovalidate", "buf"]
 "test/**/*" = ["S101"]
 
 [tool.uv.sources]
+protobuf-py = { path = "../protobuf-py", editable = true }
+protoc-gen-py = { path = "../protobuf-py/packages/protoc-gen-py", editable = true }
 protovalidate = { workspace = true }
 protovalidate-proto = { workspace = true }
 

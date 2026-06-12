@@ -13,99 +13,72 @@
 # limitations under the License.
 
 import sys
-import typing
 
-from google.protobuf import any_pb2, descriptor, descriptor_pool, message_factory
+import protobuf
+from protobuf import Oneof, Registry
+from protobuf import wkt as pb_wkt
 
 import protovalidate
-from buf.validate.conformance.cases import (
-    bool_pb2,  # noqa: F401
-    bytes_pb2,  # noqa: F401
-    enums_pb2,  # noqa: F401
-    filename_with_dash_pb2,  # noqa: F401
-    groups_editions_pb2,  # noqa: F401
-    groups_proto2_pb2,  # noqa: F401
-    ignore_empty_proto2_pb2,  # noqa: F401
-    ignore_empty_proto3_pb2,  # noqa: F401
-    ignore_empty_proto_editions_pb2,  # noqa: F401
-    ignore_proto2_pb2,  # noqa: F401
-    ignore_proto3_pb2,  # noqa: F401
-    ignore_proto_editions_pb2,  # noqa: F401
-    kitchen_sink_pb2,  # noqa: F401
-    library_pb2,  # noqa: F401
-    maps_pb2,  # noqa: F401
-    messages_pb2,  # noqa: F401
-    numbers_pb2,  # noqa: F401
-    oneofs_pb2,  # noqa: F401
-    predefined_rules_proto2_pb2,  # noqa: F401
-    predefined_rules_proto3_pb2,  # noqa: F401
-    predefined_rules_proto_editions_pb2,  # noqa: F401
-    repeated_pb2,  # noqa: F401
-    required_field_proto2_pb2,  # noqa: F401
-    required_field_proto3_pb2,  # noqa: F401
-    required_field_proto_editions_pb2,  # noqa: F401
-    strings_pb2,  # noqa: F401
-    wkt_any_pb2,  # noqa: F401
-    wkt_duration_pb2,  # noqa: F401
-    wkt_nested_pb2,  # noqa: F401
-    wkt_timestamp_pb2,  # noqa: F401
-    wkt_wrappers_pb2,  # noqa: F401
-)
-from buf.validate.conformance.cases.custom_rules import custom_rules_pb2  # noqa: F401
-from buf.validate.conformance.harness import harness_pb2
+from buf.validate import validate_pb, validate_pb2
+from buf.validate.conformance.harness import harness_pb
 
 
-def run_test_case(tc: typing.Any, result: harness_pb2.TestResult | None = None) -> harness_pb2.TestResult:
-    if result is None:
-        result = harness_pb2.TestResult()
+def run_test_case(tc: protobuf.Message, result: harness_pb.TestResult) -> harness_pb.TestResult:
     # Run the validator
     try:
         violations = protovalidate.collect_violations(tc)
-        for violation in violations:
-            result.validation_error.violations.append(violation.proto)
-        if len(result.validation_error.violations) == 0:
-            result.success = True
+        if len(violations) > 0:
+            # The validator's violations are google.protobuf messages (the
+            # rule engine side of the bridge); cross back by serialization.
+            google_violations = validate_pb2.Violations(violations=[violation.proto for violation in violations])
+            result.result = Oneof(
+                field="validation_error",
+                value=validate_pb.Violations.from_binary(google_violations.SerializeToString(deterministic=True)),
+            )
+        else:
+            result.result = Oneof(field="success", value=True)
     except RuntimeError as e:
-        result.runtime_error = str(e)
+        result.result = Oneof(field="runtime_error", value=str(e))
     except protovalidate.CompilationError as e:
-        result.compilation_error = str(e)
+        result.result = Oneof(field="compilation_error", value=str(e))
     except Exception as e:
-        result.unexpected_error = str(e)
+        result.result = Oneof(field="unexpected_error", value=str(e))
     return result
 
 
 def run_any_test_case(
-    pool: descriptor_pool.DescriptorPool,
-    tc: any_pb2.Any,
-    result: harness_pb2.TestResult | None = None,
-) -> harness_pb2.TestResult:
+    registry: Registry,
+    tc: pb_wkt.Any,
+    result: harness_pb.TestResult,
+) -> harness_pb.TestResult:
     type_name = tc.type_url.split("/")[-1]
-    desc: descriptor.Descriptor = pool.FindMessageTypeByName(type_name)
-    # Create a message from the protobuf descriptor
-    msg = message_factory.GetMessageClass(desc)()
-    tc.Unpack(msg)
+    desc = registry.message(type_name)
+    if desc is None:
+        result.result = Oneof(field="unexpected_error", value=f"unknown type: {type_name}")
+        return result
+    msg = tc.unpack(desc)
+    if msg is None:
+        result.result = Oneof(field="unexpected_error", value=f"cannot unpack {tc.type_url}")
+        return result
     return run_test_case(msg, result)
 
 
 def run_conformance_test(
-    request: harness_pb2.TestConformanceRequest,
-) -> harness_pb2.TestConformanceResponse:
-    pool = descriptor_pool.DescriptorPool()
-    for fd in request.fdset.file:
-        pool.Add(fd)
-    result = harness_pb2.TestConformanceResponse()
+    request: harness_pb.TestConformanceRequest,
+) -> harness_pb.TestConformanceResponse:
+    registry = request.fdset.to_registry()
+    response = harness_pb.TestConformanceResponse()
     for name, tc in request.cases.items():
-        run_any_test_case(pool, tc, result.results[name])
-    return result
+        response.results[name] = run_any_test_case(registry, tc, harness_pb.TestResult())
+    return response
 
 
 if __name__ == "__main__":
     # Read a serialized TestConformanceRequest from stdin
-    request = harness_pb2.TestConformanceRequest()
-    request.ParseFromString(sys.stdin.buffer.read())
+    request = harness_pb.TestConformanceRequest.from_binary(sys.stdin.buffer.read())
     # Run the test
     result = run_conformance_test(request)
     # Write a serialized TestConformanceResponse to stdout
-    sys.stdout.buffer.write(result.SerializeToString())
+    sys.stdout.buffer.write(result.to_binary())
     sys.stdout.flush()
     sys.exit(0)

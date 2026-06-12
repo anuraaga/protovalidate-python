@@ -6,3 +6,6 @@ plugins:
       out: src
     - remote: buf.build/protocolbuffers/pyi:v26.0
       out: src
+    # protobuf-py gencode (`*_pb.py`), side by side with `*_pb2.py`.
+    - local: protoc-gen-py
+      out: src
