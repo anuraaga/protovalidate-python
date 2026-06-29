@@ -86,8 +86,8 @@ def gen_complex(depth: int) -> BenchComplexSchema:
         f64=random.randint(1, 999),
         sf32=random.randint(1, 100),
         sf64=random.randint(1, 999),
-        fl=random.randint(1, 100),
-        db=random.randint(1, 100),
+        fl=float(random.randint(1, 100)),
+        db=float(random.randint(1, 100)),
         bl=True,
         by=gen_bytes(8, 7),
         nested=BenchScalar(x=random.randint(1, 100)),
@@ -172,8 +172,8 @@ cases = [
     param(
         lambda: WrapperTesting(
             i32=Int32Value(value=11),
-            d=DoubleValue(value=11),
-            f=FloatValue(value=11),
+            d=DoubleValue(value=11.0),
+            f=FloatValue(value=11.0),
             i64=Int64Value(value=11),
             u64=UInt64Value(value=11),
             u32=UInt32Value(value=11),

@@ -8,5 +8,5 @@ plugins:
     - remote: buf.build/protocolbuffers/pyi:v26.0
       out: gen
     # protobuf-py gencode (`*_pb.py`), side by side with `*_pb2.py`.
-    - local: protoc-gen-py
+    - remote: buf.build/bufbuild/py:v0.1.1
       out: gen
