@@ -48,16 +48,16 @@ Source = "https://github.com/bufbuild/protovalidate-python"
 dev = [
   "protovalidate-proto",
 
-  "buf-bin==1.70.0",
+  "buf-bin==1.71.0",
   "fix-protobuf-imports==0.1.7",
-  "protoc-gen-py",
   "google-re2-stubs==0.1.1",
   "poethepoet==0.46.0",
-  "pytest==9.0.3",
-  "pytest-benchmark==5.1.0",
-  "ruff==0.15.16",
-  "tombi==1.1.2",
-  "ty==0.0.44",
+  "protoc-gen-py",
+  "pytest==9.1.1",
+  "pytest-benchmark==5.2.3",
+  "ruff==0.15.18",
+  "tombi==1.1.4",
+  "ty==0.0.51",
   "types-protobuf==6.32.1.20260221",
 ]
 
@@ -72,6 +72,7 @@ raw-options = { fallback_version = "0.0.0" }
 [tool.pytest]
 addopts = [
   "--benchmark-disable",
+  "--benchmark-group-by=func,param:_id",
 ]
 # Turn all warnings into errors,
 # except DeprecationWarnings (which we knowingly tolerate due to using old `protobuf` APIs).

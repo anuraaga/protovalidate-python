@@ -16,8 +16,12 @@ go run github.com/bufbuild/buf/private/pkg/licenseheader/cmd/license-header@v1.6
 """
 
 [tasks.bench]
-help = "Run CEL evaluation benchmarks"
-cmd = "pytest --benchmark-enable --benchmark-only"
+help = "Run benchmarks"
+cmd = "pytest --benchmark-enable --benchmark-only --benchmark-autosave"
+
+[tasks.bench-compare]
+help = "Compare saved benchmark runs"
+cmd = "pytest-benchmark compare --group-by=func,param:_id --sort=name"
 
 [tasks.check]
 help = "Run code checks"
@@ -37,6 +41,7 @@ sequence = [
   "generate-protovalidate",
   "generate-test",
   "add-license-header",
+  "format-protos",
 ]
 
 [tasks.generate-cel]
