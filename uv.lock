@@ -9,12 +9,6 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
-[manifest]
-members = [
-    "protovalidate",
-    "protovalidate-proto",
-]
-
 [[package]]
 name = "buf-bin"
 version = "1.71.0"
@@ -287,7 +281,6 @@ dev = [
     { name = "google-re2-stubs" },
     { name = "poethepoet" },
     { name = "protoc-gen-py" },
-    { name = "protovalidate-proto" },
     { name = "pytest" },
     { name = "pytest-benchmark" },
     { name = "ruff" },
@@ -315,7 +308,6 @@ dev = [
     { name = "google-re2-stubs", specifier = "==0.1.1" },
     { name = "poethepoet", specifier = "==0.46.0" },
     { name = "protoc-gen-py", editable = "../protobuf-py/packages/protoc-gen-py" },
-    { name = "protovalidate-proto", editable = "packages/protovalidate-proto" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "pytest-benchmark", specifier = "==5.2.3" },
     { name = "ruff", specifier = "==0.15.18" },
@@ -323,11 +315,6 @@ dev = [
     { name = "ty", specifier = "==0.0.51" },
     { name = "types-protobuf", specifier = "==6.32.1.20260221" },
 ]
-
-[[package]]
-name = "protovalidate-proto"
-version = "0.1.0"
-source = { editable = "packages/protovalidate-proto" }
 
 [[package]]
 name = "py-cpuinfo"

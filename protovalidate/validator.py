@@ -13,14 +13,14 @@
 # limitations under the License.
 
 import protobuf
-from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
-from buf.validate import validate_pb2
+from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal import extra_func
 from protovalidate.internal import rules as _rules
+from protovalidate.internal._bridge import GoogleBridge
 
 CompilationError = _rules.CompilationError
-Violations = validate_pb2.Violations
+Violations = validate_pb.Violations
 Violation = _rules.Violation
 
 
@@ -32,51 +32,21 @@ class Validator:
     rules, so reusing the same instance for multiple validations
     significantly improves performance.
 
-    The rule engine evaluates CEL through cel-expr-python, which only ingests
-    ``google.protobuf`` descriptor pools and messages. Each validated message
-    type is therefore mirrored once into a private ``google.protobuf`` pool
-    (cold path), and every validated message crosses the boundary by a
-    serialize/parse round trip (hot path).
+    Rules are discovered from protobuf-py descriptors (the ``buf.validate``
+    options are read off the relocatable protobuf-py stub, so nothing is
+    registered in google's global pool for discovery). The rule engine then
+    evaluates CEL through cel-expr-python, which only ingests
+    ``google.protobuf`` pools and messages, so each validated message type is
+    mirrored once into the global ``google.protobuf`` pool (cold path) and
+    every validated message crosses the boundary by a serialize/parse round
+    trip (hot path) — see :class:`GoogleBridge`.
     """
 
     _factory: _rules.RuleFactory
 
     def __init__(self):
-        # The bridge pool must be the process-wide default: google.protobuf
-        # parses descriptor options (where validation rules live) against the
-        # default pool only, so extensions mirrored anywhere else — notably
-        # predefined rules — would come back as unknown fields. The mirror
-        # therefore mutates global state, skipping files already present.
-        self._pool = descriptor_pool.Default()
-        self._factory = _rules.RuleFactory(extra_func.make_extension(), self._pool)
-        self._mirrored: set[str] = set()
-        self._classes: dict[str, type] = {}
-
-    def _bridge(self, message: protobuf.Message):
-        """Re-creates a protobuf-py message as a google.protobuf message."""
-        desc = type(message).desc()
-        cls = self._classes.get(desc.type_name)
-        if cls is None:
-            self._mirror_file(desc.file)
-            google_desc = self._pool.FindMessageTypeByName(desc.type_name)
-            cls = message_factory.GetMessageClass(google_desc)
-            self._classes[desc.type_name] = cls
-        bridged = cls()
-        bridged.ParseFromString(message.to_binary())
-        return bridged
-
-    def _mirror_file(self, desc_file) -> None:
-        if desc_file.name in self._mirrored:
-            return
-        # Proto imports are acyclic; dependencies register first.
-        for dep in desc_file.dependencies:
-            self._mirror_file(dep)
-        try:
-            self._pool.FindFileByName(desc_file.name)
-        except KeyError:
-            proto = descriptor_pb2.FileDescriptorProto.FromString(desc_file.proto.to_binary())
-            self._pool.Add(proto)
-        self._mirrored.add(desc_file.name)
+        self._bridge = GoogleBridge()
+        self._factory = _rules.RuleFactory(extra_func.make_extension(), self._bridge)
 
     def validate(self, message: protobuf.Message, *, fail_fast: bool = False):
         """
@@ -117,17 +87,14 @@ class Validator:
         Raises:
             CompilationError: If the static rules could not be compiled.
         """
-        bridged = self._bridge(message)
+        bridged = self._bridge.to_google(message)
         ctx = _rules.RuleContext(fail_fast=fail_fast)
-        for rule in self._factory.get(bridged.DESCRIPTOR):
+        for rule in self._factory.get(type(message).desc()):
             rule.validate(ctx, bridged)
             if ctx.done:
                 break
         for violation in ctx.violations:
-            if violation.proto.HasField("field"):
-                violation.proto.field.elements.reverse()
-            if violation.proto.HasField("rule"):
-                violation.proto.rule.elements.reverse()
+            violation.finalize_paths()
         return ctx.violations
 
 
@@ -142,11 +109,11 @@ class ValidationError(ValueError):
         super().__init__(msg)
         self._violations = violations
 
-    def to_proto(self) -> validate_pb2.Violations:
+    def to_proto(self) -> validate_pb.Violations:
         """
         Provides the Protobuf form of the validation errors.
         """
-        return validate_pb2.Violations(violations=[violation.proto for violation in self._violations])
+        return validate_pb.Violations(violations=[violation.proto for violation in self._violations])
 
     @property
     def violations(self) -> list[Violation]:

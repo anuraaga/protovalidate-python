@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
+
+# The buf.validate stubs (including the conformance harness) live in test/gen;
+# put it on the path before the `buf` imports so the top-level `buf` package
+# resolves there.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gen"))
 
 import protobuf
 from protobuf import Oneof, Registry
 from protobuf import wkt as pb_wkt
 
 import protovalidate
-from buf.validate import validate_pb, validate_pb2
+from buf.validate import validate_pb
 from buf.validate.conformance.harness import harness_pb
 
 
@@ -28,12 +34,12 @@ def run_test_case(tc: protobuf.Message, result: harness_pb.TestResult) -> harnes
     try:
         violations = protovalidate.collect_violations(tc)
         if len(violations) > 0:
-            # The validator's violations are google.protobuf messages (the
-            # rule engine side of the bridge); cross back by serialization.
-            google_violations = validate_pb2.Violations(violations=[violation.proto for violation in violations])
+            # protovalidate bundles its own relocatable validate_pb stub, a
+            # distinct class identity from the harness gen here; cross by binary.
+            pv_violations = protovalidate.Violations(violations=[violation.proto for violation in violations])
             result.result = Oneof(
                 field="validation_error",
-                value=validate_pb.Violations.from_binary(google_violations.SerializeToString(deterministic=True)),
+                value=validate_pb.Violations.from_binary(pv_violations.to_binary()),
             )
         else:
             result.result = Oneof(field="success", value=True)

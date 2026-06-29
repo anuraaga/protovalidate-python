@@ -32,11 +32,12 @@ def test_ninf(validator):
     msg = validations_pb.DoubleFinite()
     msg.val = float("-inf")
 
-    expected_violation = rules.Violation()
-    expected_violation.proto.message = "must be finite"
-    expected_violation.proto.rule_id = "double.finite"
-    expected_violation.field_value = msg.val
-    expected_violation.rule_value = True
+    expected_violation = rules.Violation(
+        message="must be finite",
+        rule_id="double.finite",
+        field_value=msg.val,
+        rule_value=True,
+    )
 
     check_invalid(validator, msg, [expected_violation])
 
@@ -46,12 +47,13 @@ def test_map_key(validator):
     msg = validations_pb.MapKeys()
     msg.val[1] = "a"
 
-    expected_violation = rules.Violation()
-    expected_violation.proto.message = "must be less than 0"
-    expected_violation.proto.rule_id = "sint64.lt"
-    expected_violation.proto.for_key = True
-    expected_violation.field_value = 1
-    expected_violation.rule_value = 0
+    expected_violation = rules.Violation(
+        message="must be less than 0",
+        rule_id="sint64.lt",
+        for_key=True,
+        field_value=1,
+        rule_value=0,
+    )
 
     check_invalid(validator, msg, [expected_violation])
 
@@ -84,9 +86,7 @@ def test_protovalidate_oneof_violation(validator):
     msg.a = "A"
     msg.b = "B"
 
-    expected_violation = rules.Violation()
-    expected_violation.proto.message = "only one of a, b can be set"
-    expected_violation.proto.rule_id = "message.oneof"
+    expected_violation = rules.Violation(message="only one of a, b can be set", rule_id="message.oneof")
 
     check_invalid(validator, msg, [expected_violation])
 
@@ -95,9 +95,7 @@ def test_protovalidate_oneof_violation(validator):
 def test_protovalidate_oneof_required_violation(validator):
     msg = validations_pb.ProtovalidateOneofRequired()
 
-    expected_violation = rules.Violation()
-    expected_violation.proto.message = "one of a, b must be set"
-    expected_violation.proto.rule_id = "message.oneof"
+    expected_violation = rules.Violation(message="one of a, b must be set", rule_id="message.oneof")
 
     check_invalid(validator, msg, [expected_violation])
 
@@ -123,11 +121,12 @@ def test_repeated(validator):
 def test_maps(validator):
     msg = validations_pb.MapMinMax()
 
-    expected_violation = rules.Violation()
-    expected_violation.proto.message = "map must be at least 2 entries"
-    expected_violation.proto.rule_id = "map.min_pairs"
-    expected_violation.field_value = {}
-    expected_violation.rule_value = 2
+    expected_violation = rules.Violation(
+        message="map must be at least 2 entries",
+        rule_id="map.min_pairs",
+        field_value={},
+        rule_value=2,
+    )
 
     check_invalid(validator, msg, [expected_violation])
 
@@ -146,17 +145,19 @@ def test_multiple_validations(validator):
     msg.title = "bar"
     msg.name = "blah"
 
-    expected_violation1 = rules.Violation()
-    expected_violation1.proto.message = "does not have prefix `foo`"
-    expected_violation1.proto.rule_id = "string.prefix"
-    expected_violation1.field_value = msg.title
-    expected_violation1.rule_value = "foo"
+    expected_violation1 = rules.Violation(
+        message="does not have prefix `foo`",
+        rule_id="string.prefix",
+        field_value=msg.title,
+        rule_value="foo",
+    )
 
-    expected_violation2 = rules.Violation()
-    expected_violation2.proto.message = "must be at least 5 characters"
-    expected_violation2.proto.rule_id = "string.min_len"
-    expected_violation2.field_value = msg.name
-    expected_violation2.rule_value = 5
+    expected_violation2 = rules.Violation(
+        message="must be at least 5 characters",
+        rule_id="string.min_len",
+        field_value=msg.name,
+        rule_value=5,
+    )
 
     check_invalid(validator, msg, [expected_violation1, expected_violation2])
 
@@ -178,11 +179,12 @@ def test_fail_fast(validator):
     msg.title = "bar"
     msg.name = "blah"
 
-    expected_violation = rules.Violation()
-    expected_violation.proto.message = "does not have prefix `foo`"
-    expected_violation.proto.rule_id = "string.prefix"
-    expected_violation.field_value = msg.title
-    expected_violation.rule_value = "foo"
+    expected_violation = rules.Violation(
+        message="does not have prefix `foo`",
+        rule_id="string.prefix",
+        field_value=msg.title,
+        rule_value="foo",
+    )
 
     # Test validate
     with pytest.raises(protovalidate.ValidationError) as cm:

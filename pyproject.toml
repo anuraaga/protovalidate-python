@@ -46,8 +46,6 @@ Source = "https://github.com/bufbuild/protovalidate-python"
 
 [dependency-groups]
 dev = [
-  "protovalidate-proto",
-
   "buf-bin==1.71.0",
   "fix-protobuf-imports==0.1.7",
   "google-re2-stubs==0.1.1",
@@ -85,7 +83,6 @@ testpaths = ["test"]
 line-length = 120
 exclude = [
   # Protobuf generated code
-  "packages/protovalidate-proto/src/**",
   "test/gen/**",
 ]
 
@@ -136,10 +133,3 @@ known-first-party = ["protovalidate", "buf"]
 [tool.uv.sources]
 protobuf-py = { path = "../protobuf-py", editable = true }
 protoc-gen-py = { path = "../protobuf-py/packages/protoc-gen-py", editable = true }
-protovalidate = { workspace = true }
-protovalidate-proto = { workspace = true }
-
-[tool.uv.workspace]
-members = [
-  "packages/protovalidate-proto",
-]
