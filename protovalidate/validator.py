@@ -12,33 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from google.protobuf import message
+import protobuf
 
-from buf.validate import validate_pb2
+from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal import extra_func
 from protovalidate.internal import rules as _rules
+from protovalidate.internal._bridge import GoogleBridge
 
 CompilationError = _rules.CompilationError
-Violations = validate_pb2.Violations
+Violations = validate_pb.Violations
 Violation = _rules.Violation
 
 
 class Validator:
     """
-    Validates protobuf messages against static rules.
+    Validates protobuf-py messages against static rules.
 
     Each validator instance caches internal state generated from the static
     rules, so reusing the same instance for multiple validations
     significantly improves performance.
+
+    Rules are discovered from protobuf-py descriptors (the ``buf.validate``
+    options are read off the relocatable protobuf-py stub, so nothing is
+    registered in google's global pool for discovery). The rule engine then
+    evaluates CEL through cel-expr-python, which only ingests
+    ``google.protobuf`` pools and messages, so each validated message type is
+    mirrored once into the global ``google.protobuf`` pool (cold path) and
+    every validated message crosses the boundary by a serialize/parse round
+    trip (hot path) — see :class:`GoogleBridge`.
     """
 
     _factory: _rules.RuleFactory
 
     def __init__(self):
-        funcs = extra_func.make_extra_funcs()
-        self._factory = _rules.RuleFactory(funcs)
+        self._bridge = GoogleBridge()
+        self._factory = _rules.RuleFactory(extra_func.make_extension(), self._bridge)
 
-    def validate(self, message: message.Message, *, fail_fast: bool = False):
+    def validate(self, message: protobuf.Message, *, fail_fast: bool = False):
         """
         Validates the given message against the static rules defined in
         the message's descriptor.
@@ -53,12 +63,12 @@ class Validator:
         """
         violations = self.collect_violations(message, fail_fast=fail_fast)
         if len(violations) > 0:
-            msg = f"invalid {message.DESCRIPTOR.name}"
+            msg = f"invalid {type(message).desc().name}"
             raise ValidationError(msg, violations)
 
     def collect_violations(
         self,
-        message: message.Message,
+        message: protobuf.Message,
         *,
         fail_fast: bool = False,
     ) -> list[Violation]:
@@ -77,16 +87,14 @@ class Validator:
         Raises:
             CompilationError: If the static rules could not be compiled.
         """
+        bridged = self._bridge.to_google(message)
         ctx = _rules.RuleContext(fail_fast=fail_fast)
-        for rule in self._factory.get(message.DESCRIPTOR):
-            rule.validate(ctx, message)
+        for rule in self._factory.get(type(message).desc()):
+            rule.validate(ctx, bridged)
             if ctx.done:
                 break
         for violation in ctx.violations:
-            if violation.proto.HasField("field"):
-                violation.proto.field.elements.reverse()
-            if violation.proto.HasField("rule"):
-                violation.proto.rule.elements.reverse()
+            violation.finalize_paths()
         return ctx.violations
 
 
@@ -101,11 +109,11 @@ class ValidationError(ValueError):
         super().__init__(msg)
         self._violations = violations
 
-    def to_proto(self) -> validate_pb2.Violations:
+    def to_proto(self) -> validate_pb.Violations:
         """
         Provides the Protobuf form of the validation errors.
         """
-        return validate_pb2.Violations(violations=[violation.proto for violation in self._violations])
+        return validate_pb.Violations(violations=[violation.proto for violation in self._violations])
 
     @property
     def violations(self) -> list[Violation]:

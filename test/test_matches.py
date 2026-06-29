@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import celpy
-from celpy import celtypes
+from cel_expr_python import cel
+from google.protobuf import descriptor_pool
 
-from protovalidate.internal.extra_func import cel_matches
+_env = cel.NewEnv(descriptor_pool=descriptor_pool.Default())
 
 
 def test_function_matches_re2():
-    empty_string = celtypes.StringType("")
-    # \z is valid re2 syntax for end of text
-    assert cel_matches(empty_string, "^\\z")
-    # \Z is invalid re2 syntax
-    assert isinstance(cel_matches(empty_string, "^\\Z"), celpy.CELEvalError)
+    # The runtime must evaluate matches() with RE2, which the protovalidate
+    # spec requires. \z is valid RE2 syntax for end of text.
+    result = _env.compile("''.matches('^\\\\z')").eval()
+    assert result.plain_value() is True
+    # \Z is invalid RE2 syntax, so evaluation must fail.
+    result = _env.compile("''.matches('^\\\\Z')").eval()
+    assert result.type() == cel.Type.ERROR

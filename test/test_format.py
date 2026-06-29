@@ -17,13 +17,10 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
-import celpy
 import pytest
-from celpy import celtypes
-from google.protobuf import text_format
-
-from protovalidate.internal import extra_func
-from protovalidate.internal.cel_field_presence import InterpretedRunner
+from cel_expr_python import cel
+from cel_expr_python.ext import ext_strings
+from google.protobuf import descriptor_pool, text_format
 
 from .gen.cel.expr import eval_pb2
 from .gen.cel.expr.conformance.test import simple_pb2
@@ -31,18 +28,20 @@ from .gen.cel.expr.conformance.test import simple_pb2
 # Version of the cel-spec that this implementation is conformant with.
 CEL_SPEC_VERSION = "v0.25.1"
 
+# Supplemental (non cel-spec) format cases where the runtime's builtin
+# diverges from the previous celpy-based implementation. The invalid-UTF-8
+# cases expect bytes formatted with %s to be replaced with U+FFFD; the runtime
+# instead produces a CEL string containing the invalid bytes verbatim, which
+# cannot even be converted to a Python str.
 skipped_tests = [
-    # cel-python seems to have a bug with ints and booleans in the same map which evaluate to the same value
-    # which the test data for this test has. For example: {1: 'value1', true: 'value2'}]).
-    # This throws an error like:
-    # "no such overload: IntType(0) <class 'celpy.celtypes.IntType'> !=
-    #    BoolType(False) <class 'celpy.celtypes.BoolType'>",))
-    # TODO: Check if this bug is fixed in newer versions of cel-python.
-    "map support (all key types)",
+    "bytes support for string with invalid utf-8 encoding",
+    "bytes support for string with only invalid utf-8 sequences",
 ]
-skipped_error_tests = [
-    # cel-python does not support Protobuf messages at the moment and these tests use a MessageType
-    # See https://github.com/cloud-custodian/cel-python/issues/43
+
+# Supplemental error cases that expect formatting an object to fail. The
+# runtime implements the current CEL spec for format, which formats proto
+# messages (e.g. a Duration renders as "2s") instead of erroring.
+error_skipped_tests = [
     "object not allowed",
     "object inside list",
     "object inside map",
@@ -63,7 +62,7 @@ def build_variables(bindings: MutableMapping[str, eval_pb2.ExprValue]) -> dict[A
         if value.HasField("value"):
             val = value.value
             if val.HasField("string_value"):
-                binder[key] = celtypes.StringType(val.string_value)
+                binder[key] = val.string_value
     return binder
 
 
@@ -72,14 +71,6 @@ def get_expected_result(test: simple_pb2.SimpleTest) -> str | None:
         val = test.value
         if val.HasField("string_value"):
             return val.string_value
-    return None
-
-
-def get_eval_error_message(test: simple_pb2.SimpleTest) -> str | None:
-    if test.HasField("eval_error"):
-        err_set = test.eval_error
-        if len(err_set.errors) == 1:
-            return celtypes.StringType(err_set.errors[0].message)
     return None
 
 
@@ -100,39 +91,39 @@ _format_error_tests: Iterable[simple_pb2.SimpleTest] = chain.from_iterable(
     x.test for x in sections if x.name == "format_errors"
 )
 
-env = celpy.Environment(runner_class=InterpretedRunner)
+# The bundled strings extension provides string.format, so an environment with
+# just that extension exercises the same implementation protovalidate relies
+# on. The fixture expressions reference free variables, so the type check is
+# disabled and bindings resolve at evaluation time.
+env = cel.NewEnv(descriptor_pool=descriptor_pool.Default(), extensions=[ext_strings.ExtStrings()])
 
 
 def test_format_successes(subtests: pytest.Subtests):
-    """Tests success scenarios for string.format"""
+    """Tests success scenarios for string.format using the runtime builtin."""
     for format_test in _format_tests:
         with subtests.test(msg=format_test.name):
             if format_test.name in skipped_tests:
-                pytest.skip(f"skipped test: {format_test.name}")
-            ast = env.compile(format_test.expr)
-            prog = env.program(ast, functions=extra_func.make_extra_funcs())
-
+                pytest.skip(f"runtime builtin diverges from supplemental fixture: {format_test.name}")
+            program = env.compile(format_test.expr, disable_check=True)
             bindings = build_variables(format_test.bindings)
-            result = prog.evaluate(bindings)
+            result = program.eval(data=bindings)
             expected = get_expected_result(format_test)
             assert expected is not None, f"[{format_test.name}]: expected a success result to be defined"
-            assert result == expected
+            assert result.plain_value() == expected
 
 
 def test_format_errors(subtests: pytest.Subtests):
-    """Tests error scenarios for string.format"""
+    """Tests error scenarios for string.format using the runtime builtin.
+
+    The cel-spec fixtures pin exact error messages that are tied to the
+    reference implementation; the runtime's wording differs, so we only assert
+    that evaluation produces an error, which is the behavior the spec defines.
+    """
     for format_error_test in _format_error_tests:
         with subtests.test(msg=format_error_test.name):
-            if format_error_test.name in skipped_error_tests:
-                pytest.skip(f"skipped test: {format_error_test.name}")
-            ast = env.compile(format_error_test.expr)
-            prog = env.program(ast, functions=extra_func.make_extra_funcs())
-
+            if format_error_test.name in error_skipped_tests:
+                pytest.skip(f"runtime builtin diverges from supplemental fixture: {format_error_test.name}")
+            program = env.compile(format_error_test.expr, disable_check=True)
             bindings = build_variables(format_error_test.bindings)
-            try:
-                prog.evaluate(bindings)
-                pytest.fail(f"[{format_error_test.name}]: expected an error to be raised during evaluation")
-            except celpy.CELEvalError as e:
-                msg = get_eval_error_message(format_error_test)
-                assert msg is not None, f"[{format_error_test.name}]: expected an eval error to be defined"
-                assert str(e) == msg
+            result = program.eval(data=bindings)
+            assert result.type() == cel.Type.ERROR

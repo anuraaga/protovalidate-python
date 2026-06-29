@@ -2,7 +2,7 @@
 name = "protovalidate"
 description = "Protocol Buffer Validation for Python"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 keywords = ["protobuf", "protocol buffer", "validate"]
@@ -16,7 +16,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "cel-python>=0.5",
+  "cel-expr-python>=0.1.2",
   "google-re2>=1",
   # We need at least this version, which started publishing wheels for Python 3.13.
   # Ref: https://github.com/google/re2/issues/516
@@ -26,11 +26,15 @@ dependencies = [
   "google-re2>=1.1.20251105; python_version == '3.14'",
   # 1.1 started supporting 3.12.
   "google-re2>=1.1; python_version == '3.12'",
+  # google-protobuf remains required: cel-expr-python only ingests
+  # google.protobuf descriptor pools and messages, so protobuf-py values are
+  # bridged through it at the validation boundary.
   "protobuf>=5",
   # We need at least this version, which fixed Python 3.14 compatibility (tp_new metaclass issue).
   # The fix was never backported to the 5.x series.
   # Ref: https://github.com/protocolbuffers/protobuf/pull/20594
   "protobuf>=6.31.0; python_version >= '3.14'",
+  "protobuf-py>=0.1.1",
 ]
 dynamic = ["version"]
 
@@ -42,8 +46,6 @@ Source = "https://github.com/bufbuild/protovalidate-python"
 
 [dependency-groups]
 dev = [
-  "protovalidate-proto",
-
   "buf-bin==1.71.0",
   "fix-protobuf-imports==0.1.7",
   "google-re2-stubs==0.1.1",
@@ -80,7 +82,6 @@ testpaths = ["test"]
 line-length = 120
 exclude = [
   # Protobuf generated code
-  "packages/protovalidate-proto/src/**",
   "test/gen/**",
 ]
 
@@ -127,12 +128,3 @@ known-first-party = ["protovalidate", "buf"]
 [tool.ruff.lint.per-file-ignores]
 # Tests can use assertions.
 "test/**/*" = ["S101"]
-
-[tool.uv.sources]
-protovalidate = { workspace = true }
-protovalidate-proto = { workspace = true }
-
-[tool.uv.workspace]
-members = [
-  "packages/protovalidate-proto",
-]
