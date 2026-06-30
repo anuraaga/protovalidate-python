@@ -266,20 +266,19 @@ class _MessageShape:
     message value of that type.
     """
 
-    __slots__ = ("fields", "oneof_field_names")
+    __slots__ = ("fields",)
 
     def __init__(self, desc: DescMessage):
         # name -> _Field view, reused across every value and every field access.
         self.fields = {field.name: _Field.of(field) for field in desc.fields}
-        self.oneof_field_names = frozenset(f.name for oneof in desc.oneofs for f in oneof.fields)
 
 
 class MessageConverter:
     """Converts protobuf-py values into celpy celtypes for CEL evaluation.
 
     Caches the per-descriptor :class:`_MessageShape` it derives, so the field
-    views and oneof membership of each message type are computed once and
-    reused across every value. One converter is owned by each
+    views of each message type are computed once and reused across every
+    value. One converter is owned by each
     :class:`RuleFactory`, so the cache lives and dies with its Validator rather
     than as global state.
     """
@@ -341,7 +340,11 @@ class MessageConverter:
         return ctor(val)
 
     def zero(self, field: _Field) -> celtypes.Value:
-        if field.message is not None and not field.is_repeated:
+        if field.is_map:
+            return celtypes.MapType()
+        if field.is_repeated:
+            return celtypes.ListType()
+        if field.message is not None:
             return self.message(field.message.type())
         return self.scalar(_scalar_zero(field.type), field)
 
@@ -368,10 +371,11 @@ class MessageType(celtypes.MapType):
         self.msg = msg
         self._conv = conv
         self._shape = conv.shape(type(msg).desc())
-        for name, field in self._shape.fields.items():
-            if name in self._shape.oneof_field_names and not field.is_present(msg):
-                continue
-            self[celtypes.StringType(name)] = conv.field(msg, field)
+        # Iterating a message yields exactly its set fields, with the active
+        # oneof member resolved; unset fields are synthesized by __getitem__.
+        for field_desc in msg:
+            field = self._shape.fields[field_desc.name]
+            self[celtypes.StringType(field_desc.name)] = conv.field(msg, field)
 
     def field_view(self, name: str) -> _Field | None:
         """The _Field view for a field name, or None if the type has no such field."""
@@ -383,7 +387,7 @@ class MessageType(celtypes.MapType):
 
     def __getitem__(self, key):
         field = self._shape.fields[key]
-        if field.has_presence and not field.is_present(self.msg):
+        if not field.is_present(self.msg):
             if in_has():
                 raise KeyError
             return self._conv.zero(field)
