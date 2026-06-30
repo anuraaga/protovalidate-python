@@ -584,7 +584,16 @@ class CelRules(Rules):
     _rules_cel: celtypes.Value | None = None
     _uses_now: bool = False
 
-    def __init__(self, rules: Message | None, *, conv: MessageConverter):
+    def __init__(
+        self,
+        rules: Message | None,
+        *,
+        env: celpy.Environment,
+        funcs: dict[str, celpy.CELFunction],
+        conv: MessageConverter,
+    ):
+        self._env = env
+        self._funcs = funcs
         self._conv = conv
         self._cel = []
         if rules is not None:
@@ -642,8 +651,6 @@ class CelRules(Rules):
 
     def add_rule(
         self,
-        env: celpy.Environment,
-        funcs: dict[str, celpy.CELFunction],
         rules: validate_pb.Rule | str,
         *,
         rule_field: _Field | None = None,
@@ -654,8 +661,8 @@ class CelRules(Rules):
             rules = validate_pb.Rule(id=expression, expression=expression)
         if "now" in rules.expression:
             self._uses_now = True
-        ast = env.compile(rules.expression)
-        prog = env.program(ast, functions=funcs)
+        ast = self._env.compile(rules.expression)
+        prog = self._env.program(ast, functions=self._funcs)
         rule_value = None
         rule_cel = None
         if rule_field is not None and self._rules is not None:
@@ -702,8 +709,16 @@ class MessageRules(CelRules):
 
     _oneofs: list[MessageOneofRule]
 
-    def __init__(self, rules: Message | None, desc: DescMessage, *, conv: MessageConverter):
-        super().__init__(rules, conv=conv)
+    def __init__(
+        self,
+        rules: Message | None,
+        desc: DescMessage,
+        *,
+        env: celpy.Environment,
+        funcs: dict[str, celpy.CELFunction],
+        conv: MessageConverter,
+    ):
+        super().__init__(rules, env=env, funcs=funcs, conv=conv)
         self._oneofs = []
         self._desc = desc
 
@@ -797,7 +812,7 @@ class FieldRules(CelRules):
         type_oneof = field_level.type
         type_case = type_oneof.field if type_oneof is not None else None
         rules_pb = type_oneof.value if type_oneof is not None else None
-        super().__init__(rules_pb, conv=conv)
+        super().__init__(rules_pb, env=env, funcs=funcs, conv=conv)
         self._field = field
         self._ignore_empty = (
             field_level.ignore == validate_pb.Ignore.IF_ZERO_VALUE
@@ -821,8 +836,6 @@ class FieldRules(CelRules):
                 rule_field = _Field.of(rule_field_desc)
                 for cel in opts[validate_pb.ext_predefined].cel:
                     self.add_rule(
-                        env,
-                        funcs,
                         cel,
                         rule_field=rule_field,
                         rule_path=validate_pb.FieldPath(
@@ -847,8 +860,6 @@ class FieldRules(CelRules):
                     ext_field = _Field.of_extension(ext)
                     for cel in ext.proto.options[validate_pb.ext_predefined].cel:
                         self.add_rule(
-                            env,
-                            funcs,
                             cel,
                             rule_field=ext_field,
                             rule_path=validate_pb.FieldPath(
@@ -858,16 +869,12 @@ class FieldRules(CelRules):
         cel_expression_field = _spec_field(validate_pb.FieldRules, "cel_expression")
         for i, cel in enumerate(field_level.cel_expression):
             self.add_rule(
-                env,
-                funcs,
                 cel,
                 rule_path=validate_pb.FieldPath(elements=[_indexed_field_element(cel_expression_field, i)]),
             )
         cel_field = _spec_field(validate_pb.FieldRules, "cel")
         for i, cel in enumerate(field_level.cel):
-            self.add_rule(
-                env, funcs, cel, rule_path=validate_pb.FieldPath(elements=[_indexed_field_element(cel_field, i)])
-            )
+            self.add_rule(cel, rule_path=validate_pb.FieldPath(elements=[_indexed_field_element(cel_field, i)]))
 
     @property
     def _read_field(self) -> _Field:
@@ -1186,13 +1193,13 @@ class RuleFactory:
         return result
 
     def _new_message_rule(self, rules: validate_pb.MessageRules, desc: DescMessage) -> MessageRules:
-        result = MessageRules(rules, desc, conv=self._conv)
+        result = MessageRules(rules, desc, env=self._env, funcs=self._funcs, conv=self._conv)
         for oneof in rules.oneof:
             result.add_oneof(oneof)
         for expr in rules.cel_expression:
-            result.add_rule(self._env, self._funcs, expr)
+            result.add_rule(expr)
         for cel in rules.cel:
-            result.add_rule(self._env, self._funcs, cel)
+            result.add_rule(cel)
         return result
 
     def _new_scalar_field_rule(
