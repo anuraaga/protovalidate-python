@@ -741,6 +741,31 @@ class MessageRules(CelRules):
         self._oneofs.append(MessageOneofRule(fields, required=rule.required))
 
 
+# For each scalar FieldRules.type case: the field type it requires, as
+# (expected wire type, wrapper message). A None wire type means the field must
+# be the named well-known wrapper message rather than a scalar.
+_RULE_FIELD_TYPES: dict[str, tuple[_FieldType | None, str | None]] = {
+    "duration": (None, "google.protobuf.Duration"),
+    "field_mask": (None, "google.protobuf.FieldMask"),
+    "timestamp": (None, "google.protobuf.Timestamp"),
+    "bool": (_FieldType.BOOL, "google.protobuf.BoolValue"),
+    "bytes": (_FieldType.BYTES, "google.protobuf.BytesValue"),
+    "fixed32": (_FieldType.FIXED32, None),
+    "fixed64": (_FieldType.FIXED64, None),
+    "float": (_FieldType.FLOAT, "google.protobuf.FloatValue"),
+    "double": (_FieldType.DOUBLE, "google.protobuf.DoubleValue"),
+    "int32": (_FieldType.INT32, "google.protobuf.Int32Value"),
+    "int64": (_FieldType.INT64, "google.protobuf.Int64Value"),
+    "sfixed32": (_FieldType.SFIXED32, None),
+    "sfixed64": (_FieldType.SFIXED64, None),
+    "sint32": (_FieldType.SINT32, None),
+    "sint64": (_FieldType.SINT64, None),
+    "uint32": (_FieldType.UINT32, "google.protobuf.UInt32Value"),
+    "uint64": (_FieldType.UINT64, "google.protobuf.UInt64Value"),
+    "string": (_FieldType.STRING, "google.protobuf.StringValue"),
+}
+
+
 def check_field_type(field: _Leaf, expected: _FieldType | None, wrapper_name: str | None = None):
     if field.type != expected and (field.type != _FieldType.MESSAGE or field.message_full_name != wrapper_name):
         if expected is None:
@@ -1190,26 +1215,6 @@ class RuleFactory:
             "registry": self._registry,
             "conv": self._conv,
         }
-        checks: dict[str, tuple[_FieldType | None, str | None]] = {
-            "duration": (None, "google.protobuf.Duration"),
-            "field_mask": (None, "google.protobuf.FieldMask"),
-            "timestamp": (None, "google.protobuf.Timestamp"),
-            "bool": (_FieldType.BOOL, "google.protobuf.BoolValue"),
-            "bytes": (_FieldType.BYTES, "google.protobuf.BytesValue"),
-            "fixed32": (_FieldType.FIXED32, None),
-            "fixed64": (_FieldType.FIXED64, None),
-            "float": (_FieldType.FLOAT, "google.protobuf.FloatValue"),
-            "double": (_FieldType.DOUBLE, "google.protobuf.DoubleValue"),
-            "int32": (_FieldType.INT32, "google.protobuf.Int32Value"),
-            "int64": (_FieldType.INT64, "google.protobuf.Int64Value"),
-            "sfixed32": (_FieldType.SFIXED32, None),
-            "sfixed64": (_FieldType.SFIXED64, None),
-            "sint32": (_FieldType.SINT32, None),
-            "sint64": (_FieldType.SINT64, None),
-            "uint32": (_FieldType.UINT32, "google.protobuf.UInt32Value"),
-            "uint64": (_FieldType.UINT64, "google.protobuf.UInt64Value"),
-            "string": (_FieldType.STRING, "google.protobuf.StringValue"),
-        }
         if type_case is None:
             return FieldRules(self._env, self._funcs, field, field_level, **kw)
         if type_case == "enum":
@@ -1218,8 +1223,8 @@ class RuleFactory:
         if type_case == "any":
             check_field_type(field, None, "google.protobuf.Any")
             return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry, conv=self._conv)
-        if type_case in checks:
-            expected, wrapper = checks[type_case]
+        if type_case in _RULE_FIELD_TYPES:
+            expected, wrapper = _RULE_FIELD_TYPES[type_case]
             check_field_type(field, expected, wrapper)
             return FieldRules(self._env, self._funcs, field, field_level, **kw)
         msg = f"unknown rule type {type_case!r}"
@@ -1300,66 +1305,42 @@ class RuleFactory:
         return result
 
 
-class SubMsgRule(Rules):
+class _SubMessageRule(Rules):
+    """Recurses into a message-typed field's own rules. Subclasses supply how to
+    enumerate the sub-messages to validate (singular, map values, list items)
+    as (sub_message, field_path_element) pairs."""
+
     def __init__(self, factory: RuleFactory, field: _Field, sub_desc: DescMessage):
         self._factory = factory
         self._field = field
         self._sub_desc = sub_desc
 
-    def validate(self, ctx: RuleContext, message: Message):
-        if not self._field.is_present(message):
-            return
+    def _validate_each(self, ctx: RuleContext, items: typing.Iterable[tuple[Message, validate_pb.FieldPathElement]]):
         rules = self._factory.get(self._sub_desc)
         if not rules:
             return
-        val = self._field.get(message)
-        sub_ctx = ctx.sub_context()
-        for rule in rules:
-            rule.validate(sub_ctx, val)
-        if sub_ctx.has_errors():
-            sub_ctx.add_field_path_element(_field_to_element(self._field))
-            ctx.add_errors(sub_ctx)
-
-
-class MapValMsgRule(Rules):
-    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: DescMessage):
-        self._factory = factory
-        self._field = field
-        self._sub_desc = sub_desc
-
-    def validate(self, ctx: RuleContext, message: Message):
-        val = self._field.get(message)
-        if not val:
-            return
-        rules = self._factory.get(self._sub_desc)
-        if not rules:
-            return
-        for k, v in val.items():
+        for value, element in items:
             sub_ctx = ctx.sub_context()
             for rule in rules:
-                rule.validate(sub_ctx, v)
+                rule.validate(sub_ctx, value)
             if sub_ctx.has_errors():
-                sub_ctx.add_field_path_element(_map_key_element(self._field, k))
+                sub_ctx.add_field_path_element(element)
                 ctx.add_errors(sub_ctx)
 
 
-class RepeatedMsgRule(Rules):
-    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: DescMessage):
-        self._factory = factory
-        self._field = field
-        self._sub_desc = sub_desc
+class SubMsgRule(_SubMessageRule):
+    def validate(self, ctx: RuleContext, message: Message):
+        if self._field.is_present(message):
+            self._validate_each(ctx, [(self._field.get(message), _field_to_element(self._field))])
 
+
+class MapValMsgRule(_SubMessageRule):
     def validate(self, ctx: RuleContext, message: Message):
         val = self._field.get(message)
-        if not val:
-            return
-        rules = self._factory.get(self._sub_desc)
-        if not rules:
-            return
-        for idx, item in enumerate(val):
-            sub_ctx = ctx.sub_context()
-            for rule in rules:
-                rule.validate(sub_ctx, item)
-            if sub_ctx.has_errors():
-                sub_ctx.add_field_path_element(_indexed_field_element(self._field, idx))
-                ctx.add_errors(sub_ctx)
+        self._validate_each(ctx, ((v, _map_key_element(self._field, k)) for k, v in val.items()))
+
+
+class RepeatedMsgRule(_SubMessageRule):
+    def validate(self, ctx: RuleContext, message: Message):
+        val = self._field.get(message)
+        self._validate_each(ctx, ((item, _indexed_field_element(self._field, i)) for i, item in enumerate(val)))
