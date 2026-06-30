@@ -20,7 +20,7 @@ import re2
 from celpy import celtypes
 
 from protovalidate.internal import string_format
-from protovalidate.internal.rules import MessageType, field_to_cel
+from protovalidate.internal.rules import MessageType, _Field, field_to_cel
 
 # See https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
 _email_regex = re2.compile(
@@ -35,10 +35,10 @@ def cel_get_field(message: celtypes.Value, field_name: celtypes.Value) -> celpy.
     if not isinstance(field_name, celtypes.StringType):
         msg = "invalid argument, expected string"
         raise celpy.CELEvalError(msg)
-    if field_name not in message.desc.fields_by_name:
+    if field_name not in message.desc._fields_by_name:
         msg = f"no such field: {field_name}"
         raise celpy.CELEvalError(msg)
-    return field_to_cel(message.msg, message.desc.fields_by_name[field_name])
+    return field_to_cel(message.msg, _Field.of(message.desc._fields_by_name[field_name]))
 
 
 def cel_is_ip(val: celtypes.Value, ver: celtypes.Value | None = None) -> celpy.Result:

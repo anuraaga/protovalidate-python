@@ -1,0 +1,9 @@
+version: v2
+managed:
+  enabled: true
+plugins:
+    # The bundled buf.validate stub is relocatable protobuf-py gencode only
+    # (`*_pb.py`); it ships inside protovalidate so users need not add the
+    # protos themselves.
+    - remote: buf.build/bufbuild/py:v0.1.1
+      out: protovalidate/_gen
