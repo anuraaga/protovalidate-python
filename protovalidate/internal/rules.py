@@ -28,19 +28,27 @@ import typing
 from collections.abc import Callable, Mapping
 
 import celpy
-import protobuf
 from celpy import celtypes
-from protobuf import Oneof, wkt
+from protobuf import (
+    DescEnum,
+    DescExtension,
+    DescField,
+    DescFieldValueEnum,
+    DescFieldValueList,
+    DescFieldValueMap,
+    DescFieldValueMessage,
+    DescMessage,
+    DescOneof,
+    Extension,
+    Message,
+    Oneof,
+    Registry,
+    ScalarType,
+    wkt,
+)
 
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal.cel_field_presence import InterpretedRunner, in_has
-
-# protobuf-py field-value kind discriminators.
-_PbScalar = protobuf.DescFieldValueScalar
-_PbEnum = protobuf.DescFieldValueEnum
-_PbMessage = protobuf.DescFieldValueMessage
-_PbList = protobuf.DescFieldValueList
-_PbMap = protobuf.DescFieldValueMap
 
 # FieldDescriptorProto.Type numbers (shared between google and protobuf-py).
 _TYPE_MESSAGE = 11
@@ -60,7 +68,7 @@ class _FieldTypeMeta(typing.TypedDict):
     ctor: Callable[..., celtypes.Value]
 
 
-def _msg_to_cel(msg: protobuf.Message) -> celtypes.Value:
+def _msg_to_cel(msg: Message) -> celtypes.Value:
     ctor = _WKT_CTORS.get(type(msg).desc().type_name)
     if ctor is not None:
         return ctor(msg)
@@ -94,7 +102,7 @@ def _get_type_name(type_num: int) -> str:
     return meta["name"] if meta is not None else "unknown"
 
 
-def _fields_by_name(desc: protobuf.DescMessage) -> dict[str, protobuf.DescField]:
+def _fields_by_name(desc: DescMessage) -> dict[str, DescField]:
     """A name -> field map computed from the public field list (protobuf-py
     descriptors do not expose a public fields_by_name)."""
     return {field.name: field for field in desc.fields}
@@ -137,13 +145,13 @@ class _Field:
     def __init__(
         self,
         *,
-        desc: protobuf.DescField | protobuf.Extension | None = None,
+        desc: DescField | Extension | None = None,
         type: int,  # noqa: A002
         name: str = "",
         number: int = 0,
         local_name: str = "",
-        message: protobuf.DescMessage | None = None,
-        enum: protobuf.DescEnum | None = None,
+        message: DescMessage | None = None,
+        enum: DescEnum | None = None,
         has_presence: bool = False,
         is_repeated: bool = False,
         is_map: bool = False,
@@ -169,24 +177,24 @@ class _Field:
     def message_full_name(self) -> str | None:
         return self.message.type_name if self.message is not None else None
 
-    def get(self, msg: protobuf.Message) -> typing.Any:
+    def get(self, msg: Message) -> typing.Any:
         # Item access (by descriptor) reads any field kind uniformly, including
         # oneof members, which attribute access does not expose by member name.
         assert self.desc is not None  # noqa: S101
         return msg[self.desc]
 
-    def is_present(self, msg: protobuf.Message) -> bool:
+    def is_present(self, msg: Message) -> bool:
         return self.desc is not None and self.desc in msg
 
     @classmethod
-    def of(cls, desc: protobuf.DescField) -> "_Field":
+    def of(cls, desc: DescField) -> "_Field":
         value = desc.value
         type_num = int(desc.proto.type)
         # Delimited (proto2 group / editions delimited) message fields report
         # the GROUP wire type in field paths.
         if getattr(value, "delimited_encoding", False):
             type_num = _TYPE_GROUP
-        if isinstance(value, _PbMap):
+        if isinstance(value, DescFieldValueMap):
             return cls(
                 desc=desc,
                 type=type_num,
@@ -198,7 +206,7 @@ class _Field:
                 key_field=_leaf_field(value.key),
                 value_field=_leaf_field(value.value),
             )
-        if isinstance(value, _PbList):
+        if isinstance(value, DescFieldValueList):
             return cls(
                 desc=desc,
                 type=type_num,
@@ -208,8 +216,8 @@ class _Field:
                 is_repeated=True,
                 item_field=_leaf_field(value.element, name=desc.name, number=desc.number),
             )
-        message = value.message if isinstance(value, _PbMessage) else None
-        enum = value.enum if isinstance(value, _PbEnum) else None
+        message = value.message if isinstance(value, DescFieldValueMessage) else None
+        enum = value.enum if isinstance(value, DescFieldValueEnum) else None
         return cls(
             desc=desc,
             type=type_num,
@@ -222,7 +230,7 @@ class _Field:
         )
 
     @classmethod
-    def of_extension(cls, ext: protobuf.DescExtension) -> "_Field":
+    def of_extension(cls, ext: DescExtension) -> "_Field":
         """A _Field for a proto2 extension on a rules message (read via the
         Extension object; the path uses the bracketed extension name)."""
         value = ext.value
@@ -230,7 +238,7 @@ class _Field:
         if getattr(value, "delimited_encoding", False):
             type_num = _TYPE_GROUP
         name = f"[{ext.type_name}]"
-        if isinstance(value, _PbList):
+        if isinstance(value, DescFieldValueList):
             return cls(
                 desc=ext.type,
                 type=type_num,
@@ -239,8 +247,8 @@ class _Field:
                 is_repeated=True,
                 item_field=_leaf_field(value.element, name=name, number=ext.number),
             )
-        message = value.message if isinstance(value, _PbMessage) else None
-        enum = value.enum if isinstance(value, _PbEnum) else None
+        message = value.message if isinstance(value, DescFieldValueMessage) else None
+        enum = value.enum if isinstance(value, DescFieldValueEnum) else None
         return cls(
             desc=ext.type,
             type=type_num,
@@ -252,15 +260,13 @@ class _Field:
         )
 
 
-def _leaf_field(
-    kind: protobuf.ScalarType | protobuf.DescMessage | protobuf.DescEnum, *, name: str = "", number: int = 0
-) -> _Field:
+def _leaf_field(kind: ScalarType | DescMessage | DescEnum, *, name: str = "", number: int = 0) -> _Field:
     """Builds a synthetic _Field for a map key/value or list element kind."""
-    if isinstance(kind, protobuf.ScalarType):
+    if isinstance(kind, ScalarType):
         return _Field(type=int(kind), name=name, number=number)
-    if isinstance(kind, protobuf.DescMessage):
+    if isinstance(kind, DescMessage):
         return _Field(type=_TYPE_MESSAGE, name=name, number=number, message=kind)
-    if isinstance(kind, protobuf.DescEnum):
+    if isinstance(kind, DescEnum):
         return _Field(type=_TYPE_ENUM, name=name, number=number, enum=kind)
     msg = "unknown map/list element kind"
     raise CompilationError(msg)
@@ -277,7 +283,7 @@ def make_timestamp(msg: wkt.timestamp_pb.Timestamp) -> celtypes.TimestampType:
     return celtypes.TimestampType(1970, 1, 1) + celtypes.DurationType(seconds=msg.seconds, nanos=msg.nanos)
 
 
-def _unwrap(msg: protobuf.Message) -> celtypes.Value:
+def _unwrap(msg: Message) -> celtypes.Value:
     value_field = _Field.of(_fields_by_name(type(msg).desc())["value"])
     return _scalar_to_cel(value_field.get(msg), value_field)
 
@@ -324,7 +330,7 @@ def _field_value_to_cel(val: typing.Any, field: _Field) -> celtypes.Value:
     return _scalar_to_cel(val, field)
 
 
-def field_to_cel(msg: protobuf.Message, field: _Field) -> celtypes.Value:
+def field_to_cel(msg: Message, field: _Field) -> celtypes.Value:
     if field.is_repeated:
         return _field_value_to_cel(field.get(msg), field)
     if field.message is not None and not field.is_present(msg):
@@ -338,7 +344,7 @@ def _zero_value(field: _Field) -> celtypes.Value:
     return _scalar_to_cel(_scalar_zero(field.type), field)
 
 
-def _is_empty_field(msg: protobuf.Message, field: _Field) -> bool:
+def _is_empty_field(msg: Message, field: _Field) -> bool:
     if field.has_presence:
         return not field.is_present(msg)
     if field.is_repeated:
@@ -347,9 +353,9 @@ def _is_empty_field(msg: protobuf.Message, field: _Field) -> bool:
 
 
 class MessageType(celtypes.MapType):
-    msg: protobuf.Message
+    msg: Message
 
-    def __init__(self, msg: protobuf.Message):
+    def __init__(self, msg: Message):
         super().__init__()
         self.msg = msg
         self.desc = type(msg).desc()
@@ -394,7 +400,7 @@ def _indexed_field_element(field: _Field, index: int) -> validate_pb.FieldPathEl
     )
 
 
-def _oneof_to_element(oneof: protobuf.DescOneof) -> validate_pb.FieldPathElement:
+def _oneof_to_element(oneof: DescOneof) -> validate_pb.FieldPathElement:
     return validate_pb.FieldPathElement(field_name=oneof.name)
 
 
@@ -428,11 +434,11 @@ def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathEle
     )
 
 
-def _spec_field(rules_cls: type[protobuf.Message], name: str) -> protobuf.DescField:
+def _spec_field(rules_cls: type[Message], name: str) -> DescField:
     return _fields_by_name(rules_cls.desc())[name]
 
 
-def _spec_element(pb_field: protobuf.DescField) -> validate_pb.FieldPathElement:
+def _spec_element(pb_field: DescField) -> validate_pb.FieldPathElement:
     return validate_pb.FieldPathElement(
         field_number=pb_field.number,
         field_name=pb_field.name,
@@ -440,7 +446,7 @@ def _spec_element(pb_field: protobuf.DescField) -> validate_pb.FieldPathElement:
     )
 
 
-def _indexed_spec_element(pb_field: protobuf.DescField, index: int) -> validate_pb.FieldPathElement:
+def _indexed_spec_element(pb_field: DescField, index: int) -> validate_pb.FieldPathElement:
     return validate_pb.FieldPathElement(
         field_number=pb_field.number,
         field_name=pb_field.name,
@@ -549,7 +555,7 @@ class Rules(abc.ABC):
     """The rules associated with a single 'rules' message."""
 
     @abc.abstractmethod
-    def validate(self, ctx: RuleContext, message: protobuf.Message) -> None:
+    def validate(self, ctx: RuleContext, message: Message) -> None:
         """Validate the message against the rules in this rule."""
         ...
 
@@ -567,11 +573,11 @@ class CelRules(Rules):
     """A rule that has rules written in CEL."""
 
     _cel: list[CelRunner]
-    _rules: protobuf.Message | None = None
+    _rules: Message | None = None
     _rules_cel: celtypes.Value | None = None
     _uses_now: bool = False
 
-    def __init__(self, rules: protobuf.Message | None):
+    def __init__(self, rules: Message | None):
         self._cel = []
         if rules is not None:
             self._rules = rules
@@ -665,7 +671,7 @@ class MessageOneofRule(Rules):
         self._fields = fields
         self._required = required
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         num_set_fields = sum(1 for field in self._fields if not _is_empty_field(message, field))
         if num_set_fields > 1:
             ctx.add(
@@ -688,12 +694,12 @@ class MessageRules(CelRules):
 
     _oneofs: list[MessageOneofRule]
 
-    def __init__(self, rules: protobuf.Message | None, desc: protobuf.DescMessage):
+    def __init__(self, rules: Message | None, desc: DescMessage):
         super().__init__(rules)
         self._oneofs = []
         self._desc = desc
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         if self._cel:
             self._validate_cel(ctx, this_cel=_msg_to_cel(message))
             if ctx.done:
@@ -753,7 +759,7 @@ class FieldRules(CelRules):
         *,
         for_items: bool = False,
         force_ignore_empty: bool = False,
-        registry: protobuf.Registry | None = None,
+        registry: Registry | None = None,
     ):
         type_oneof = field_level.type
         type_case = type_oneof.field if type_oneof is not None else None
@@ -796,7 +802,7 @@ class FieldRules(CelRules):
                 rules_type_name = type(rules_pb).desc().type_name
                 for ext in registry:
                     if (
-                        not isinstance(ext, protobuf.DescExtension)
+                        not isinstance(ext, DescExtension)
                         or ext.extendee.type_name != rules_type_name
                         or ext.proto.options is None
                         or validate_pb.ext_predefined not in ext.proto.options
@@ -828,7 +834,7 @@ class FieldRules(CelRules):
                 env, funcs, cel, rule_path=validate_pb.FieldPath(elements=[_indexed_spec_element(cel_field, i)])
             )
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         if _is_empty_field(message, self._field):
             if self._required:
                 ctx.add(
@@ -884,7 +890,7 @@ class AnyRules(FieldRules):
         field: _Field,
         field_level: validate_pb.FieldRules,
         *,
-        registry: protobuf.Registry | None = None,
+        registry: Registry | None = None,
     ):
         super().__init__(env, funcs, field, field_level, registry=registry)
         type_oneof = field_level.type
@@ -937,7 +943,7 @@ class EnumRules(FieldRules):
         *,
         for_items: bool = False,
         force_ignore_empty: bool = False,
-        registry: protobuf.Registry | None = None,
+        registry: Registry | None = None,
     ):
         super().__init__(
             env,
@@ -954,7 +960,7 @@ class EnumRules(FieldRules):
             self._defined_only = True
         self._defined_numbers = {v.number for v in field.enum.values} if field.enum is not None else set()
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         super().validate(ctx, message)
         if ctx.done:
             return
@@ -988,13 +994,13 @@ class RepeatedRules(FieldRules):
         field_level: validate_pb.FieldRules,
         item_rules: FieldRules | None,
         *,
-        registry: protobuf.Registry | None = None,
+        registry: Registry | None = None,
     ):
         super().__init__(env, funcs, field, field_level, registry=registry)
         if item_rules is not None:
             self._item_rules = item_rules
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         super().validate(ctx, message)
         if ctx.done:
             return
@@ -1040,7 +1046,7 @@ class MapRules(FieldRules):
         key_rules: FieldRules | None,
         value_rules: FieldRules | None,
         *,
-        registry: protobuf.Registry | None = None,
+        registry: Registry | None = None,
     ):
         super().__init__(env, funcs, field, field_level, registry=registry)
         if key_rules is not None:
@@ -1048,7 +1054,7 @@ class MapRules(FieldRules):
         if value_rules is not None:
             self._value_rules = value_rules
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         super().validate(ctx, message)
         if ctx.done:
             return
@@ -1077,12 +1083,12 @@ class OneofRules(Rules):
 
     required = True
 
-    def __init__(self, oneof: protobuf.DescOneof, rules: validate_pb.OneofRules):
+    def __init__(self, oneof: DescOneof, rules: validate_pb.OneofRules):
         self._oneof = oneof
         if not rules.required:
             self.required = False
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         if getattr(message, self._oneof.local_name) is None:
             if self.required:
                 ctx.add(
@@ -1095,7 +1101,7 @@ class OneofRules(Rules):
             return
 
 
-def _message_child(field: _Field) -> protobuf.DescMessage | None:
+def _message_child(field: _Field) -> DescMessage | None:
     if field.is_map:
         return field.value_field.message if field.value_field is not None else None
     if field.is_repeated:
@@ -1109,13 +1115,13 @@ class RuleFactory:
     _env: celpy.Environment
     _funcs: dict[str, celpy.CELFunction]
 
-    def __init__(self, funcs: dict[str, celpy.CELFunction], registry: protobuf.Registry | None = None):
+    def __init__(self, funcs: dict[str, celpy.CELFunction], registry: Registry | None = None):
         self._env = celpy.Environment(runner_class=InterpretedRunner)
         self._funcs = funcs
         self._registry = registry
         self._cache: dict[str, list[Rules] | Exception] = {}
 
-    def get(self, desc: protobuf.DescMessage) -> list[Rules]:
+    def get(self, desc: DescMessage) -> list[Rules]:
         key = desc.type_name
         if key not in self._cache:
             try:
@@ -1127,7 +1133,7 @@ class RuleFactory:
             raise result
         return result
 
-    def _new_message_rule(self, rules: validate_pb.MessageRules, desc: protobuf.DescMessage) -> MessageRules:
+    def _new_message_rule(self, rules: validate_pb.MessageRules, desc: DescMessage) -> MessageRules:
         result = MessageRules(rules, desc)
         for oneof in rules.oneof:
             result.add_oneof(oneof)
@@ -1209,7 +1215,7 @@ class RuleFactory:
             item_rule = self._new_scalar_field_rule(item_field, rep_rules.items)
         return RepeatedRules(self._env, self._funcs, field, rules, item_rule, registry=self._registry)
 
-    def _new_rules(self, desc: protobuf.DescMessage) -> list[Rules]:
+    def _new_rules(self, desc: DescMessage) -> list[Rules]:
         result: list[Rules] = []
         all_msg_oneof_fields: set[str] = set()
 
@@ -1256,12 +1262,12 @@ class RuleFactory:
 
 
 class SubMsgRule(Rules):
-    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: protobuf.DescMessage):
+    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: DescMessage):
         self._factory = factory
         self._field = field
         self._sub_desc = sub_desc
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         if not self._field.is_present(message):
             return
         rules = self._factory.get(self._sub_desc)
@@ -1277,12 +1283,12 @@ class SubMsgRule(Rules):
 
 
 class MapValMsgRule(Rules):
-    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: protobuf.DescMessage):
+    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: DescMessage):
         self._factory = factory
         self._field = field
         self._sub_desc = sub_desc
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         val = self._field.get(message)
         if not val:
             return
@@ -1299,12 +1305,12 @@ class MapValMsgRule(Rules):
 
 
 class RepeatedMsgRule(Rules):
-    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: protobuf.DescMessage):
+    def __init__(self, factory: RuleFactory, field: _Field, sub_desc: DescMessage):
         self._factory = factory
         self._field = field
         self._sub_desc = sub_desc
 
-    def validate(self, ctx: RuleContext, message: protobuf.Message):
+    def validate(self, ctx: RuleContext, message: Message):
         val = self._field.get(message)
         if not val:
             return

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import protobuf
+from protobuf import Message, Registry
 
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal import extra_func
@@ -34,7 +34,7 @@ class Validator:
 
     _factory: _rules.RuleFactory
 
-    def __init__(self, registry: protobuf.Registry | None = None):
+    def __init__(self, registry: Registry | None = None):
         """
         Parameters:
             registry: An optional protobuf-py Registry used to resolve custom
@@ -45,7 +45,7 @@ class Validator:
         funcs = extra_func.make_extra_funcs()
         self._factory = _rules.RuleFactory(funcs, registry)
 
-    def validate(self, message: protobuf.Message, *, fail_fast: bool = False):
+    def validate(self, message: Message, *, fail_fast: bool = False):
         """
         Validates the given message against the static rules defined in
         the message's descriptor.
@@ -65,7 +65,7 @@ class Validator:
 
     def collect_violations(
         self,
-        message: protobuf.Message,
+        message: Message,
         *,
         fail_fast: bool = False,
     ) -> list[Violation]:
