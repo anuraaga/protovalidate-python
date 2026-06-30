@@ -132,7 +132,7 @@ class _Field:
     def __init__(
         self,
         *,
-        desc: protobuf.DescField | None = None,
+        desc: typing.Any = None,
         type: int,  # noqa: A002
         name: str = "",
         number: int = 0,
@@ -214,6 +214,36 @@ class _Field:
             message=message,
             enum=enum,
             has_presence=desc.presence != SupportedFieldPresence.IMPLICIT,
+        )
+
+    @classmethod
+    def of_extension(cls, ext: typing.Any) -> "_Field":
+        """A _Field for a proto2 extension on a rules message (read via the
+        Extension object; the path uses the bracketed extension name)."""
+        value = ext.value
+        type_num = int(ext.proto.type)
+        if getattr(value, "delimited_encoding", False):
+            type_num = _TYPE_GROUP
+        name = f"[{ext.type_name}]"
+        if isinstance(value, _PbList):
+            return cls(
+                desc=ext.type,
+                type=type_num,
+                name=name,
+                number=ext.number,
+                is_repeated=True,
+                item_field=_leaf_field(value.element, name=name, number=ext.number),
+            )
+        message = value.message if isinstance(value, _PbMessage) else None
+        enum = value.enum if isinstance(value, _PbEnum) else None
+        return cls(
+            desc=ext.type,
+            type=type_num,
+            name=name,
+            number=ext.number,
+            message=message,
+            enum=enum,
+            has_presence=True,
         )
 
 
@@ -714,6 +744,7 @@ class FieldRules(CelRules):
         *,
         for_items: bool = False,
         force_ignore_empty: bool = False,
+        registry: typing.Any = None,
     ):
         type_case = _which_type(field_level)
         rules_pb = field_level.type.value if type_case is not None else None
@@ -729,9 +760,8 @@ class FieldRules(CelRules):
             assert type_case is not None  # noqa: S101
             type_field = _spec_field(validate_pb.FieldRules, type_case)
             # For each set rule sub-field, look for the private predefined-rule
-            # extension that implements it (standard rules carry these in the
-            # bundled stub). Custom predefined extensions defined in user files
-            # are not yet decoded here.
+            # extension that implements it. Standard rules carry these as
+            # declared fields known to the bundled stub.
             for rule_field_desc in type(rules_pb).desc().fields:
                 if rule_field_desc not in rules_pb:
                     continue
@@ -748,6 +778,25 @@ class FieldRules(CelRules):
                             elements=[_spec_element(rule_field_desc), _spec_element(type_field)]
                         ),
                     )
+            # Custom predefined rules are proto2 extensions on the rules message
+            # that the bundled stub cannot decode (they remain as unknown
+            # fields); a caller-supplied Registry resolves them.
+            if registry is not None:
+                for number in getattr(rules_pb, "_unknown_fields", None) or {}:
+                    ext = registry.extension_for(type(rules_pb).desc(), number)
+                    if ext is None or ext.proto.options is None or validate_pb.ext_predefined not in ext.proto.options:
+                        continue
+                    ext_field = _Field.of_extension(ext)
+                    for cel in ext.proto.options[validate_pb.ext_predefined].cel:
+                        self.add_rule(
+                            env,
+                            funcs,
+                            cel,
+                            rule_field=ext_field,
+                            rule_path=validate_pb.FieldPath(
+                                elements=[_field_to_element(ext_field), _spec_element(type_field)]
+                            ),
+                        )
         cel_expression_field = _spec_field(validate_pb.FieldRules, "cel_expression")
         for i, cel in enumerate(field_level.cel_expression):
             self.add_rule(
@@ -817,8 +866,10 @@ class AnyRules(FieldRules):
         funcs: dict[str, celpy.CELFunction],
         field: _Field,
         field_level: typing.Any,
+        *,
+        registry: typing.Any = None,
     ):
-        super().__init__(env, funcs, field, field_level)
+        super().__init__(env, funcs, field, field_level, registry=registry)
         any_rules = field_level.type.value
         self._in = list(any_rules.in_) or []
         self._not_in: typing.Container[str] = list(any_rules.not_in) or []
@@ -867,8 +918,17 @@ class EnumRules(FieldRules):
         *,
         for_items: bool = False,
         force_ignore_empty: bool = False,
+        registry: typing.Any = None,
     ):
-        super().__init__(env, funcs, field, field_level, for_items=for_items, force_ignore_empty=force_ignore_empty)
+        super().__init__(
+            env,
+            funcs,
+            field,
+            field_level,
+            for_items=for_items,
+            force_ignore_empty=force_ignore_empty,
+            registry=registry,
+        )
         if field_level.type.value.defined_only:
             self._defined_only = True
         self._defined_numbers = {v.number for v in field.enum.values} if field.enum is not None else set()
@@ -906,8 +966,10 @@ class RepeatedRules(FieldRules):
         field: _Field,
         field_level: typing.Any,
         item_rules: FieldRules | None,
+        *,
+        registry: typing.Any = None,
     ):
-        super().__init__(env, funcs, field, field_level)
+        super().__init__(env, funcs, field, field_level, registry=registry)
         if item_rules is not None:
             self._item_rules = item_rules
 
@@ -956,8 +1018,10 @@ class MapRules(FieldRules):
         field_level: typing.Any,
         key_rules: FieldRules | None,
         value_rules: FieldRules | None,
+        *,
+        registry: typing.Any = None,
     ):
-        super().__init__(env, funcs, field, field_level)
+        super().__init__(env, funcs, field, field_level, registry=registry)
         if key_rules is not None:
             self._key_rules = key_rules
         if value_rules is not None:
@@ -1024,9 +1088,10 @@ class RuleFactory:
     _env: celpy.Environment
     _funcs: dict[str, celpy.CELFunction]
 
-    def __init__(self, funcs: dict[str, celpy.CELFunction]):
+    def __init__(self, funcs: dict[str, celpy.CELFunction], registry: typing.Any = None):
         self._env = celpy.Environment(runner_class=InterpretedRunner)
         self._funcs = funcs
+        self._registry = registry
         self._cache: dict[str, list[Rules] | Exception] = {}
 
     def get(self, desc: protobuf.DescMessage) -> list[Rules]:
@@ -1062,7 +1127,7 @@ class RuleFactory:
         if field_level.ignore == validate_pb.Ignore.ALWAYS:
             return None
         type_case = _which_type(field_level)
-        kw = {"for_items": for_items, "force_ignore_empty": force_ignore_empty}
+        kw = {"for_items": for_items, "force_ignore_empty": force_ignore_empty, "registry": self._registry}
         checks: dict[str, tuple[int, str | None]] = {
             "duration": (0, "google.protobuf.Duration"),
             "field_mask": (0, "google.protobuf.FieldMask"),
@@ -1090,7 +1155,7 @@ class RuleFactory:
             return EnumRules(self._env, self._funcs, field, field_level, **kw)
         if type_case == "any":
             check_field_type(field, 0, "google.protobuf.Any")
-            return AnyRules(self._env, self._funcs, field, field_level)
+            return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry)
         if type_case in checks:
             expected, wrapper = checks[type_case]
             check_field_type(field, expected, wrapper)
@@ -1112,14 +1177,14 @@ class RuleFactory:
                 key_rules = self._new_scalar_field_rule(key_field, map_rules.keys, for_items=True)
             if map_rules is not None and map_rules.values is not None:
                 value_rules = self._new_scalar_field_rule(value_field, map_rules.values, for_items=True)
-            return MapRules(self._env, self._funcs, field, rules, key_rules, value_rules)
+            return MapRules(self._env, self._funcs, field, rules, key_rules, value_rules, registry=self._registry)
         item_field = field.item_field
         assert item_field is not None  # noqa: S101
         item_rule = None
         rep_rules: typing.Any = rules.type.value if type_case == "repeated" else None
         if rep_rules is not None and rep_rules.items is not None:
             item_rule = self._new_scalar_field_rule(item_field, rep_rules.items)
-        return RepeatedRules(self._env, self._funcs, field, rules, item_rule)
+        return RepeatedRules(self._env, self._funcs, field, rules, item_rule, registry=self._registry)
 
     def _new_rules(self, desc: protobuf.DescMessage) -> list[Rules]:
         result: list[Rules] = []

@@ -34,9 +34,16 @@ class Validator:
 
     _factory: _rules.RuleFactory
 
-    def __init__(self):
+    def __init__(self, registry: protobuf.Registry | None = None):
+        """
+        Parameters:
+            registry: An optional protobuf-py Registry used to resolve custom
+                predefined-rule extensions (proto2 extensions on the standard
+                rule messages). Without it, only standard rules and rules whose
+                extensions are known to the bundled stub are applied.
+        """
         funcs = extra_func.make_extra_funcs()
-        self._factory = _rules.RuleFactory(funcs)
+        self._factory = _rules.RuleFactory(funcs, registry)
 
     def validate(self, message: protobuf.Message, *, fail_fast: bool = False):
         """

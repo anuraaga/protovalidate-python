@@ -30,10 +30,12 @@ from buf.validate import validate_pb
 from buf.validate.conformance.harness import harness_pb
 
 
-def run_test_case(tc: protobuf.Message, result: harness_pb.TestResult) -> harness_pb.TestResult:
+def run_test_case(
+    validator: protovalidate.Validator, tc: protobuf.Message, result: harness_pb.TestResult
+) -> harness_pb.TestResult:
     # Run the validator
     try:
-        violations = protovalidate.collect_violations(tc)
+        violations = validator.collect_violations(tc)
         if len(violations) > 0:
             # protovalidate bundles its own relocatable validate_pb stub, a
             # distinct class identity from the harness gen here; cross by binary.
@@ -54,6 +56,7 @@ def run_test_case(tc: protobuf.Message, result: harness_pb.TestResult) -> harnes
 
 
 def run_any_test_case(
+    validator: protovalidate.Validator,
     registry: Registry,
     tc: pb_wkt.Any,
     result: harness_pb.TestResult,
@@ -67,16 +70,18 @@ def run_any_test_case(
     if msg is None:
         result.result = Oneof(field="unexpected_error", value=f"cannot unpack {tc.type_url}")
         return result
-    return run_test_case(msg, result)
+    return run_test_case(validator, msg, result)
 
 
 def run_conformance_test(
     request: harness_pb.TestConformanceRequest,
 ) -> harness_pb.TestConformanceResponse:
     registry = request.fdset.to_registry()
+    # The registry resolves the conformance suite's custom predefined-rule extensions.
+    validator = protovalidate.Validator(registry=registry)
     response = harness_pb.TestConformanceResponse()
     for name, tc in request.cases.items():
-        response.results[name] = run_any_test_case(registry, tc, harness_pb.TestResult())
+        response.results[name] = run_any_test_case(validator, registry, tc, harness_pb.TestResult())
     return response
 
 
