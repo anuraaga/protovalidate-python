@@ -25,7 +25,7 @@ import abc
 import dataclasses
 import datetime
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import celpy
 import protobuf
@@ -100,7 +100,7 @@ def _fields_by_name(desc: protobuf.DescMessage) -> dict[str, protobuf.DescField]
     return {field.name: field for field in desc.fields}
 
 
-def _scalar_zero(type_num: int) -> typing.Any:
+def _scalar_zero(type_num: int) -> str | bytes | bool | float | int:
     if type_num == 9:
         return ""
     if type_num == 12:
@@ -137,13 +137,13 @@ class _Field:
     def __init__(
         self,
         *,
-        desc: typing.Any = None,
+        desc: protobuf.DescField | protobuf.Extension | None = None,
         type: int,  # noqa: A002
         name: str = "",
         number: int = 0,
         local_name: str = "",
         message: protobuf.DescMessage | None = None,
-        enum: typing.Any = None,
+        enum: protobuf.DescEnum | None = None,
         has_presence: bool = False,
         is_repeated: bool = False,
         is_map: bool = False,
@@ -222,7 +222,7 @@ class _Field:
         )
 
     @classmethod
-    def of_extension(cls, ext: typing.Any) -> "_Field":
+    def of_extension(cls, ext: protobuf.DescExtension) -> "_Field":
         """A _Field for a proto2 extension on a rules message (read via the
         Extension object; the path uses the bracketed extension name)."""
         value = ext.value
@@ -252,7 +252,9 @@ class _Field:
         )
 
 
-def _leaf_field(kind: typing.Any, *, name: str = "", number: int = 0) -> _Field:
+def _leaf_field(
+    kind: protobuf.ScalarType | protobuf.DescMessage | protobuf.DescEnum, *, name: str = "", number: int = 0
+) -> _Field:
     """Builds a synthetic _Field for a map key/value or list element kind."""
     if isinstance(kind, protobuf.ScalarType):
         return _Field(type=int(kind), name=name, number=number)
@@ -267,11 +269,11 @@ def _leaf_field(kind: typing.Any, *, name: str = "", number: int = 0) -> _Field:
 # ----- value conversion: protobuf-py -> celpy celtypes -----
 
 
-def make_duration(msg: typing.Any) -> celtypes.DurationType:
+def make_duration(msg: wkt.duration_pb.Duration) -> celtypes.DurationType:
     return celtypes.DurationType(seconds=msg.seconds, nanos=msg.nanos)
 
 
-def make_timestamp(msg: typing.Any) -> celtypes.TimestampType:
+def make_timestamp(msg: wkt.timestamp_pb.Timestamp) -> celtypes.TimestampType:
     return celtypes.TimestampType(1970, 1, 1) + celtypes.DurationType(seconds=msg.seconds, nanos=msg.nanos)
 
 
@@ -303,7 +305,7 @@ def _scalar_to_cel(val: typing.Any, field: _Field) -> celtypes.Value:
     return meta["ctor"](val)
 
 
-def _map_to_cel(mapping: typing.Any, field: _Field) -> celtypes.Value:
+def _map_to_cel(mapping: Mapping[typing.Any, typing.Any], field: _Field) -> celtypes.Value:
     key_field, value_field = field.key_field, field.value_field
     assert key_field is not None and value_field is not None  # noqa: S101
     result = celtypes.MapType()
@@ -371,7 +373,7 @@ class MessageType(celtypes.MapType):
 # ----- protobuf-py validate_pb path / element construction -----
 
 
-def _ftype(type_num: int) -> typing.Any:
+def _ftype(type_num: int) -> wkt.descriptor_pb.FieldDescriptorProto.Type:
     return wkt.descriptor_pb.FieldDescriptorProto.Type(type_num)
 
 
@@ -426,7 +428,7 @@ def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathEle
     )
 
 
-def _spec_field(rules_cls: typing.Any, name: str) -> protobuf.DescField:
+def _spec_field(rules_cls: type[protobuf.Message], name: str) -> protobuf.DescField:
     return _fields_by_name(rules_cls.desc())[name]
 
 
@@ -447,7 +449,7 @@ def _indexed_spec_element(pb_field: protobuf.DescField, index: int) -> validate_
     )
 
 
-def _which_type(field_level: typing.Any) -> str | None:
+def _which_type(field_level: validate_pb.FieldRules) -> str | None:
     return field_level.type.field if field_level.type is not None else None
 
 
@@ -555,7 +557,7 @@ class Rules(abc.ABC):
 @dataclasses.dataclass
 class CelRunner:
     runner: celpy.Runner
-    rule: typing.Any
+    rule: validate_pb.Rule
     rule_value: typing.Any | None = None
     rule_cel: celtypes.Value | None = None
     rule_path: validate_pb.FieldPath | None = None
@@ -628,7 +630,7 @@ class CelRules(Rules):
         self,
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
-        rules: typing.Any,
+        rules: validate_pb.Rule | str,
         *,
         rule_field: _Field | None = None,
         rule_path: validate_pb.FieldPath | None = None,
@@ -701,7 +703,7 @@ class MessageRules(CelRules):
             if ctx.done:
                 return
 
-    def add_oneof(self, rule: typing.Any):
+    def add_oneof(self, rule: validate_pb.MessageOneofRule):
         fields = []
         seen = set()
         if len(rule.fields) == 0:
@@ -747,14 +749,15 @@ class FieldRules(CelRules):
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
         field: _Field,
-        field_level: typing.Any,
+        field_level: validate_pb.FieldRules,
         *,
         for_items: bool = False,
         force_ignore_empty: bool = False,
-        registry: typing.Any = None,
+        registry: protobuf.Registry | None = None,
     ):
-        type_case = _which_type(field_level)
-        rules_pb = field_level.type.value if type_case is not None else None
+        type_oneof = field_level.type
+        type_case = type_oneof.field if type_oneof is not None else None
+        rules_pb = type_oneof.value if type_oneof is not None else None
         super().__init__(rules_pb)
         self._field = field
         self._ignore_empty = (
@@ -879,12 +882,14 @@ class AnyRules(FieldRules):
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
         field: _Field,
-        field_level: typing.Any,
+        field_level: validate_pb.FieldRules,
         *,
-        registry: typing.Any = None,
+        registry: protobuf.Registry | None = None,
     ):
         super().__init__(env, funcs, field, field_level, registry=registry)
-        any_rules = field_level.type.value
+        type_oneof = field_level.type
+        assert type_oneof is not None and type_oneof.field == "any"  # noqa: S101
+        any_rules = type_oneof.value
         self._in = list(any_rules.in_) or []
         self._not_in: typing.Container[str] = list(any_rules.not_in) or []
 
@@ -928,11 +933,11 @@ class EnumRules(FieldRules):
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
         field: _Field,
-        field_level: typing.Any,
+        field_level: validate_pb.FieldRules,
         *,
         for_items: bool = False,
         force_ignore_empty: bool = False,
-        registry: typing.Any = None,
+        registry: protobuf.Registry | None = None,
     ):
         super().__init__(
             env,
@@ -943,7 +948,9 @@ class EnumRules(FieldRules):
             force_ignore_empty=force_ignore_empty,
             registry=registry,
         )
-        if field_level.type.value.defined_only:
+        type_oneof = field_level.type
+        assert type_oneof is not None and type_oneof.field == "enum"  # noqa: S101
+        if type_oneof.value.defined_only:
             self._defined_only = True
         self._defined_numbers = {v.number for v in field.enum.values} if field.enum is not None else set()
 
@@ -978,10 +985,10 @@ class RepeatedRules(FieldRules):
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
         field: _Field,
-        field_level: typing.Any,
+        field_level: validate_pb.FieldRules,
         item_rules: FieldRules | None,
         *,
-        registry: typing.Any = None,
+        registry: protobuf.Registry | None = None,
     ):
         super().__init__(env, funcs, field, field_level, registry=registry)
         if item_rules is not None:
@@ -1029,11 +1036,11 @@ class MapRules(FieldRules):
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
         field: _Field,
-        field_level: typing.Any,
+        field_level: validate_pb.FieldRules,
         key_rules: FieldRules | None,
         value_rules: FieldRules | None,
         *,
-        registry: typing.Any = None,
+        registry: protobuf.Registry | None = None,
     ):
         super().__init__(env, funcs, field, field_level, registry=registry)
         if key_rules is not None:
@@ -1070,7 +1077,7 @@ class OneofRules(Rules):
 
     required = True
 
-    def __init__(self, oneof: protobuf.DescOneof, rules: typing.Any):
+    def __init__(self, oneof: protobuf.DescOneof, rules: validate_pb.OneofRules):
         self._oneof = oneof
         if not rules.required:
             self.required = False
@@ -1102,7 +1109,7 @@ class RuleFactory:
     _env: celpy.Environment
     _funcs: dict[str, celpy.CELFunction]
 
-    def __init__(self, funcs: dict[str, celpy.CELFunction], registry: typing.Any = None):
+    def __init__(self, funcs: dict[str, celpy.CELFunction], registry: protobuf.Registry | None = None):
         self._env = celpy.Environment(runner_class=InterpretedRunner)
         self._funcs = funcs
         self._registry = registry
@@ -1120,7 +1127,7 @@ class RuleFactory:
             raise result
         return result
 
-    def _new_message_rule(self, rules: typing.Any, desc: protobuf.DescMessage) -> MessageRules:
+    def _new_message_rule(self, rules: validate_pb.MessageRules, desc: protobuf.DescMessage) -> MessageRules:
         result = MessageRules(rules, desc)
         for oneof in rules.oneof:
             result.add_oneof(oneof)
@@ -1133,7 +1140,7 @@ class RuleFactory:
     def _new_scalar_field_rule(
         self,
         field: _Field,
-        field_level: typing.Any,
+        field_level: validate_pb.FieldRules,
         *,
         for_items: bool = False,
         force_ignore_empty: bool = False,
@@ -1177,12 +1184,14 @@ class RuleFactory:
         msg = f"unknown rule type {type_case!r}"
         raise CompilationError(msg)
 
-    def _new_field_rule(self, field: _Field, rules: typing.Any, *, force_ignore_empty: bool = False) -> FieldRules:
+    def _new_field_rule(
+        self, field: _Field, rules: validate_pb.FieldRules, *, force_ignore_empty: bool = False
+    ) -> FieldRules:
         if not field.is_repeated:
             return self._new_scalar_field_rule(field, rules, force_ignore_empty=force_ignore_empty)
-        type_case = _which_type(rules)
+        type_oneof = rules.type
         if field.is_map:
-            map_rules: typing.Any = rules.type.value if type_case == "map" else None
+            map_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "map" else None
             key_field, value_field = field.key_field, field.value_field
             assert key_field is not None and value_field is not None  # noqa: S101
             key_rules = None
@@ -1195,7 +1204,7 @@ class RuleFactory:
         item_field = field.item_field
         assert item_field is not None  # noqa: S101
         item_rule = None
-        rep_rules: typing.Any = rules.type.value if type_case == "repeated" else None
+        rep_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "repeated" else None
         if rep_rules is not None and rep_rules.items is not None:
             item_rule = self._new_scalar_field_rule(item_field, rep_rules.items)
         return RepeatedRules(self._env, self._funcs, field, rules, item_rule, registry=self._registry)
@@ -1206,7 +1215,7 @@ class RuleFactory:
 
         msg_opts = desc.proto.options
         if msg_opts is not None and validate_pb.ext_message in msg_opts:
-            message_level: typing.Any = msg_opts[validate_pb.ext_message]
+            message_level: validate_pb.MessageRules = msg_opts[validate_pb.ext_message]
             for oneof in message_level.oneof:
                 all_msg_oneof_fields.update(oneof.fields)
             if rule := self._new_message_rule(message_level, desc):
@@ -1221,7 +1230,7 @@ class RuleFactory:
         for field_desc in desc.fields:
             field = _Field.of(field_desc)
             field_opts = field_desc.proto.options
-            field_level: typing.Any = None
+            field_level: validate_pb.FieldRules | None = None
             if field_opts is not None and validate_pb.ext_field in field_opts:
                 field_level = field_opts[validate_pb.ext_field]
             if field_level is not None:
@@ -1229,8 +1238,9 @@ class RuleFactory:
                 if field_level.ignore == validate_pb.Ignore.ALWAYS:
                     continue
                 result.append(self._new_field_rule(field, field_level, force_ignore_empty=force_ignore_empty))
-                if _which_type(field_level) == "repeated":
-                    rep: typing.Any = field_level.type.value  # ty: ignore[unresolved-attribute]
+                type_oneof = field_level.type
+                if type_oneof is not None and type_oneof.field == "repeated":
+                    rep = type_oneof.value
                     if rep.items is not None and rep.items.ignore == validate_pb.Ignore.ALWAYS:
                         continue
             sub_desc = _message_child(field)
