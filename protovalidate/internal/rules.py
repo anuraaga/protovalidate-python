@@ -95,71 +95,89 @@ def _scalar_zero(field_type: _FieldType) -> str | bytes | bool | float | int:
             return 0
 
 
-# ----- _Field: a uniform view over a protobuf-py DescField or a synthetic
-# map-key / map-value / list-item field (which protobuf-py does not model as
-# its own descriptor). -----
+# ----- value types -----
+#
+# protobuf-py models a map key/value or list element as a bare ScalarType /
+# DescMessage / DescEnum, not as a field, so _Leaf captures just that: a
+# CEL-convertible value type. _Field is a readable message field or extension
+# -- a value type that additionally has a number, presence, repeated/map
+# structure, and can be read from a message -- so it extends _Leaf.
 
 
-class _Field:
-    __slots__ = (
-        "desc",
-        "enum",
-        "has_presence",
-        "is_map",
-        "is_repeated",
-        "item_field",
-        "key_field",
-        "local_name",
-        "message",
-        "name",
-        "number",
-        "type",
-        "value_field",
-    )
+class _Leaf:
+    """The value type of a map key/value or list element."""
+
+    __slots__ = ("enum", "has_presence", "message", "name", "type")
 
     def __init__(
         self,
         *,
-        desc: DescField | Extension | None = None,
         type: _FieldType,  # noqa: A002
         name: str = "",
-        number: int = 0,
-        local_name: str = "",
         message: DescMessage | None = None,
         enum: DescEnum | None = None,
         has_presence: bool = False,
-        is_repeated: bool = False,
-        is_map: bool = False,
-        item_field: "_Field | None" = None,
-        key_field: "_Field | None" = None,
-        value_field: "_Field | None" = None,
     ):
-        self.desc = desc
         self.type = type
         self.name = name
-        self.number = number
-        self.local_name = local_name
         self.message = message
         self.enum = enum
         self.has_presence = has_presence
-        self.is_repeated = is_repeated
-        self.is_map = is_map
-        self.item_field = item_field
-        self.key_field = key_field
-        self.value_field = value_field
 
     @property
     def message_full_name(self) -> str | None:
         return self.message.type_name if self.message is not None else None
 
+
+def _leaf(kind: ScalarType | DescMessage | DescEnum, name: str = "") -> _Leaf:
+    """The value type of a map key/value or list element kind."""
+    if isinstance(kind, DescMessage):
+        return _Leaf(type=_FieldType.MESSAGE, name=name, message=kind)
+    if isinstance(kind, DescEnum):
+        return _Leaf(type=_FieldType.ENUM, name=name, enum=kind)
+    if isinstance(kind, ScalarType):
+        return _Leaf(type=_FieldType(int(kind)), name=name)
+    msg = "unknown map/list element kind"
+    raise CompilationError(msg)
+
+
+class _Field(_Leaf):
+    """A readable message field or extension."""
+
+    __slots__ = ("desc", "element_type", "is_map", "is_repeated", "key_type", "number", "value_type")
+
+    def __init__(
+        self,
+        *,
+        desc: DescField | Extension,
+        type: _FieldType,  # noqa: A002
+        name: str,
+        number: int,
+        message: DescMessage | None = None,
+        enum: DescEnum | None = None,
+        has_presence: bool = False,
+        is_repeated: bool = False,
+        is_map: bool = False,
+        element_type: _Leaf | None = None,
+        key_type: _Leaf | None = None,
+        value_type: _Leaf | None = None,
+    ):
+        super().__init__(type=type, name=name, message=message, enum=enum, has_presence=has_presence)
+        self.desc = desc
+        self.number = number
+        self.is_repeated = is_repeated
+        self.is_map = is_map
+        self.element_type = element_type
+        self.key_type = key_type
+        self.value_type = value_type
+
     def get(self, msg: Message) -> typing.Any:
         # Item access (by descriptor) reads any field kind uniformly, including
         # oneof members, which attribute access does not expose by member name.
-        assert self.desc is not None  # noqa: S101
         return msg[self.desc]
 
     def is_present(self, msg: Message) -> bool:
-        return self.desc is not None and self.desc in msg
+        return self.desc in msg
 
     @classmethod
     def of(cls, desc: DescField) -> "_Field":
@@ -175,11 +193,10 @@ class _Field:
                 type=field_type,
                 name=desc.name,
                 number=desc.number,
-                local_name=desc.local_name,
                 is_repeated=True,
                 is_map=True,
-                key_field=_leaf_field(value.key),
-                value_field=_leaf_field(value.value),
+                key_type=_leaf(value.key),
+                value_type=_leaf(value.value),
             )
         if isinstance(value, DescFieldValueList):
             return cls(
@@ -187,9 +204,8 @@ class _Field:
                 type=field_type,
                 name=desc.name,
                 number=desc.number,
-                local_name=desc.local_name,
                 is_repeated=True,
-                item_field=_leaf_field(value.element, name=desc.name, number=desc.number),
+                element_type=_leaf(value.element, desc.name),
             )
         message = value.message if isinstance(value, DescFieldValueMessage) else None
         enum = value.enum if isinstance(value, DescFieldValueEnum) else None
@@ -198,7 +214,6 @@ class _Field:
             type=field_type,
             name=desc.name,
             number=desc.number,
-            local_name=desc.local_name,
             message=message,
             enum=enum,
             has_presence=desc.presence.name != "IMPLICIT",
@@ -220,7 +235,7 @@ class _Field:
                 name=name,
                 number=ext.number,
                 is_repeated=True,
-                item_field=_leaf_field(value.element, name=name, number=ext.number),
+                element_type=_leaf(value.element, name),
             )
         message = value.message if isinstance(value, DescFieldValueMessage) else None
         enum = value.enum if isinstance(value, DescFieldValueEnum) else None
@@ -233,18 +248,6 @@ class _Field:
             enum=enum,
             has_presence=True,
         )
-
-
-def _leaf_field(kind: ScalarType | DescMessage | DescEnum, *, name: str = "", number: int = 0) -> _Field:
-    """Builds a synthetic _Field for a map key/value or list element kind."""
-    if isinstance(kind, ScalarType):
-        return _Field(type=_FieldType(int(kind)), name=name, number=number)
-    if isinstance(kind, DescMessage):
-        return _Field(type=_FieldType.MESSAGE, name=name, number=number, message=kind)
-    if isinstance(kind, DescEnum):
-        return _Field(type=_FieldType.ENUM, name=name, number=number, enum=kind)
-    msg = "unknown map/list element kind"
-    raise CompilationError(msg)
 
 
 # ----- value conversion: protobuf-py -> celpy celtypes -----
@@ -325,15 +328,15 @@ class MessageConverter:
         if field.is_map:
             return self._map(val, field)
         if field.is_repeated:
-            item_field = field.item_field
+            item_field = field.element_type
             assert item_field is not None  # noqa: S101
             return celtypes.ListType(self.scalar(item, item_field) for item in val)
         return self.scalar(val, field)
 
-    def scalar(self, val: typing.Any, field: _Field) -> celtypes.Value:
-        if field.type in (_FieldType.MESSAGE, _FieldType.GROUP):
+    def scalar(self, val: typing.Any, vt: _Leaf) -> celtypes.Value:
+        if vt.type in (_FieldType.MESSAGE, _FieldType.GROUP):
             return self.message(val)
-        ctor = _TYPE_CTORS.get(field.type)
+        ctor = _TYPE_CTORS.get(vt.type)
         if ctor is None:
             msg = "unknown field type"
             raise CompilationError(msg)
@@ -349,7 +352,7 @@ class MessageConverter:
         return self.scalar(_scalar_zero(field.type), field)
 
     def _map(self, mapping: Mapping[typing.Any, typing.Any], field: _Field) -> celtypes.Value:
-        key_field, value_field = field.key_field, field.value_field
+        key_field, value_field = field.key_type, field.value_type
         assert key_field is not None and value_field is not None  # noqa: S101
         result = celtypes.MapType()
         for key, val in mapping.items():
@@ -432,7 +435,7 @@ _UINT_KEY_TYPES = frozenset((_FieldType.UINT32, _FieldType.FIXED32, _FieldType.U
 
 
 def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathElement:
-    key_field, value_field = field.key_field, field.value_field
+    key_field, value_field = field.key_type, field.value_type
     assert key_field is not None and value_field is not None  # noqa: S101
     key_type = key_field.type
     subscript: Oneof
@@ -738,7 +741,7 @@ class MessageRules(CelRules):
         self._oneofs.append(MessageOneofRule(fields, required=rule.required))
 
 
-def check_field_type(field: _Field, expected: _FieldType | None, wrapper_name: str | None = None):
+def check_field_type(field: _Leaf, expected: _FieldType | None, wrapper_name: str | None = None):
     if field.type != expected and (field.type != _FieldType.MESSAGE or field.message_full_name != wrapper_name):
         if expected is None:
             expected_type_str = wrapper_name if wrapper_name is not None else "message"
@@ -762,7 +765,7 @@ class FieldRules(CelRules):
         self,
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
-        field: _Field,
+        field: _Leaf,
         field_level: validate_pb.FieldRules,
         *,
         for_items: bool = False,
@@ -844,12 +847,20 @@ class FieldRules(CelRules):
                 env, funcs, cel, rule_path=validate_pb.FieldPath(elements=[_indexed_field_element(cel_field, i)])
             )
 
+    @property
+    def _read_field(self) -> _Field:
+        # validate() reads from a message, so it only runs on real fields, never
+        # on the leaf value types used for map/list element rules.
+        assert isinstance(self._field, _Field)  # noqa: S101
+        return self._field
+
     def validate(self, ctx: RuleContext, message: Message):
-        if not self._field.is_present(message):
+        field = self._read_field
+        if not field.is_present(message):
             if self._required:
                 ctx.add(
                     Violation(
-                        field=validate_pb.FieldPath(elements=[_field_to_element(self._field)]),
+                        field=validate_pb.FieldPath(elements=[_field_to_element(field)]),
                         rule=FieldRules._required_rule_path,
                         rule_value=self._required,
                         rule_id="required",
@@ -859,16 +870,16 @@ class FieldRules(CelRules):
                 return
             if self._ignore_empty:
                 return
-        val = self._field.get(message)
-        cel_val = self._conv.field_value(val, self._field)
+        val = field.get(message)
+        cel_val = self._conv.field_value(val, field)
         sub_ctx = ctx.sub_context()
         self._validate_value(sub_ctx, val)
         self._validate_cel(sub_ctx, this_value=val, this_cel=cel_val)
         if sub_ctx.has_errors():
-            sub_ctx.add_field_path_element(_field_to_element(self._field))
+            sub_ctx.add_field_path_element(_field_to_element(field))
             ctx.add_errors(sub_ctx)
 
-    def validate_item(self, ctx: RuleContext, value: typing.Any, item_field: _Field, *, for_key: bool = False):
+    def validate_item(self, ctx: RuleContext, value: typing.Any, item_field: _Leaf, *, for_key: bool = False):
         self._validate_value(ctx, value, for_key=for_key)
         self._validate_cel(ctx, this_value=value, this_cel=self._conv.scalar(value, item_field), for_key=for_key)
 
@@ -897,7 +908,7 @@ class AnyRules(FieldRules):
         self,
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
-        field: _Field,
+        field: _Leaf,
         field_level: validate_pb.FieldRules,
         *,
         registry: Registry | None = None,
@@ -949,7 +960,7 @@ class EnumRules(FieldRules):
         self,
         env: celpy.Environment,
         funcs: dict[str, celpy.CELFunction],
-        field: _Field,
+        field: _Leaf,
         field_level: validate_pb.FieldRules,
         *,
         for_items: bool = False,
@@ -977,10 +988,11 @@ class EnumRules(FieldRules):
         super().validate(ctx, message)
         if ctx.done:
             return
-        if self._defined_only and int(self._field.get(message)) not in self._defined_numbers:
+        field = self._read_field
+        if self._defined_only and int(field.get(message)) not in self._defined_numbers:
             ctx.add(
                 Violation(
-                    field=validate_pb.FieldPath(elements=[_field_to_element(self._field)]),
+                    field=validate_pb.FieldPath(elements=[_field_to_element(field)]),
                     rule=EnumRules._defined_only_rule_path,
                     rule_value=self._defined_only,
                     rule_id="enum.defined_only",
@@ -1020,15 +1032,16 @@ class RepeatedRules(FieldRules):
             return
         if self._item_rules is None:
             return
-        item_field = self._field.item_field
+        field = self._read_field
+        item_field = field.element_type
         assert item_field is not None  # noqa: S101
-        for i, item in enumerate(self._field.get(message)):
+        for i, item in enumerate(field.get(message)):
             if self._item_rules._ignore_empty and not item:
                 continue
             sub_ctx = ctx.sub_context()
             self._item_rules.validate_item(sub_ctx, item, item_field)
             if sub_ctx.has_errors():
-                sub_ctx.add_field_path_element(_indexed_field_element(self._field, i))
+                sub_ctx.add_field_path_element(_indexed_field_element(field, i))
                 sub_ctx.add_rule_path_elements(RepeatedRules._items_rules_suffix)
                 ctx.add_errors(sub_ctx)
             if ctx.done:
@@ -1073,10 +1086,11 @@ class MapRules(FieldRules):
         super().validate(ctx, message)
         if ctx.done:
             return
-        key_field = self._field.key_field
-        value_field = self._field.value_field
+        field = self._read_field
+        key_field = field.key_type
+        value_field = field.value_type
         assert key_field is not None and value_field is not None  # noqa: S101
-        for k, v in self._field.get(message).items():
+        for k, v in field.get(message).items():
             key_ctx = ctx.sub_context()
             if self._key_rules is not None and (not self._key_rules._ignore_empty or k):
                 self._key_rules.validate_item(key_ctx, k, key_field, for_key=True)
@@ -1089,7 +1103,7 @@ class MapRules(FieldRules):
                     map_ctx.add_rule_path_elements(MapRules._value_rules_suffix)
             map_ctx.add_errors(key_ctx)
             if map_ctx.has_errors():
-                map_ctx.add_field_path_element(_map_key_element(self._field, k))
+                map_ctx.add_field_path_element(_map_key_element(field, k))
                 ctx.add_errors(map_ctx)
 
 
@@ -1118,9 +1132,9 @@ class OneofRules(Rules):
 
 def _message_child(field: _Field) -> DescMessage | None:
     if field.is_map:
-        return field.value_field.message if field.value_field is not None else None
+        return field.value_type.message if field.value_type is not None else None
     if field.is_repeated:
-        return field.item_field.message if field.item_field is not None else None
+        return field.element_type.message if field.element_type is not None else None
     return field.message
 
 
@@ -1161,7 +1175,7 @@ class RuleFactory:
 
     def _new_scalar_field_rule(
         self,
-        field: _Field,
+        field: _Leaf,
         field_level: validate_pb.FieldRules,
         *,
         for_items: bool = False,
@@ -1219,7 +1233,7 @@ class RuleFactory:
         type_oneof = rules.type
         if field.is_map:
             map_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "map" else None
-            key_field, value_field = field.key_field, field.value_field
+            key_field, value_field = field.key_type, field.value_type
             assert key_field is not None and value_field is not None  # noqa: S101
             key_rules = None
             value_rules = None
@@ -1230,7 +1244,7 @@ class RuleFactory:
             return MapRules(
                 self._env, self._funcs, field, rules, key_rules, value_rules, registry=self._registry, conv=self._conv
             )
-        item_field = field.item_field
+        item_field = field.element_type
         assert item_field is not None  # noqa: S101
         item_rule = None
         rep_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "repeated" else None
