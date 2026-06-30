@@ -50,22 +50,14 @@ from protobuf import (
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal.cel_field_presence import InterpretedRunner, in_has
 
-# FieldDescriptorProto.Type numbers (shared between google and protobuf-py).
-_TYPE_MESSAGE = 11
-_TYPE_GROUP = 10
-_TYPE_ENUM = 14
+_FieldType = wkt.descriptor_pb.FieldDescriptorProto.Type
 
 
 class CompilationError(Exception):
     pass
 
 
-# ----- field type metadata, keyed on the wire type number -----
-
-
-class _FieldTypeMeta(typing.TypedDict):
-    name: str
-    ctor: Callable[..., celtypes.Value]
+# ----- field type metadata: a celtypes constructor per field type -----
 
 
 def _msg_to_cel(msg: Message) -> celtypes.Value:
@@ -75,31 +67,30 @@ def _msg_to_cel(msg: Message) -> celtypes.Value:
     return MessageType(msg)
 
 
-_TYPE_META: dict[int, _FieldTypeMeta] = {
-    _TYPE_MESSAGE: {"name": "message", "ctor": _msg_to_cel},
-    _TYPE_GROUP: {"name": "group", "ctor": _msg_to_cel},
-    _TYPE_ENUM: {"name": "enum", "ctor": lambda v: celtypes.IntType(int(v))},
-    8: {"name": "bool", "ctor": celtypes.BoolType},
-    12: {"name": "bytes", "ctor": celtypes.BytesType},
-    9: {"name": "string", "ctor": celtypes.StringType},
-    2: {"name": "float", "ctor": celtypes.DoubleType},
-    1: {"name": "double", "ctor": celtypes.DoubleType},
-    5: {"name": "int32", "ctor": celtypes.IntType},
-    3: {"name": "int64", "ctor": celtypes.IntType},
-    17: {"name": "sint32", "ctor": celtypes.IntType},
-    18: {"name": "sint64", "ctor": celtypes.IntType},
-    15: {"name": "sfixed32", "ctor": celtypes.IntType},
-    16: {"name": "sfixed64", "ctor": celtypes.IntType},
-    13: {"name": "uint32", "ctor": celtypes.UintType},
-    4: {"name": "uint64", "ctor": celtypes.UintType},
-    7: {"name": "fixed32", "ctor": celtypes.UintType},
-    6: {"name": "fixed64", "ctor": celtypes.UintType},
+_TYPE_CTORS: dict[_FieldType, Callable[..., celtypes.Value]] = {
+    _FieldType.MESSAGE: _msg_to_cel,
+    _FieldType.GROUP: _msg_to_cel,
+    _FieldType.ENUM: lambda v: celtypes.IntType(int(v)),
+    _FieldType.BOOL: celtypes.BoolType,
+    _FieldType.BYTES: celtypes.BytesType,
+    _FieldType.STRING: celtypes.StringType,
+    _FieldType.FLOAT: celtypes.DoubleType,
+    _FieldType.DOUBLE: celtypes.DoubleType,
+    _FieldType.INT32: celtypes.IntType,
+    _FieldType.INT64: celtypes.IntType,
+    _FieldType.SINT32: celtypes.IntType,
+    _FieldType.SINT64: celtypes.IntType,
+    _FieldType.SFIXED32: celtypes.IntType,
+    _FieldType.SFIXED64: celtypes.IntType,
+    _FieldType.UINT32: celtypes.UintType,
+    _FieldType.UINT64: celtypes.UintType,
+    _FieldType.FIXED32: celtypes.UintType,
+    _FieldType.FIXED64: celtypes.UintType,
 }
 
 
-def _get_type_name(type_num: int) -> str:
-    meta = _TYPE_META.get(type_num)
-    return meta["name"] if meta is not None else "unknown"
+def _get_type_name(field_type: _FieldType) -> str:
+    return field_type.name.lower()
 
 
 def _fields_by_name(desc: DescMessage) -> dict[str, DescField]:
@@ -108,14 +99,14 @@ def _fields_by_name(desc: DescMessage) -> dict[str, DescField]:
     return {field.name: field for field in desc.fields}
 
 
-def _scalar_zero(type_num: int) -> str | bytes | bool | float | int:
-    if type_num == 9:
+def _scalar_zero(field_type: _FieldType) -> str | bytes | bool | float | int:
+    if field_type == _FieldType.STRING:
         return ""
-    if type_num == 12:
+    if field_type == _FieldType.BYTES:
         return b""
-    if type_num == 8:
+    if field_type == _FieldType.BOOL:
         return False
-    if type_num in (1, 2):
+    if field_type in (_FieldType.DOUBLE, _FieldType.FLOAT):
         return 0.0
     return 0
 
@@ -146,7 +137,7 @@ class _Field:
         self,
         *,
         desc: DescField | Extension | None = None,
-        type: int,  # noqa: A002
+        type: _FieldType,  # noqa: A002
         name: str = "",
         number: int = 0,
         local_name: str = "",
@@ -189,15 +180,15 @@ class _Field:
     @classmethod
     def of(cls, desc: DescField) -> "_Field":
         value = desc.value
-        type_num = int(desc.proto.type)
+        field_type = _FieldType(desc.proto.type)
         # Delimited (proto2 group / editions delimited) message fields report
         # the GROUP wire type in field paths.
         if getattr(value, "delimited_encoding", False):
-            type_num = _TYPE_GROUP
+            field_type = _FieldType.GROUP
         if isinstance(value, DescFieldValueMap):
             return cls(
                 desc=desc,
-                type=type_num,
+                type=field_type,
                 name=desc.name,
                 number=desc.number,
                 local_name=desc.local_name,
@@ -209,7 +200,7 @@ class _Field:
         if isinstance(value, DescFieldValueList):
             return cls(
                 desc=desc,
-                type=type_num,
+                type=field_type,
                 name=desc.name,
                 number=desc.number,
                 local_name=desc.local_name,
@@ -220,7 +211,7 @@ class _Field:
         enum = value.enum if isinstance(value, DescFieldValueEnum) else None
         return cls(
             desc=desc,
-            type=type_num,
+            type=field_type,
             name=desc.name,
             number=desc.number,
             local_name=desc.local_name,
@@ -234,14 +225,14 @@ class _Field:
         """A _Field for a proto2 extension on a rules message (read via the
         Extension object; the path uses the bracketed extension name)."""
         value = ext.value
-        type_num = int(ext.proto.type)
+        field_type = _FieldType(ext.proto.type)
         if getattr(value, "delimited_encoding", False):
-            type_num = _TYPE_GROUP
+            field_type = _FieldType.GROUP
         name = f"[{ext.type_name}]"
         if isinstance(value, DescFieldValueList):
             return cls(
                 desc=ext.type,
-                type=type_num,
+                type=field_type,
                 name=name,
                 number=ext.number,
                 is_repeated=True,
@@ -251,7 +242,7 @@ class _Field:
         enum = value.enum if isinstance(value, DescFieldValueEnum) else None
         return cls(
             desc=ext.type,
-            type=type_num,
+            type=field_type,
             name=name,
             number=ext.number,
             message=message,
@@ -263,11 +254,11 @@ class _Field:
 def _leaf_field(kind: ScalarType | DescMessage | DescEnum, *, name: str = "", number: int = 0) -> _Field:
     """Builds a synthetic _Field for a map key/value or list element kind."""
     if isinstance(kind, ScalarType):
-        return _Field(type=int(kind), name=name, number=number)
+        return _Field(type=_FieldType(int(kind)), name=name, number=number)
     if isinstance(kind, DescMessage):
-        return _Field(type=_TYPE_MESSAGE, name=name, number=number, message=kind)
+        return _Field(type=_FieldType.MESSAGE, name=name, number=number, message=kind)
     if isinstance(kind, DescEnum):
-        return _Field(type=_TYPE_ENUM, name=name, number=number, enum=kind)
+        return _Field(type=_FieldType.ENUM, name=name, number=number, enum=kind)
     msg = "unknown map/list element kind"
     raise CompilationError(msg)
 
@@ -304,11 +295,11 @@ _WKT_CTORS: dict[str, Callable[..., celtypes.Value]] = {
 
 
 def _scalar_to_cel(val: typing.Any, field: _Field) -> celtypes.Value:
-    meta = _TYPE_META.get(field.type)
-    if meta is None:
+    ctor = _TYPE_CTORS.get(field.type)
+    if ctor is None:
         msg = "unknown field type"
         raise CompilationError(msg)
-    return meta["ctor"](val)
+    return ctor(val)
 
 
 def _map_to_cel(mapping: Mapping[typing.Any, typing.Any], field: _Field) -> celtypes.Value:
@@ -379,15 +370,11 @@ class MessageType(celtypes.MapType):
 # ----- protobuf-py validate_pb path / element construction -----
 
 
-def _ftype(type_num: int) -> wkt.descriptor_pb.FieldDescriptorProto.Type:
-    return wkt.descriptor_pb.FieldDescriptorProto.Type(type_num)
-
-
 def _field_to_element(field: _Field) -> validate_pb.FieldPathElement:
     return validate_pb.FieldPathElement(
         field_number=field.number,
         field_name=field.name,
-        field_type=_ftype(field.type),
+        field_type=field.type,
     )
 
 
@@ -395,7 +382,7 @@ def _indexed_field_element(field: _Field, index: int) -> validate_pb.FieldPathEl
     return validate_pb.FieldPathElement(
         field_number=field.number,
         field_name=field.name,
-        field_type=_ftype(field.type),
+        field_type=field.type,
         subscript=Oneof(field="index", value=index),
     )
 
@@ -404,8 +391,17 @@ def _oneof_to_element(oneof: DescOneof) -> validate_pb.FieldPathElement:
     return validate_pb.FieldPathElement(field_name=oneof.name)
 
 
-_INT_KEY_TYPES = frozenset((5, 15, 3, 16, 17, 18))
-_UINT_KEY_TYPES = frozenset((13, 7, 4, 6))
+_INT_KEY_TYPES = frozenset(
+    (
+        _FieldType.INT32,
+        _FieldType.SFIXED32,
+        _FieldType.INT64,
+        _FieldType.SFIXED64,
+        _FieldType.SINT32,
+        _FieldType.SINT64,
+    )
+)
+_UINT_KEY_TYPES = frozenset((_FieldType.UINT32, _FieldType.FIXED32, _FieldType.UINT64, _FieldType.FIXED64))
 
 
 def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathElement:
@@ -413,13 +409,13 @@ def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathEle
     assert key_field is not None and value_field is not None  # noqa: S101
     key_type = key_field.type
     subscript: Oneof
-    if key_type == 8:
+    if key_type == _FieldType.BOOL:
         subscript = Oneof(field="bool_key", value=key)
     elif key_type in _INT_KEY_TYPES:
         subscript = Oneof(field="int_key", value=key)
     elif key_type in _UINT_KEY_TYPES:
         subscript = Oneof(field="uint_key", value=key)
-    elif key_type == 9:
+    elif key_type == _FieldType.STRING:
         subscript = Oneof(field="string_key", value=key)
     else:
         msg = "unexpected map type"
@@ -427,9 +423,9 @@ def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathEle
     return validate_pb.FieldPathElement(
         field_number=field.number,
         field_name=field.name,
-        field_type=_ftype(field.type),
-        key_type=_ftype(key_type),
-        value_type=_ftype(value_field.type),
+        field_type=field.type,
+        key_type=key_type,
+        value_type=value_field.type,
         subscript=subscript,
     )
 
@@ -729,11 +725,11 @@ class MessageRules(CelRules):
         self._oneofs.append(MessageOneofRule(fields, required=rule.required))
 
 
-def check_field_type(field: _Field, expected: int, wrapper_name: str | None = None):
-    if field.type != expected and (field.type != _TYPE_MESSAGE or field.message_full_name != wrapper_name):
+def check_field_type(field: _Field, expected: _FieldType | None, wrapper_name: str | None = None):
+    if field.type != expected and (field.type != _FieldType.MESSAGE or field.message_full_name != wrapper_name):
         field_type_str = _get_type_name(field.type)
-        if expected == 0:
-            expected_type_str = wrapper_name if wrapper_name is not None else _get_type_name(_TYPE_MESSAGE)
+        if expected is None:
+            expected_type_str = wrapper_name if wrapper_name is not None else _get_type_name(_FieldType.MESSAGE)
         else:
             expected_type_str = _get_type_name(expected)
         msg = f"field {field.name} has type {field_type_str} but expected {expected_type_str}"
@@ -1155,33 +1151,33 @@ class RuleFactory:
             return None
         type_case = _which_type(field_level)
         kw = {"for_items": for_items, "force_ignore_empty": force_ignore_empty, "registry": self._registry}
-        checks: dict[str, tuple[int, str | None]] = {
-            "duration": (0, "google.protobuf.Duration"),
-            "field_mask": (0, "google.protobuf.FieldMask"),
-            "timestamp": (0, "google.protobuf.Timestamp"),
-            "bool": (8, "google.protobuf.BoolValue"),
-            "bytes": (12, "google.protobuf.BytesValue"),
-            "fixed32": (7, None),
-            "fixed64": (6, None),
-            "float": (2, "google.protobuf.FloatValue"),
-            "double": (1, "google.protobuf.DoubleValue"),
-            "int32": (5, "google.protobuf.Int32Value"),
-            "int64": (3, "google.protobuf.Int64Value"),
-            "sfixed32": (15, None),
-            "sfixed64": (16, None),
-            "sint32": (17, None),
-            "sint64": (18, None),
-            "uint32": (13, "google.protobuf.UInt32Value"),
-            "uint64": (4, "google.protobuf.UInt64Value"),
-            "string": (9, "google.protobuf.StringValue"),
+        checks: dict[str, tuple[_FieldType | None, str | None]] = {
+            "duration": (None, "google.protobuf.Duration"),
+            "field_mask": (None, "google.protobuf.FieldMask"),
+            "timestamp": (None, "google.protobuf.Timestamp"),
+            "bool": (_FieldType.BOOL, "google.protobuf.BoolValue"),
+            "bytes": (_FieldType.BYTES, "google.protobuf.BytesValue"),
+            "fixed32": (_FieldType.FIXED32, None),
+            "fixed64": (_FieldType.FIXED64, None),
+            "float": (_FieldType.FLOAT, "google.protobuf.FloatValue"),
+            "double": (_FieldType.DOUBLE, "google.protobuf.DoubleValue"),
+            "int32": (_FieldType.INT32, "google.protobuf.Int32Value"),
+            "int64": (_FieldType.INT64, "google.protobuf.Int64Value"),
+            "sfixed32": (_FieldType.SFIXED32, None),
+            "sfixed64": (_FieldType.SFIXED64, None),
+            "sint32": (_FieldType.SINT32, None),
+            "sint64": (_FieldType.SINT64, None),
+            "uint32": (_FieldType.UINT32, "google.protobuf.UInt32Value"),
+            "uint64": (_FieldType.UINT64, "google.protobuf.UInt64Value"),
+            "string": (_FieldType.STRING, "google.protobuf.StringValue"),
         }
         if type_case is None:
             return FieldRules(self._env, self._funcs, field, field_level, **kw)
         if type_case == "enum":
-            check_field_type(field, _TYPE_ENUM)
+            check_field_type(field, _FieldType.ENUM)
             return EnumRules(self._env, self._funcs, field, field_level, **kw)
         if type_case == "any":
-            check_field_type(field, 0, "google.protobuf.Any")
+            check_field_type(field, None, "google.protobuf.Any")
             return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry)
         if type_case in checks:
             expected, wrapper = checks[type_case]
