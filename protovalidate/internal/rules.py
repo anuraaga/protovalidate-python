@@ -31,7 +31,6 @@ import celpy
 import protobuf
 from celpy import celtypes
 from protobuf import Oneof, wkt
-from protobuf._descriptors import SupportedFieldPresence
 
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal.cel_field_presence import InterpretedRunner, in_has
@@ -93,6 +92,12 @@ _TYPE_META: dict[int, _FieldTypeMeta] = {
 def _get_type_name(type_num: int) -> str:
     meta = _TYPE_META.get(type_num)
     return meta["name"] if meta is not None else "unknown"
+
+
+def _fields_by_name(desc: protobuf.DescMessage) -> dict[str, protobuf.DescField]:
+    """A name -> field map computed from the public field list (protobuf-py
+    descriptors do not expose a public fields_by_name)."""
+    return {field.name: field for field in desc.fields}
 
 
 def _scalar_zero(type_num: int) -> typing.Any:
@@ -213,7 +218,7 @@ class _Field:
             local_name=desc.local_name,
             message=message,
             enum=enum,
-            has_presence=desc.presence != SupportedFieldPresence.IMPLICIT,
+            has_presence=desc.presence.name != "IMPLICIT",
         )
 
     @classmethod
@@ -271,7 +276,7 @@ def make_timestamp(msg: typing.Any) -> celtypes.TimestampType:
 
 
 def _unwrap(msg: protobuf.Message) -> celtypes.Value:
-    value_field = _Field.of(type(msg).desc()._fields_by_name["value"])
+    value_field = _Field.of(_fields_by_name(type(msg).desc())["value"])
     return _scalar_to_cel(value_field.get(msg), value_field)
 
 
@@ -346,6 +351,7 @@ class MessageType(celtypes.MapType):
         super().__init__()
         self.msg = msg
         self.desc = type(msg).desc()
+        self.fields_by_name = _fields_by_name(self.desc)
         self._oneof_field_names = {f.name for oneof in self.desc.oneofs for f in oneof.fields}
         for fdesc in self.desc.fields:
             if fdesc.name in self._oneof_field_names and fdesc not in msg:
@@ -353,7 +359,7 @@ class MessageType(celtypes.MapType):
             self[fdesc.name] = field_to_cel(msg, _Field.of(fdesc))
 
     def __getitem__(self, key):
-        fdesc = self.desc._fields_by_name[key]
+        fdesc = self.fields_by_name[key]
         field = _Field.of(fdesc)
         if field.has_presence and fdesc not in self.msg:
             if in_has():
@@ -421,7 +427,7 @@ def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathEle
 
 
 def _spec_field(rules_cls: typing.Any, name: str) -> protobuf.DescField:
-    return rules_cls.desc()._fields_by_name[name]
+    return _fields_by_name(rules_cls.desc())[name]
 
 
 def _spec_element(pb_field: protobuf.DescField) -> validate_pb.FieldPathElement:
@@ -701,12 +707,13 @@ class MessageRules(CelRules):
         if len(rule.fields) == 0:
             msg = f"at least one field must be specified in oneof rule for the message {self._desc.type_name}"
             raise CompilationError(msg)
+        desc_fields = _fields_by_name(self._desc)
         for name in rule.fields:
-            if name in self._desc._fields_by_name:
+            if name in desc_fields:
                 if name in seen:
                     msg = f"duplicate {name} in oneof rule for the message {self._desc.type_name}"
                     raise CompilationError(msg)
-                fields.append(_Field.of(self._desc._fields_by_name[name]))
+                fields.append(_Field.of(desc_fields[name]))
                 seen.add(name)
             else:
                 msg = f'field "{name}" not found in message {self._desc.type_name}'
@@ -779,12 +786,19 @@ class FieldRules(CelRules):
                         ),
                     )
             # Custom predefined rules are proto2 extensions on the rules message
-            # that the bundled stub cannot decode (they remain as unknown
-            # fields); a caller-supplied Registry resolves them.
+            # that the bundled stub cannot decode; a caller-supplied Registry
+            # knows them, so apply each extension of this rules message that is
+            # set and carries a predefined rule.
             if registry is not None:
-                for number in getattr(rules_pb, "_unknown_fields", None) or {}:
-                    ext = registry.extension_for(type(rules_pb).desc(), number)
-                    if ext is None or ext.proto.options is None or validate_pb.ext_predefined not in ext.proto.options:
+                rules_type_name = type(rules_pb).desc().type_name
+                for ext in registry:
+                    if (
+                        not isinstance(ext, protobuf.DescExtension)
+                        or ext.extendee.type_name != rules_type_name
+                        or ext.proto.options is None
+                        or validate_pb.ext_predefined not in ext.proto.options
+                        or ext.type not in rules_pb
+                    ):
                         continue
                     ext_field = _Field.of_extension(ext)
                     for cel in ext.proto.options[validate_pb.ext_predefined].cel:
