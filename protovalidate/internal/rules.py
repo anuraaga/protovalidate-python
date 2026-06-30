@@ -107,7 +107,7 @@ def _scalar_zero(field_type: _FieldType) -> str | bytes | bool | float | int:
 class _Leaf:
     """The value type of a map key/value or list element."""
 
-    __slots__ = ("enum", "has_presence", "message", "name", "type")
+    __slots__ = ("enum", "message", "name", "type")
 
     def __init__(
         self,
@@ -116,13 +116,11 @@ class _Leaf:
         name: str = "",
         message: DescMessage | None = None,
         enum: DescEnum | None = None,
-        has_presence: bool = False,
     ):
         self.type = type
         self.name = name
         self.message = message
         self.enum = enum
-        self.has_presence = has_presence
 
     @property
     def message_full_name(self) -> str | None:
@@ -142,9 +140,14 @@ def _leaf(kind: ScalarType | DescMessage | DescEnum, name: str = "") -> _Leaf:
 
 
 class _Field(_Leaf):
-    """A readable message field or extension."""
+    """A readable message field or extension.
 
-    __slots__ = ("desc", "element_type", "is_map", "is_repeated", "key_type", "number", "value_type")
+    Read its value with ``msg[field.desc]`` and test presence with
+    ``field.desc in msg``: descriptor item access reads any field kind
+    uniformly, including oneof members (which attribute access hides).
+    """
+
+    __slots__ = ("desc", "element_type", "has_presence", "is_map", "is_repeated", "key_type", "number", "value_type")
 
     def __init__(
         self,
@@ -162,22 +165,15 @@ class _Field(_Leaf):
         key_type: _Leaf | None = None,
         value_type: _Leaf | None = None,
     ):
-        super().__init__(type=type, name=name, message=message, enum=enum, has_presence=has_presence)
+        super().__init__(type=type, name=name, message=message, enum=enum)
         self.desc = desc
         self.number = number
+        self.has_presence = has_presence
         self.is_repeated = is_repeated
         self.is_map = is_map
         self.element_type = element_type
         self.key_type = key_type
         self.value_type = value_type
-
-    def get(self, msg: Message) -> typing.Any:
-        # Item access (by descriptor) reads any field kind uniformly, including
-        # oneof members, which attribute access does not expose by member name.
-        return msg[self.desc]
-
-    def is_present(self, msg: Message) -> bool:
-        return self.desc in msg
 
     @classmethod
     def of(cls, desc: DescField) -> "_Field":
@@ -319,10 +315,10 @@ class MessageConverter:
 
     def field(self, msg: Message, field: _Field) -> celtypes.Value:
         if field.is_repeated:
-            return self.field_value(field.get(msg), field)
-        if field.message is not None and not field.is_present(msg):
+            return self.field_value(msg[field.desc], field)
+        if field.message is not None and field.desc not in msg:
             return None
-        return self.scalar(field.get(msg), field)
+        return self.scalar(msg[field.desc], field)
 
     def field_value(self, val: typing.Any, field: _Field) -> celtypes.Value:
         if field.is_map:
@@ -361,7 +357,7 @@ class MessageConverter:
 
     def _unwrap(self, msg: Message) -> celtypes.Value:
         value_field = self.shape(type(msg).desc()).fields["value"]
-        return self.scalar(value_field.get(msg), value_field)
+        return self.scalar(msg[value_field.desc], value_field)
 
 
 class MessageType(celtypes.MapType):
@@ -390,7 +386,7 @@ class MessageType(celtypes.MapType):
 
     def __getitem__(self, key):
         field = self._shape.fields[key]
-        if not field.is_present(self.msg):
+        if field.desc not in self.msg:
             if in_has():
                 raise KeyError
             return self._conv.zero(field)
@@ -663,7 +659,7 @@ class CelRules(Rules):
         rule_value = None
         rule_cel = None
         if rule_field is not None and self._rules is not None:
-            rule_value = rule_field.get(self._rules)
+            rule_value = self._rules[rule_field.desc]
             rule_cel = self._conv.field(self._rules, rule_field)
         self._cel.append(
             CelRunner(
@@ -684,7 +680,7 @@ class MessageOneofRule(Rules):
         self._required = required
 
     def validate(self, ctx: RuleContext, message: Message):
-        num_set_fields = sum(1 for field in self._fields if field.is_present(message))
+        num_set_fields = sum(1 for field in self._fields if field.desc in message)
         if num_set_fields > 1:
             ctx.add(
                 Violation(
@@ -806,7 +802,8 @@ class FieldRules(CelRules):
         self._ignore_empty = (
             field_level.ignore == validate_pb.Ignore.IF_ZERO_VALUE
             or force_ignore_empty
-            or (field.has_presence and not for_items)
+            # A presence-tracking field (not a map/list element) ignores empty by default.
+            or (not for_items and isinstance(field, _Field) and field.has_presence)
         )
         self._required = field_level.required
         if rules_pb is not None:
@@ -881,7 +878,7 @@ class FieldRules(CelRules):
 
     def validate(self, ctx: RuleContext, message: Message):
         field = self._read_field
-        if not field.is_present(message):
+        if field.desc not in message:
             if self._required:
                 ctx.add(
                     Violation(
@@ -895,7 +892,7 @@ class FieldRules(CelRules):
                 return
             if self._ignore_empty:
                 return
-        val = field.get(message)
+        val = message[field.desc]
         cel_val = self._conv.field_value(val, field)
         sub_ctx = ctx.sub_context()
         self._validate_value(sub_ctx, val)
@@ -1014,7 +1011,7 @@ class EnumRules(FieldRules):
         if ctx.done:
             return
         field = self._read_field
-        if self._defined_only and int(field.get(message)) not in self._defined_numbers:
+        if self._defined_only and int(message[field.desc]) not in self._defined_numbers:
             ctx.add(
                 Violation(
                     field=validate_pb.FieldPath(elements=[_field_to_element(field)]),
@@ -1060,7 +1057,7 @@ class RepeatedRules(FieldRules):
         field = self._read_field
         item_field = field.element_type
         assert item_field is not None  # noqa: S101
-        for i, item in enumerate(field.get(message)):
+        for i, item in enumerate(message[field.desc]):
             if self._item_rules._ignore_empty and not item:
                 continue
             sub_ctx = ctx.sub_context()
@@ -1115,7 +1112,7 @@ class MapRules(FieldRules):
         key_field = field.key_type
         value_field = field.value_type
         assert key_field is not None and value_field is not None  # noqa: S101
-        for k, v in field.get(message).items():
+        for k, v in message[field.desc].items():
             key_ctx = ctx.sub_context()
             if self._key_rules is not None and (not self._key_rules._ignore_empty or k):
                 self._key_rules.validate_item(key_ctx, k, key_field, for_key=True)
@@ -1282,9 +1279,7 @@ class RuleFactory:
             if field_opts is not None and validate_pb.ext_field in field_opts:
                 field_level = field_opts[validate_pb.ext_field]
             if field_level is not None:
-                force_ignore_empty = (
-                    not ignore_field.is_present(field_level) and field_desc.name in all_msg_oneof_fields
-                )
+                force_ignore_empty = ignore_field.desc not in field_level and field_desc.name in all_msg_oneof_fields
                 if field_level.ignore == validate_pb.Ignore.ALWAYS:
                     continue
                 result.append(self._new_field_rule(field, field_level, force_ignore_empty=force_ignore_empty))
@@ -1330,17 +1325,17 @@ class _SubMessageRule(Rules):
 
 class SubMsgRule(_SubMessageRule):
     def validate(self, ctx: RuleContext, message: Message):
-        if self._field.is_present(message):
-            self._validate_each(ctx, [(self._field.get(message), _field_to_element(self._field))])
+        if self._field.desc in message:
+            self._validate_each(ctx, [(message[self._field.desc], _field_to_element(self._field))])
 
 
 class MapValMsgRule(_SubMessageRule):
     def validate(self, ctx: RuleContext, message: Message):
-        val = self._field.get(message)
+        val = message[self._field.desc]
         self._validate_each(ctx, ((v, _map_key_element(self._field, k)) for k, v in val.items()))
 
 
 class RepeatedMsgRule(_SubMessageRule):
     def validate(self, ctx: RuleContext, message: Message):
-        val = self._field.get(message)
+        val = message[self._field.desc]
         self._validate_each(ctx, ((item, _indexed_field_element(self._field, i)) for i, item in enumerate(val)))
