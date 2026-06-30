@@ -37,6 +37,7 @@ from protobuf import (
     DescFieldValueList,
     DescFieldValueMap,
     DescFieldValueMessage,
+    DescFieldValueScalar,
     DescMessage,
     DescOneof,
     Extension,
@@ -50,46 +51,43 @@ from protobuf.wkt import Duration, FieldDescriptorProto, Timestamp
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal.cel_field_presence import InterpretedRunner, in_has
 
-_FieldType = FieldDescriptorProto.Type
-
 
 class CompilationError(Exception):
     pass
 
 
-# ----- scalar/enum field type -> celtypes constructor (message and group
-# values are converted by MessageConverter, dispatching on the descriptor) -----
+# ----- scalar type -> celtypes constructor (enum/message values are converted
+# by MessageConverter, dispatching on the descriptor) -----
 
 
-_TYPE_CTORS: dict[_FieldType, Callable[..., celtypes.Value]] = {
-    _FieldType.ENUM: lambda v: celtypes.IntType(int(v)),
-    _FieldType.BOOL: celtypes.BoolType,
-    _FieldType.BYTES: celtypes.BytesType,
-    _FieldType.STRING: celtypes.StringType,
-    _FieldType.FLOAT: celtypes.DoubleType,
-    _FieldType.DOUBLE: celtypes.DoubleType,
-    _FieldType.INT32: celtypes.IntType,
-    _FieldType.INT64: celtypes.IntType,
-    _FieldType.SINT32: celtypes.IntType,
-    _FieldType.SINT64: celtypes.IntType,
-    _FieldType.SFIXED32: celtypes.IntType,
-    _FieldType.SFIXED64: celtypes.IntType,
-    _FieldType.UINT32: celtypes.UintType,
-    _FieldType.UINT64: celtypes.UintType,
-    _FieldType.FIXED32: celtypes.UintType,
-    _FieldType.FIXED64: celtypes.UintType,
+_TYPE_CTORS: dict[ScalarType, Callable[..., celtypes.Value]] = {
+    ScalarType.BOOL: celtypes.BoolType,
+    ScalarType.BYTES: celtypes.BytesType,
+    ScalarType.STRING: celtypes.StringType,
+    ScalarType.FLOAT: celtypes.DoubleType,
+    ScalarType.DOUBLE: celtypes.DoubleType,
+    ScalarType.INT32: celtypes.IntType,
+    ScalarType.INT64: celtypes.IntType,
+    ScalarType.SINT32: celtypes.IntType,
+    ScalarType.SINT64: celtypes.IntType,
+    ScalarType.SFIXED32: celtypes.IntType,
+    ScalarType.SFIXED64: celtypes.IntType,
+    ScalarType.UINT32: celtypes.UintType,
+    ScalarType.UINT64: celtypes.UintType,
+    ScalarType.FIXED32: celtypes.UintType,
+    ScalarType.FIXED64: celtypes.UintType,
 }
 
 
-def _scalar_zero(field_type: _FieldType) -> str | bytes | bool | float | int:
-    match field_type:
-        case _FieldType.STRING:
+def _scalar_zero(scalar: ScalarType) -> str | bytes | bool | float | int:
+    match scalar:
+        case ScalarType.STRING:
             return ""
-        case _FieldType.BYTES:
+        case ScalarType.BYTES:
             return b""
-        case _FieldType.BOOL:
+        case ScalarType.BOOL:
             return False
-        case _FieldType.DOUBLE | _FieldType.FLOAT:
+        case ScalarType.DOUBLE | ScalarType.FLOAT:
             return 0.0
         case _:
             return 0
@@ -99,24 +97,23 @@ def _scalar_zero(field_type: _FieldType) -> str | bytes | bool | float | int:
 #
 # Everything works directly on protobuf-py descriptors: a field is a DescField
 # (an extension a DescExtension), and a map key/value or list element is a bare
-# ScalarType / DescMessage / DescEnum. The one shared derivation is the wire
-# type -- a field carries it on desc.proto.type, but an element has no .proto,
-# so it comes from the bare kind instead.
+# ScalarType / DescMessage / DescEnum.
 
 
-def _wire_type(field: DescField | DescExtension | ScalarType | DescMessage | DescEnum) -> _FieldType:
-    """The FieldDescriptorProto.Type of a field, extension, or map/list element."""
+def _wire_type(field: DescField | DescExtension | ScalarType | DescMessage | DescEnum) -> FieldDescriptorProto.Type:
+    """The FieldDescriptorProto.Type for a field path element. Only the path
+    boundary needs it: protobuf-py reports it on desc.proto.type, except a bare
+    element (no .proto) and an editions-delimited field (reported as MESSAGE but
+    pathed as GROUP)."""
     if isinstance(field, ScalarType):
-        return _FieldType(int(field))
+        return FieldDescriptorProto.Type(int(field))
     if isinstance(field, DescMessage):
-        return _FieldType.MESSAGE
+        return FieldDescriptorProto.Type.MESSAGE
     if isinstance(field, DescEnum):
-        return _FieldType.ENUM
-    # Delimited (proto2 group / editions delimited) message fields report the
-    # GROUP wire type in field paths.
+        return FieldDescriptorProto.Type.ENUM
     if getattr(field.value, "delimited_encoding", False):
-        return _FieldType.GROUP
-    return _FieldType(field.proto.type)
+        return FieldDescriptorProto.Type.GROUP
+    return field.proto.type
 
 
 def _path_name(field: DescField | DescExtension) -> str:
@@ -129,14 +126,30 @@ def _read_key(field: DescField | DescExtension) -> DescField | Extension:
     return field.type if isinstance(field, DescExtension) else field
 
 
-def _message_of(kind: DescField | ScalarType | DescMessage | DescEnum) -> DescMessage | None:
+def _scalar_of(subject: DescField | ScalarType | DescMessage | DescEnum) -> ScalarType | None:
+    """The ScalarType a field or element holds, if it is a scalar."""
+    if isinstance(subject, ScalarType):
+        return subject
+    if isinstance(subject, DescField) and isinstance(subject.value, DescFieldValueScalar):
+        return subject.value.scalar
+    return None
+
+
+def _message_of(subject: DescField | ScalarType | DescMessage | DescEnum) -> DescMessage | None:
     """The DescMessage a field or element holds, if it is message-typed."""
-    if isinstance(kind, DescMessage):
-        return kind
-    if isinstance(kind, DescField):
-        value = kind.value
-        if isinstance(value, DescFieldValueMessage):
-            return value.message
+    if isinstance(subject, DescMessage):
+        return subject
+    if isinstance(subject, DescField) and isinstance(subject.value, DescFieldValueMessage):
+        return subject.value.message
+    return None
+
+
+def _enum_of(subject: DescField | ScalarType | DescMessage | DescEnum) -> DescEnum | None:
+    """The DescEnum a field or element holds, if it is enum-typed."""
+    if isinstance(subject, DescEnum):
+        return subject
+    if isinstance(subject, DescField) and isinstance(subject.value, DescFieldValueEnum):
+        return subject.value.enum
     return None
 
 
@@ -215,7 +228,7 @@ class MessageConverter:
             return self.message(val)
         if isinstance(kind, DescEnum):
             return celtypes.IntType(int(val))
-        ctor = _TYPE_CTORS.get(_FieldType(int(kind)))  # kind: ScalarType
+        ctor = _TYPE_CTORS.get(kind)  # kind: ScalarType
         if ctor is None:
             msg = "unknown field type"
             raise CompilationError(msg)
@@ -231,7 +244,7 @@ class MessageConverter:
             return self.message(value.message.type())
         if isinstance(value, DescFieldValueEnum):
             return celtypes.IntType(0)
-        return self.scalar(_scalar_zero(_wire_type(value.scalar)), value.scalar)  # DescFieldValueScalar
+        return self.scalar(_scalar_zero(value.scalar), value.scalar)  # DescFieldValueScalar
 
     def _unwrap(self, msg: Message) -> celtypes.Value:
         return self.field(msg, self.fields_by_name(type(msg).desc())["value"])
@@ -295,29 +308,28 @@ def _oneof_to_element(oneof: DescOneof) -> validate_pb.FieldPathElement:
 
 _INT_KEY_TYPES = frozenset(
     (
-        _FieldType.INT32,
-        _FieldType.SFIXED32,
-        _FieldType.INT64,
-        _FieldType.SFIXED64,
-        _FieldType.SINT32,
-        _FieldType.SINT64,
+        ScalarType.INT32,
+        ScalarType.SFIXED32,
+        ScalarType.INT64,
+        ScalarType.SFIXED64,
+        ScalarType.SINT32,
+        ScalarType.SINT64,
     )
 )
-_UINT_KEY_TYPES = frozenset((_FieldType.UINT32, _FieldType.FIXED32, _FieldType.UINT64, _FieldType.FIXED64))
+_UINT_KEY_TYPES = frozenset((ScalarType.UINT32, ScalarType.FIXED32, ScalarType.UINT64, ScalarType.FIXED64))
 
 
 def _map_key_element(field: DescField, key: typing.Any) -> validate_pb.FieldPathElement:
     value = field.value
     assert isinstance(value, DescFieldValueMap)  # noqa: S101
-    key_type = _wire_type(value.key)
     subscript: Oneof
-    if key_type == _FieldType.BOOL:
+    if value.key == ScalarType.BOOL:
         subscript = Oneof(field="bool_key", value=key)
-    elif key_type in _INT_KEY_TYPES:
+    elif value.key in _INT_KEY_TYPES:
         subscript = Oneof(field="int_key", value=key)
-    elif key_type in _UINT_KEY_TYPES:
+    elif value.key in _UINT_KEY_TYPES:
         subscript = Oneof(field="uint_key", value=key)
-    elif key_type == _FieldType.STRING:
+    elif value.key == ScalarType.STRING:
         subscript = Oneof(field="string_key", value=key)
     else:
         msg = "unexpected map type"
@@ -326,7 +338,7 @@ def _map_key_element(field: DescField, key: typing.Any) -> validate_pb.FieldPath
         field_number=field.number,
         field_name=field.name,
         field_type=_wire_type(field),
-        key_type=key_type,
+        key_type=_wire_type(value.key),
         value_type=_wire_type(value.value),
         subscript=subscript,
     )
@@ -627,44 +639,45 @@ class MessageRules(CelRules):
         self._oneofs.append(MessageOneofRule(fields, required=rule.required))
 
 
-# For each scalar FieldRules.type case: the field type it requires, as
-# (expected wire type, wrapper message). A None wire type means the field must
-# be the named well-known wrapper message rather than a scalar.
-_RULE_FIELD_TYPES: dict[str, tuple[_FieldType | None, str | None]] = {
+# For each scalar FieldRules.type case: the scalar the field must be, and the
+# well-known wrapper message it may be instead. A None scalar means the field
+# must be the wrapper message (no scalar form).
+_RULE_FIELD_TYPES: dict[str, tuple[ScalarType | None, str | None]] = {
     "duration": (None, "google.protobuf.Duration"),
     "field_mask": (None, "google.protobuf.FieldMask"),
     "timestamp": (None, "google.protobuf.Timestamp"),
-    "bool": (_FieldType.BOOL, "google.protobuf.BoolValue"),
-    "bytes": (_FieldType.BYTES, "google.protobuf.BytesValue"),
-    "fixed32": (_FieldType.FIXED32, None),
-    "fixed64": (_FieldType.FIXED64, None),
-    "float": (_FieldType.FLOAT, "google.protobuf.FloatValue"),
-    "double": (_FieldType.DOUBLE, "google.protobuf.DoubleValue"),
-    "int32": (_FieldType.INT32, "google.protobuf.Int32Value"),
-    "int64": (_FieldType.INT64, "google.protobuf.Int64Value"),
-    "sfixed32": (_FieldType.SFIXED32, None),
-    "sfixed64": (_FieldType.SFIXED64, None),
-    "sint32": (_FieldType.SINT32, None),
-    "sint64": (_FieldType.SINT64, None),
-    "uint32": (_FieldType.UINT32, "google.protobuf.UInt32Value"),
-    "uint64": (_FieldType.UINT64, "google.protobuf.UInt64Value"),
-    "string": (_FieldType.STRING, "google.protobuf.StringValue"),
+    "bool": (ScalarType.BOOL, "google.protobuf.BoolValue"),
+    "bytes": (ScalarType.BYTES, "google.protobuf.BytesValue"),
+    "fixed32": (ScalarType.FIXED32, None),
+    "fixed64": (ScalarType.FIXED64, None),
+    "float": (ScalarType.FLOAT, "google.protobuf.FloatValue"),
+    "double": (ScalarType.DOUBLE, "google.protobuf.DoubleValue"),
+    "int32": (ScalarType.INT32, "google.protobuf.Int32Value"),
+    "int64": (ScalarType.INT64, "google.protobuf.Int64Value"),
+    "sfixed32": (ScalarType.SFIXED32, None),
+    "sfixed64": (ScalarType.SFIXED64, None),
+    "sint32": (ScalarType.SINT32, None),
+    "sint64": (ScalarType.SINT64, None),
+    "uint32": (ScalarType.UINT32, "google.protobuf.UInt32Value"),
+    "uint64": (ScalarType.UINT64, "google.protobuf.UInt64Value"),
+    "string": (ScalarType.STRING, "google.protobuf.StringValue"),
 }
 
 
 def check_field_type(
     subject: DescField | ScalarType | DescMessage | DescEnum,
-    expected: _FieldType | None,
+    expected: ScalarType | None,
     wrapper_name: str | None = None,
 ):
-    wire = _wire_type(subject)
-    message = _message_of(subject)
-    message_name = message.type_name if message is not None else None
-    if wire != expected and (wire != _FieldType.MESSAGE or message_name != wrapper_name):
-        name = subject.name if isinstance(subject, DescField) else wire.name.lower()
-        expected_type_str = (wrapper_name or "message") if expected is None else expected.name.lower()
-        msg = f"field {name} has type {wire.name.lower()} but expected {expected_type_str}"
-        raise CompilationError(msg)
+    if (expected is not None and _scalar_of(subject) == expected) or (
+        (message := _message_of(subject)) is not None and message.type_name == wrapper_name
+    ):
+        return
+    actual = _wire_type(subject).name.lower()
+    name = subject.name if isinstance(subject, DescField) else actual
+    expected_str = (wrapper_name or "message") if expected is None else expected.name.lower()
+    msg = f"field {name} has type {actual} but expected {expected_str}"
+    raise CompilationError(msg)
 
 
 class FieldRules(CelRules):
@@ -898,9 +911,7 @@ class EnumRules(FieldRules):
         assert type_oneof is not None and type_oneof.field == "enum"  # noqa: S101
         if type_oneof.value.defined_only:
             self._defined_only = True
-        enum = field if isinstance(field, DescEnum) else None
-        if isinstance(field, DescField) and isinstance(field.value, DescFieldValueEnum):
-            enum = field.value.enum
+        enum = _enum_of(field)
         self._defined_numbers = {v.number for v in enum.values} if enum is not None else set()
 
     def validate(self, ctx: RuleContext, message: Message):
@@ -1116,7 +1127,11 @@ class RuleFactory:
         if type_case is None:
             return FieldRules(self._env, self._funcs, field, field_level, **kw)
         if type_case == "enum":
-            check_field_type(field, _FieldType.ENUM)
+            if _enum_of(field) is None:
+                actual = _wire_type(field).name.lower()
+                name = field.name if isinstance(field, DescField) else actual
+                msg = f"field {name} has type {actual} but expected enum"
+                raise CompilationError(msg)
             return EnumRules(self._env, self._funcs, field, field_level, **kw)
         if type_case == "any":
             check_field_type(field, None, "google.protobuf.Any")
