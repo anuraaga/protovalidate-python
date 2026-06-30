@@ -258,14 +258,6 @@ def make_timestamp(msg: Timestamp) -> celtypes.TimestampType:
     return celtypes.TimestampType(1970, 1, 1) + celtypes.DurationType(seconds=msg.seconds, nanos=msg.nanos)
 
 
-def _is_empty_field(msg: Message, field: _Field) -> bool:
-    if field.has_presence:
-        return not field.is_present(msg)
-    if field.is_repeated:
-        return len(field.get(msg)) == 0
-    return field.get(msg) == _scalar_zero(field.type)
-
-
 class _MessageShape:
     """Per-descriptor data for wrapping a message as a celtypes value.
 
@@ -685,7 +677,7 @@ class MessageOneofRule(Rules):
         self._required = required
 
     def validate(self, ctx: RuleContext, message: Message):
-        num_set_fields = sum(1 for field in self._fields if not _is_empty_field(message, field))
+        num_set_fields = sum(1 for field in self._fields if field.is_present(message))
         if num_set_fields > 1:
             ctx.add(
                 Violation(
@@ -849,7 +841,7 @@ class FieldRules(CelRules):
             )
 
     def validate(self, ctx: RuleContext, message: Message):
-        if _is_empty_field(message, self._field):
+        if not self._field.is_present(message):
             if self._required:
                 ctx.add(
                     Violation(
