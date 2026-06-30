@@ -44,32 +44,24 @@ from protobuf import (
     Oneof,
     Registry,
     ScalarType,
-    wkt,
 )
+from protobuf.wkt import Duration, FieldDescriptorProto, Timestamp
 
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal.cel_field_presence import InterpretedRunner, in_has
 
-_FieldType = wkt.descriptor_pb.FieldDescriptorProto.Type
+_FieldType = FieldDescriptorProto.Type
 
 
 class CompilationError(Exception):
     pass
 
 
-# ----- field type metadata: a celtypes constructor per field type -----
-
-
-def _msg_to_cel(msg: Message) -> celtypes.Value:
-    ctor = _WKT_CTORS.get(type(msg).desc().type_name)
-    if ctor is not None:
-        return ctor(msg)
-    return MessageType(msg)
+# ----- scalar/enum field type -> celtypes constructor (message and group are
+# handled by MessageConverter, which owns the per-descriptor shape cache) -----
 
 
 _TYPE_CTORS: dict[_FieldType, Callable[..., celtypes.Value]] = {
-    _FieldType.MESSAGE: _msg_to_cel,
-    _FieldType.GROUP: _msg_to_cel,
     _FieldType.ENUM: lambda v: celtypes.IntType(int(v)),
     _FieldType.BOOL: celtypes.BoolType,
     _FieldType.BYTES: celtypes.BytesType,
@@ -94,8 +86,9 @@ def _get_type_name(field_type: _FieldType) -> str:
 
 
 def _fields_by_name(desc: DescMessage) -> dict[str, DescField]:
-    """A name -> field map computed from the public field list (protobuf-py
-    descriptors do not expose a public fields_by_name)."""
+    """A name -> field map for building rule paths at compile time (protobuf-py
+    exposes no public fields_by_name). Eval-time field access goes through the
+    converter's per-descriptor shape cache instead."""
     return {field.name: field for field in desc.fields}
 
 
@@ -266,73 +259,12 @@ def _leaf_field(kind: ScalarType | DescMessage | DescEnum, *, name: str = "", nu
 # ----- value conversion: protobuf-py -> celpy celtypes -----
 
 
-def make_duration(msg: wkt.duration_pb.Duration) -> celtypes.DurationType:
+def make_duration(msg: Duration) -> celtypes.DurationType:
     return celtypes.DurationType(seconds=msg.seconds, nanos=msg.nanos)
 
 
-def make_timestamp(msg: wkt.timestamp_pb.Timestamp) -> celtypes.TimestampType:
+def make_timestamp(msg: Timestamp) -> celtypes.TimestampType:
     return celtypes.TimestampType(1970, 1, 1) + celtypes.DurationType(seconds=msg.seconds, nanos=msg.nanos)
-
-
-def _unwrap(msg: Message) -> celtypes.Value:
-    value_field = _Field.of(_fields_by_name(type(msg).desc())["value"])
-    return _scalar_to_cel(value_field.get(msg), value_field)
-
-
-_WKT_CTORS: dict[str, Callable[..., celtypes.Value]] = {
-    "google.protobuf.Duration": make_duration,
-    "google.protobuf.Timestamp": make_timestamp,
-    "google.protobuf.StringValue": _unwrap,
-    "google.protobuf.BytesValue": _unwrap,
-    "google.protobuf.Int32Value": _unwrap,
-    "google.protobuf.Int64Value": _unwrap,
-    "google.protobuf.UInt32Value": _unwrap,
-    "google.protobuf.UInt64Value": _unwrap,
-    "google.protobuf.FloatValue": _unwrap,
-    "google.protobuf.DoubleValue": _unwrap,
-    "google.protobuf.BoolValue": _unwrap,
-}
-
-
-def _scalar_to_cel(val: typing.Any, field: _Field) -> celtypes.Value:
-    ctor = _TYPE_CTORS.get(field.type)
-    if ctor is None:
-        msg = "unknown field type"
-        raise CompilationError(msg)
-    return ctor(val)
-
-
-def _map_to_cel(mapping: Mapping[typing.Any, typing.Any], field: _Field) -> celtypes.Value:
-    key_field, value_field = field.key_field, field.value_field
-    assert key_field is not None and value_field is not None  # noqa: S101
-    result = celtypes.MapType()
-    for key, val in mapping.items():
-        result[_scalar_to_cel(key, key_field)] = _scalar_to_cel(val, value_field)
-    return result
-
-
-def _field_value_to_cel(val: typing.Any, field: _Field) -> celtypes.Value:
-    if field.is_map:
-        return _map_to_cel(val, field)
-    if field.is_repeated:
-        item_field = field.item_field
-        assert item_field is not None  # noqa: S101
-        return celtypes.ListType(_scalar_to_cel(item, item_field) for item in val)
-    return _scalar_to_cel(val, field)
-
-
-def field_to_cel(msg: Message, field: _Field) -> celtypes.Value:
-    if field.is_repeated:
-        return _field_value_to_cel(field.get(msg), field)
-    if field.message is not None and not field.is_present(msg):
-        return None
-    return _scalar_to_cel(field.get(msg), field)
-
-
-def _zero_value(field: _Field) -> celtypes.Value:
-    if field.message is not None and not field.is_repeated:
-        return _msg_to_cel(field.message.type())
-    return _scalar_to_cel(_scalar_zero(field.type), field)
 
 
 def _is_empty_field(msg: Message, field: _Field) -> bool:
@@ -343,27 +275,135 @@ def _is_empty_field(msg: Message, field: _Field) -> bool:
     return field.get(msg) == _scalar_zero(field.type)
 
 
+class _MessageShape:
+    """Per-descriptor data for wrapping a message as a celtypes value.
+
+    Everything here is a function of the message *type*, not the value, so a
+    MessageConverter builds it once per descriptor and shares it across every
+    message value of that type.
+    """
+
+    __slots__ = ("fields", "oneof_field_names")
+
+    def __init__(self, desc: DescMessage):
+        # name -> _Field view, reused across every value and every field access.
+        self.fields = {field.name: _Field.of(field) for field in desc.fields}
+        self.oneof_field_names = frozenset(f.name for oneof in desc.oneofs for f in oneof.fields)
+
+
+class MessageConverter:
+    """Converts protobuf-py values into celpy celtypes for CEL evaluation.
+
+    Caches the per-descriptor :class:`_MessageShape` it derives, so the field
+    views and oneof membership of each message type are computed once and
+    reused across every value. One converter is owned by each
+    :class:`RuleFactory`, so the cache lives and dies with its Validator rather
+    than as global state.
+    """
+
+    def __init__(self):
+        self._shapes: dict[DescMessage, _MessageShape] = {}
+        # Well-known types convert to native CEL values rather than maps. The
+        # table is bound per converter so _unwrap can reach the shape cache.
+        self._wkt: dict[str, Callable[..., celtypes.Value]] = {
+            "google.protobuf.Duration": make_duration,
+            "google.protobuf.Timestamp": make_timestamp,
+            "google.protobuf.StringValue": self._unwrap,
+            "google.protobuf.BytesValue": self._unwrap,
+            "google.protobuf.Int32Value": self._unwrap,
+            "google.protobuf.Int64Value": self._unwrap,
+            "google.protobuf.UInt32Value": self._unwrap,
+            "google.protobuf.UInt64Value": self._unwrap,
+            "google.protobuf.FloatValue": self._unwrap,
+            "google.protobuf.DoubleValue": self._unwrap,
+            "google.protobuf.BoolValue": self._unwrap,
+        }
+
+    def shape(self, desc: DescMessage) -> _MessageShape:
+        shape = self._shapes.get(desc)
+        if shape is None:
+            shape = _MessageShape(desc)
+            self._shapes[desc] = shape
+        return shape
+
+    def message(self, msg: Message) -> celtypes.Value:
+        wkt_ctor = self._wkt.get(type(msg).desc().type_name)
+        if wkt_ctor is not None:
+            return wkt_ctor(msg)
+        return MessageType(msg, self)
+
+    def field(self, msg: Message, field: _Field) -> celtypes.Value:
+        if field.is_repeated:
+            return self.field_value(field.get(msg), field)
+        if field.message is not None and not field.is_present(msg):
+            return None
+        return self.scalar(field.get(msg), field)
+
+    def field_value(self, val: typing.Any, field: _Field) -> celtypes.Value:
+        if field.is_map:
+            return self._map(val, field)
+        if field.is_repeated:
+            item_field = field.item_field
+            assert item_field is not None  # noqa: S101
+            return celtypes.ListType(self.scalar(item, item_field) for item in val)
+        return self.scalar(val, field)
+
+    def scalar(self, val: typing.Any, field: _Field) -> celtypes.Value:
+        if field.type in (_FieldType.MESSAGE, _FieldType.GROUP):
+            return self.message(val)
+        ctor = _TYPE_CTORS.get(field.type)
+        if ctor is None:
+            msg = "unknown field type"
+            raise CompilationError(msg)
+        return ctor(val)
+
+    def zero(self, field: _Field) -> celtypes.Value:
+        if field.message is not None and not field.is_repeated:
+            return self.message(field.message.type())
+        return self.scalar(_scalar_zero(field.type), field)
+
+    def _map(self, mapping: Mapping[typing.Any, typing.Any], field: _Field) -> celtypes.Value:
+        key_field, value_field = field.key_field, field.value_field
+        assert key_field is not None and value_field is not None  # noqa: S101
+        result = celtypes.MapType()
+        for key, val in mapping.items():
+            result[self.scalar(key, key_field)] = self.scalar(val, value_field)
+        return result
+
+    def _unwrap(self, msg: Message) -> celtypes.Value:
+        value_field = self.shape(type(msg).desc()).fields["value"]
+        return self.scalar(value_field.get(msg), value_field)
+
+
 class MessageType(celtypes.MapType):
+    """A protobuf-py message wrapped as a celpy map for CEL evaluation."""
+
     msg: Message
 
-    def __init__(self, msg: Message):
+    def __init__(self, msg: Message, conv: MessageConverter):
         super().__init__()
         self.msg = msg
-        self.desc = type(msg).desc()
-        self.fields_by_name = _fields_by_name(self.desc)
-        self._oneof_field_names = {f.name for oneof in self.desc.oneofs for f in oneof.fields}
-        for fdesc in self.desc.fields:
-            if fdesc.name in self._oneof_field_names and fdesc not in msg:
+        self._conv = conv
+        self._shape = conv.shape(type(msg).desc())
+        for name, field in self._shape.fields.items():
+            if name in self._shape.oneof_field_names and not field.is_present(msg):
                 continue
-            self[fdesc.name] = field_to_cel(msg, _Field.of(fdesc))
+            self[celtypes.StringType(name)] = conv.field(msg, field)
+
+    def field_view(self, name: str) -> _Field | None:
+        """The _Field view for a field name, or None if the type has no such field."""
+        return self._shape.fields.get(name)
+
+    def convert_field(self, field: _Field) -> celtypes.Value:
+        """Convert one of this message's fields to its CEL value."""
+        return self._conv.field(self.msg, field)
 
     def __getitem__(self, key):
-        fdesc = self.fields_by_name[key]
-        field = _Field.of(fdesc)
-        if field.has_presence and fdesc not in self.msg:
+        field = self._shape.fields[key]
+        if field.has_presence and not field.is_present(self.msg):
             if in_has():
                 raise KeyError
-            return _zero_value(field)
+            return self._conv.zero(field)
         return super().__getitem__(key)
 
 
@@ -573,11 +613,12 @@ class CelRules(Rules):
     _rules_cel: celtypes.Value | None = None
     _uses_now: bool = False
 
-    def __init__(self, rules: Message | None):
+    def __init__(self, rules: Message | None, *, conv: MessageConverter):
+        self._conv = conv
         self._cel = []
         if rules is not None:
             self._rules = rules
-            self._rules_cel = _msg_to_cel(rules)
+            self._rules_cel = conv.message(rules)
 
     def _validate_cel(
         self,
@@ -648,7 +689,7 @@ class CelRules(Rules):
         rule_cel = None
         if rule_field is not None and self._rules is not None:
             rule_value = rule_field.get(self._rules)
-            rule_cel = field_to_cel(self._rules, rule_field)
+            rule_cel = self._conv.field(self._rules, rule_field)
         self._cel.append(
             CelRunner(
                 runner=prog,
@@ -690,14 +731,14 @@ class MessageRules(CelRules):
 
     _oneofs: list[MessageOneofRule]
 
-    def __init__(self, rules: Message | None, desc: DescMessage):
-        super().__init__(rules)
+    def __init__(self, rules: Message | None, desc: DescMessage, *, conv: MessageConverter):
+        super().__init__(rules, conv=conv)
         self._oneofs = []
         self._desc = desc
 
     def validate(self, ctx: RuleContext, message: Message):
         if self._cel:
-            self._validate_cel(ctx, this_cel=_msg_to_cel(message))
+            self._validate_cel(ctx, this_cel=self._conv.message(message))
             if ctx.done:
                 return
         for oneof in self._oneofs:
@@ -756,11 +797,12 @@ class FieldRules(CelRules):
         for_items: bool = False,
         force_ignore_empty: bool = False,
         registry: Registry | None = None,
+        conv: MessageConverter,
     ):
         type_oneof = field_level.type
         type_case = type_oneof.field if type_oneof is not None else None
         rules_pb = type_oneof.value if type_oneof is not None else None
-        super().__init__(rules_pb)
+        super().__init__(rules_pb, conv=conv)
         self._field = field
         self._ignore_empty = (
             field_level.ignore == validate_pb.Ignore.IF_ZERO_VALUE
@@ -846,7 +888,7 @@ class FieldRules(CelRules):
             if self._ignore_empty:
                 return
         val = self._field.get(message)
-        cel_val = _field_value_to_cel(val, self._field)
+        cel_val = self._conv.field_value(val, self._field)
         sub_ctx = ctx.sub_context()
         self._validate_value(sub_ctx, val)
         self._validate_cel(sub_ctx, this_value=val, this_cel=cel_val)
@@ -856,7 +898,7 @@ class FieldRules(CelRules):
 
     def validate_item(self, ctx: RuleContext, value: typing.Any, item_field: _Field, *, for_key: bool = False):
         self._validate_value(ctx, value, for_key=for_key)
-        self._validate_cel(ctx, this_value=value, this_cel=_scalar_to_cel(value, item_field), for_key=for_key)
+        self._validate_cel(ctx, this_value=value, this_cel=self._conv.scalar(value, item_field), for_key=for_key)
 
     def _validate_value(self, ctx: RuleContext, value: typing.Any, *, for_key: bool = False):
         pass
@@ -887,8 +929,9 @@ class AnyRules(FieldRules):
         field_level: validate_pb.FieldRules,
         *,
         registry: Registry | None = None,
+        conv: MessageConverter,
     ):
-        super().__init__(env, funcs, field, field_level, registry=registry)
+        super().__init__(env, funcs, field, field_level, registry=registry, conv=conv)
         type_oneof = field_level.type
         assert type_oneof is not None and type_oneof.field == "any"  # noqa: S101
         any_rules = type_oneof.value
@@ -940,6 +983,7 @@ class EnumRules(FieldRules):
         for_items: bool = False,
         force_ignore_empty: bool = False,
         registry: Registry | None = None,
+        conv: MessageConverter,
     ):
         super().__init__(
             env,
@@ -949,6 +993,7 @@ class EnumRules(FieldRules):
             for_items=for_items,
             force_ignore_empty=force_ignore_empty,
             registry=registry,
+            conv=conv,
         )
         type_oneof = field_level.type
         assert type_oneof is not None and type_oneof.field == "enum"  # noqa: S101
@@ -991,8 +1036,9 @@ class RepeatedRules(FieldRules):
         item_rules: FieldRules | None,
         *,
         registry: Registry | None = None,
+        conv: MessageConverter,
     ):
-        super().__init__(env, funcs, field, field_level, registry=registry)
+        super().__init__(env, funcs, field, field_level, registry=registry, conv=conv)
         if item_rules is not None:
             self._item_rules = item_rules
 
@@ -1043,8 +1089,9 @@ class MapRules(FieldRules):
         value_rules: FieldRules | None,
         *,
         registry: Registry | None = None,
+        conv: MessageConverter,
     ):
-        super().__init__(env, funcs, field, field_level, registry=registry)
+        super().__init__(env, funcs, field, field_level, registry=registry, conv=conv)
         if key_rules is not None:
             self._key_rules = key_rules
         if value_rules is not None:
@@ -1115,6 +1162,7 @@ class RuleFactory:
         self._env = celpy.Environment(runner_class=InterpretedRunner)
         self._funcs = funcs
         self._registry = registry
+        self._conv = MessageConverter()
         self._cache: dict[str, list[Rules] | Exception] = {}
 
     def get(self, desc: DescMessage) -> list[Rules]:
@@ -1130,7 +1178,7 @@ class RuleFactory:
         return result
 
     def _new_message_rule(self, rules: validate_pb.MessageRules, desc: DescMessage) -> MessageRules:
-        result = MessageRules(rules, desc)
+        result = MessageRules(rules, desc, conv=self._conv)
         for oneof in rules.oneof:
             result.add_oneof(oneof)
         for expr in rules.cel_expression:
@@ -1150,7 +1198,12 @@ class RuleFactory:
         if field_level.ignore == validate_pb.Ignore.ALWAYS:
             return None
         type_case = _which_type(field_level)
-        kw = {"for_items": for_items, "force_ignore_empty": force_ignore_empty, "registry": self._registry}
+        kw = {
+            "for_items": for_items,
+            "force_ignore_empty": force_ignore_empty,
+            "registry": self._registry,
+            "conv": self._conv,
+        }
         checks: dict[str, tuple[_FieldType | None, str | None]] = {
             "duration": (None, "google.protobuf.Duration"),
             "field_mask": (None, "google.protobuf.FieldMask"),
@@ -1178,7 +1231,7 @@ class RuleFactory:
             return EnumRules(self._env, self._funcs, field, field_level, **kw)
         if type_case == "any":
             check_field_type(field, None, "google.protobuf.Any")
-            return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry)
+            return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry, conv=self._conv)
         if type_case in checks:
             expected, wrapper = checks[type_case]
             check_field_type(field, expected, wrapper)
@@ -1202,14 +1255,16 @@ class RuleFactory:
                 key_rules = self._new_scalar_field_rule(key_field, map_rules.keys, for_items=True)
             if map_rules is not None and map_rules.values is not None:
                 value_rules = self._new_scalar_field_rule(value_field, map_rules.values, for_items=True)
-            return MapRules(self._env, self._funcs, field, rules, key_rules, value_rules, registry=self._registry)
+            return MapRules(
+                self._env, self._funcs, field, rules, key_rules, value_rules, registry=self._registry, conv=self._conv
+            )
         item_field = field.item_field
         assert item_field is not None  # noqa: S101
         item_rule = None
         rep_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "repeated" else None
         if rep_rules is not None and rep_rules.items is not None:
             item_rule = self._new_scalar_field_rule(item_field, rep_rules.items)
-        return RepeatedRules(self._env, self._funcs, field, rules, item_rule, registry=self._registry)
+        return RepeatedRules(self._env, self._funcs, field, rules, item_rule, registry=self._registry, conv=self._conv)
 
     def _new_rules(self, desc: DescMessage) -> list[Rules]:
         result: list[Rules] = []
