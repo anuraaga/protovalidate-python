@@ -13,49 +13,38 @@
 # limitations under the License.
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
-from subprocess import run
-
-_REPO = Path(__file__).parent.parent
-
-
-def _module(name: str, version: str) -> str:
-    if re.match(r"^v\d+\.\d+\.\d+(\-.+)?$", version):
-        # Version tag, fetch from the BSR.
-        return f"buf.build/bufbuild/{name}:{version}"
-    # Not a tag, generally an unreleased commit, fetch directly from git.
-    return f"https://github.com/bufbuild/protovalidate.git#subdir=proto/{name},ref={version}"
 
 
 def main(version: str) -> None:
-    # The relocatable buf.validate stub bundled into protovalidate itself, so
-    # users do not add the protos. protobuf-py gencode only (no *_pb2.py); the
-    # template writes into protovalidate/_gen.
-    run(  # noqa: S603
-        [  # noqa: S607
-            "buf",
-            "generate",
-            _module("protovalidate", version),
-            "--path",
-            "buf/validate",
-            "--template",
-            str(_REPO / "buf.gen.bundle.yaml"),
-        ],
-        cwd=_REPO,
-        check=True,
-    )
-    # The conformance harness (and the buf.validate it imports) for the test
-    # suite, generated into test/gen alongside the example/bench protos using
-    # test/buf.gen.yaml.
-    run(  # noqa: S603
-        [  # noqa: S607
-            "buf",
-            "generate",
-            _module("protovalidate-testing", version),
-            "--path",
-            "buf/validate/conformance/harness",
-            "--include-imports",
-        ],
-        cwd=_REPO / "test",
+    if re.match(r"^v\d+\.\d+\.\d+(\-.+)?$", version):
+        # Version tag, fetch from BSR
+        protovalidate_path = f"buf.build/bufbuild/protovalidate:{version}"
+        protovalidate_testing_path = f"buf.build/bufbuild/protovalidate-testing:{version}"
+    else:
+        # Not a tag, generally an unreleased commit, fetch directly from git
+        protovalidate_path = f"https://github.com/bufbuild/protovalidate.git#subdir=proto/protovalidate,ref={version}"
+        protovalidate_testing_path = (
+            f"https://github.com/bufbuild/protovalidate.git#subdir=proto/protovalidate-testing,ref={version}"
+        )
+
+    repo = Path(__file__).parent.parent
+
+    # Vendor the protovalidate protos into proto/ and generate the bundled,
+    # relocatable buf.validate stub into protovalidate/_gen. Vendoring keeps the
+    # protos editable for testing local schema changes.
+    protos_dir = repo / "proto"
+    shutil.rmtree(protos_dir, ignore_errors=True)
+    protos_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["buf", "export", protovalidate_path, "-o", protos_dir], check=True)  # noqa: S603, S607
+    subprocess.run(["buf", "generate"], cwd=repo, check=True)  # noqa: S607
+
+    # Vendor the protovalidate-testing protos alongside the local test protos in
+    # test/proto; the conformance harness and cases are generated from them by
+    # the generate-test task.
+    subprocess.run(  # noqa: S603
+        ["buf", "export", protovalidate_testing_path, "-o", repo / "test" / "proto"],  # noqa: S607
         check=True,
     )

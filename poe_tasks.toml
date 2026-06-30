@@ -67,7 +67,10 @@ sequence = [
 
 [tasks.format-protos]
 help = "Apply auto-formatting to protobuf files"
-cmd = "buf format --write"
+sequence = [
+  { cmd = "buf format --write" },
+  { cmd = "buf format --write", cwd = "test" },
+]
 
 [tasks.format-python]
 help = "Apply auto-formatting to Python files"
@@ -91,7 +94,10 @@ sequence = [
 
 [tasks.lint-protos]
 help = "Apply linting to protobuf files"
-cmd = "buf format -d --exit-code"
+sequence = [
+  { cmd = "buf format -d --exit-code" },
+  { cmd = "buf format -d --exit-code", cwd = "test" },
+]
 
 [tasks.lint-python]
 help = "Apply linting to Python files"
