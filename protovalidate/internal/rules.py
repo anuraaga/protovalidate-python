@@ -81,27 +81,18 @@ _TYPE_CTORS: dict[_FieldType, Callable[..., celtypes.Value]] = {
 }
 
 
-def _get_type_name(field_type: _FieldType) -> str:
-    return field_type.name.lower()
-
-
-def _fields_by_name(desc: DescMessage) -> dict[str, DescField]:
-    """A name -> field map for building rule paths at compile time (protobuf-py
-    exposes no public fields_by_name). Eval-time field access goes through the
-    converter's per-descriptor shape cache instead."""
-    return {field.name: field for field in desc.fields}
-
-
 def _scalar_zero(field_type: _FieldType) -> str | bytes | bool | float | int:
-    if field_type == _FieldType.STRING:
-        return ""
-    if field_type == _FieldType.BYTES:
-        return b""
-    if field_type == _FieldType.BOOL:
-        return False
-    if field_type in (_FieldType.DOUBLE, _FieldType.FLOAT):
-        return 0.0
-    return 0
+    match field_type:
+        case _FieldType.STRING:
+            return ""
+        case _FieldType.BYTES:
+            return b""
+        case _FieldType.BOOL:
+            return False
+        case _FieldType.DOUBLE | _FieldType.FLOAT:
+            return 0.0
+        case _:
+            return 0
 
 
 # ----- _Field: a uniform view over a protobuf-py DescField or a synthetic
@@ -471,7 +462,7 @@ def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathEle
 
 
 def _spec_field(rules_cls: type[Message], name: str) -> DescField:
-    return _fields_by_name(rules_cls.desc())[name]
+    return next(f for f in rules_cls.desc().fields if f.name == name)
 
 
 def _spec_element(pb_field: DescField) -> validate_pb.FieldPathElement:
@@ -752,7 +743,7 @@ class MessageRules(CelRules):
         if len(rule.fields) == 0:
             msg = f"at least one field must be specified in oneof rule for the message {self._desc.type_name}"
             raise CompilationError(msg)
-        desc_fields = _fields_by_name(self._desc)
+        desc_fields = {f.name: f for f in self._desc.fields}
         for name in rule.fields:
             if name in desc_fields:
                 if name in seen:
@@ -768,12 +759,11 @@ class MessageRules(CelRules):
 
 def check_field_type(field: _Field, expected: _FieldType | None, wrapper_name: str | None = None):
     if field.type != expected and (field.type != _FieldType.MESSAGE or field.message_full_name != wrapper_name):
-        field_type_str = _get_type_name(field.type)
         if expected is None:
-            expected_type_str = wrapper_name if wrapper_name is not None else _get_type_name(_FieldType.MESSAGE)
+            expected_type_str = wrapper_name if wrapper_name is not None else "message"
         else:
-            expected_type_str = _get_type_name(expected)
-        msg = f"field {field.name} has type {field_type_str} but expected {expected_type_str}"
+            expected_type_str = expected.name.lower()
+        msg = f"field {field.name} has type {field.type.name.lower()} but expected {expected_type_str}"
         raise CompilationError(msg)
 
 
