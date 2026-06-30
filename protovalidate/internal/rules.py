@@ -461,25 +461,10 @@ def _map_key_element(field: _Field, key: typing.Any) -> validate_pb.FieldPathEle
     )
 
 
-def _spec_field(rules_cls: type[Message], name: str) -> DescField:
-    return next(f for f in rules_cls.desc().fields if f.name == name)
-
-
-def _spec_element(pb_field: DescField) -> validate_pb.FieldPathElement:
-    return validate_pb.FieldPathElement(
-        field_number=pb_field.number,
-        field_name=pb_field.name,
-        field_type=pb_field.proto.type,
-    )
-
-
-def _indexed_spec_element(pb_field: DescField, index: int) -> validate_pb.FieldPathElement:
-    return validate_pb.FieldPathElement(
-        field_number=pb_field.number,
-        field_name=pb_field.name,
-        field_type=pb_field.proto.type,
-        subscript=Oneof(field="index", value=index),
-    )
+def _spec_field(rules_cls: type[Message], name: str) -> _Field:
+    """The named field of a rules message, as a _Field for path construction
+    (protobuf-py has no field-number constants to look it up by number)."""
+    return _Field.of(next(f for f in rules_cls.desc().fields if f.name == name))
 
 
 def _which_type(field_level: validate_pb.FieldRules) -> str | None:
@@ -774,7 +759,7 @@ class FieldRules(CelRules):
     _required = False
 
     _required_rule_path: typing.ClassVar[validate_pb.FieldPath] = validate_pb.FieldPath(
-        elements=[_spec_element(_spec_field(validate_pb.FieldRules, "required"))]
+        elements=[_field_to_element(_spec_field(validate_pb.FieldRules, "required"))]
     )
 
     def __init__(
@@ -812,14 +797,15 @@ class FieldRules(CelRules):
                 opts = rule_field_desc.proto.options
                 if opts is None or validate_pb.ext_predefined not in opts:
                     continue
+                rule_field = _Field.of(rule_field_desc)
                 for cel in opts[validate_pb.ext_predefined].cel:
                     self.add_rule(
                         env,
                         funcs,
                         cel,
-                        rule_field=_Field.of(rule_field_desc),
+                        rule_field=rule_field,
                         rule_path=validate_pb.FieldPath(
-                            elements=[_spec_element(rule_field_desc), _spec_element(type_field)]
+                            elements=[_field_to_element(rule_field), _field_to_element(type_field)]
                         ),
                     )
             # Custom predefined rules are proto2 extensions on the rules message
@@ -845,7 +831,7 @@ class FieldRules(CelRules):
                             cel,
                             rule_field=ext_field,
                             rule_path=validate_pb.FieldPath(
-                                elements=[_field_to_element(ext_field), _spec_element(type_field)]
+                                elements=[_field_to_element(ext_field), _field_to_element(type_field)]
                             ),
                         )
         cel_expression_field = _spec_field(validate_pb.FieldRules, "cel_expression")
@@ -854,12 +840,12 @@ class FieldRules(CelRules):
                 env,
                 funcs,
                 cel,
-                rule_path=validate_pb.FieldPath(elements=[_indexed_spec_element(cel_expression_field, i)]),
+                rule_path=validate_pb.FieldPath(elements=[_indexed_field_element(cel_expression_field, i)]),
             )
         cel_field = _spec_field(validate_pb.FieldRules, "cel")
         for i, cel in enumerate(field_level.cel):
             self.add_rule(
-                env, funcs, cel, rule_path=validate_pb.FieldPath(elements=[_indexed_spec_element(cel_field, i)])
+                env, funcs, cel, rule_path=validate_pb.FieldPath(elements=[_indexed_field_element(cel_field, i)])
             )
 
     def validate(self, ctx: RuleContext, message: Message):
@@ -899,15 +885,15 @@ class AnyRules(FieldRules):
 
     _in_rule_path: typing.ClassVar[validate_pb.FieldPath] = validate_pb.FieldPath(
         elements=[
-            _spec_element(_spec_field(validate_pb.AnyRules, "in")),
-            _spec_element(_spec_field(validate_pb.FieldRules, "any")),
+            _field_to_element(_spec_field(validate_pb.AnyRules, "in")),
+            _field_to_element(_spec_field(validate_pb.FieldRules, "any")),
         ],
     )
 
     _not_in_rule_path: typing.ClassVar[validate_pb.FieldPath] = validate_pb.FieldPath(
         elements=[
-            _spec_element(_spec_field(validate_pb.AnyRules, "not_in")),
-            _spec_element(_spec_field(validate_pb.FieldRules, "any")),
+            _field_to_element(_spec_field(validate_pb.AnyRules, "not_in")),
+            _field_to_element(_spec_field(validate_pb.FieldRules, "any")),
         ],
     )
 
@@ -958,8 +944,8 @@ class EnumRules(FieldRules):
 
     _defined_only_rule_path: typing.ClassVar[validate_pb.FieldPath] = validate_pb.FieldPath(
         elements=[
-            _spec_element(_spec_field(validate_pb.EnumRules, "defined_only")),
-            _spec_element(_spec_field(validate_pb.FieldRules, "enum")),
+            _field_to_element(_spec_field(validate_pb.EnumRules, "defined_only")),
+            _field_to_element(_spec_field(validate_pb.FieldRules, "enum")),
         ],
     )
 
@@ -1013,8 +999,8 @@ class RepeatedRules(FieldRules):
     _item_rules: FieldRules | None = None
 
     _items_rules_suffix: typing.ClassVar[list[validate_pb.FieldPathElement]] = [
-        _spec_element(_spec_field(validate_pb.RepeatedRules, "items")),
-        _spec_element(_spec_field(validate_pb.FieldRules, "repeated")),
+        _field_to_element(_spec_field(validate_pb.RepeatedRules, "items")),
+        _field_to_element(_spec_field(validate_pb.FieldRules, "repeated")),
     ]
 
     def __init__(
@@ -1060,13 +1046,13 @@ class MapRules(FieldRules):
     _value_rules: FieldRules | None = None
 
     _key_rules_suffix: typing.ClassVar[list[validate_pb.FieldPathElement]] = [
-        _spec_element(_spec_field(validate_pb.MapRules, "keys")),
-        _spec_element(_spec_field(validate_pb.FieldRules, "map")),
+        _field_to_element(_spec_field(validate_pb.MapRules, "keys")),
+        _field_to_element(_spec_field(validate_pb.FieldRules, "map")),
     ]
 
     _value_rules_suffix: typing.ClassVar[list[validate_pb.FieldPathElement]] = [
-        _spec_element(_spec_field(validate_pb.MapRules, "values")),
-        _spec_element(_spec_field(validate_pb.FieldRules, "map")),
+        _field_to_element(_spec_field(validate_pb.MapRules, "values")),
+        _field_to_element(_spec_field(validate_pb.FieldRules, "map")),
     ]
 
     def __init__(
@@ -1281,7 +1267,9 @@ class RuleFactory:
             if field_opts is not None and validate_pb.ext_field in field_opts:
                 field_level = field_opts[validate_pb.ext_field]
             if field_level is not None:
-                force_ignore_empty = ignore_field not in field_level and field_desc.name in all_msg_oneof_fields
+                force_ignore_empty = (
+                    not ignore_field.is_present(field_level) and field_desc.name in all_msg_oneof_fields
+                )
                 if field_level.ignore == validate_pb.Ignore.ALWAYS:
                     continue
                 result.append(self._new_field_rule(field, field_level, force_ignore_empty=force_ignore_empty))
