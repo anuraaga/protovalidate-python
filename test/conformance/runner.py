@@ -35,7 +35,6 @@ _LEGACY = os.environ.get("PROTOVALIDATE_CONFORMANCE_LEGACY") == "1"
 
 
 def build_google_pool(fdset: pb_wkt.FileDescriptorSet) -> descriptor_pool.DescriptorPool:
-    """Build a google descriptor pool with the set's files, dependencies first."""
     pool = descriptor_pool.DescriptorPool()
     by_name = {file.name: file for file in fdset.file}
     added: set[str] = set()
