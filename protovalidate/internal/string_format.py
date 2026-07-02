@@ -19,20 +19,6 @@ from decimal import Decimal
 import celpy
 from celpy import celtypes
 
-_TYPE_NAMES: dict[type, str] = {
-    type(None): "null_type",
-    celtypes.BoolType: "bool",
-    celtypes.BytesType: "bytes",
-    celtypes.DoubleType: "double",
-    celtypes.DurationType: "google.protobuf.Duration",
-    celtypes.IntType: "int",
-    celtypes.ListType: "list",
-    celtypes.MapType: "map",
-    celtypes.StringType: "string",
-    celtypes.TimestampType: "google.protobuf.Timestamp",
-    celtypes.UintType: "uint",
-}
-
 
 class StringFormat:
     """An implementation of string.format() in CEL."""
@@ -75,27 +61,26 @@ class StringFormat:
                     i += 1
             if i >= len(fmt):
                 return celpy.CELEvalError("format() incomplete format specifier")
-            match fmt[i]:
-                case "f":
-                    result += self.__format_float(arg, precision)
-                case "e":
-                    result += self.__format_exponential(arg, precision)
-                case "d":
-                    result += self.__format_int(arg)
-                case "s":
-                    result += self.__format_string(arg)
-                case "x":
-                    result += self.__format_hex(arg)
-                case "X":
-                    result += self.__format_hex(arg).upper()
-                case "o":
-                    result += self.__format_oct(arg)
-                case "b":
-                    result += self.__format_bin(arg)
-                case _:
-                    return celpy.CELEvalError(
-                        f'could not parse formatting clause: unrecognized formatting clause "{fmt[i]}"'
-                    )
+            if fmt[i] == "f":
+                result += self.__format_float(arg, precision)
+            elif fmt[i] == "e":
+                result += self.__format_exponential(arg, precision)
+            elif fmt[i] == "d":
+                result += self.__format_int(arg)
+            elif fmt[i] == "s":
+                result += self.__format_string(arg)
+            elif fmt[i] == "x":
+                result += self.__format_hex(arg)
+            elif fmt[i] == "X":
+                result += self.__format_hex(arg).upper()
+            elif fmt[i] == "o":
+                result += self.__format_oct(arg)
+            elif fmt[i] == "b":
+                result += self.__format_bin(arg)
+            else:
+                return celpy.CELEvalError(
+                    f'could not parse formatting clause: unrecognized formatting clause "{fmt[i]}"'
+                )
             i += 1
         if j < len(args):
             return celpy.CELEvalError("format() too many arguments for format string")
@@ -148,19 +133,17 @@ class StringFormat:
         raise celpy.CELEvalError(msg)
 
     def __format_hex(self, arg: celtypes.Value) -> str:
-        match arg:
-            case celtypes.IntType() | celtypes.UintType():
-                return f"{arg:x}"
-            case celtypes.BytesType():
-                return arg.hex()
-            case celtypes.StringType():
-                return arg.encode("utf-8").hex()
-            case _:
-                msg = (
-                    "error during formatting: only integers, byte buffers, and strings can be formatted as hex, "
-                    f"was given {self.__type_str(type(arg))}"
-                )
-                raise celpy.CELEvalError(msg)
+        if isinstance(arg, celtypes.IntType | celtypes.UintType):
+            return f"{arg:x}"
+        if isinstance(arg, celtypes.BytesType):
+            return arg.hex()
+        if isinstance(arg, celtypes.StringType):
+            return arg.encode("utf-8").hex()
+        msg = (
+            "error during formatting: only integers, byte buffers, and strings can be formatted as hex, was given "
+            f"{self.__type_str(type(arg))}"
+        )
+        raise celpy.CELEvalError(msg)
 
     def __format_oct(self, arg: celtypes.Value) -> str:
         if isinstance(arg, celtypes.IntType | celtypes.UintType):
@@ -181,43 +164,42 @@ class StringFormat:
         raise celpy.CELEvalError(msg)
 
     def __format_string(self, arg: celtypes.Value) -> str:
-        match arg:
-            case None:
-                return "null"
-            case type():
-                return self.__type_str(arg)
-            case celtypes.BoolType():
-                # True -> true
-                return str(arg).lower()
-            case celtypes.BytesType():
-                decoded = arg.decode("utf-8", errors="replace")
-                # Collapse any contiguous placeholders into one
-                return re.sub("\\ufffd+", "\ufffd", decoded)
-            case celtypes.DoubleType():
-                result = self.__validate_number(arg)
-                if result is not None:
-                    return result
-                return f"{arg:g}"
-            case celtypes.DurationType():
-                return self.__format_duration(arg)
-            case celtypes.IntType() | celtypes.UintType():
-                result = self.__validate_number(arg)
-                if result is not None:
-                    return result
-                return f"{arg}"
-            case celtypes.ListType():
-                return self.__format_list(arg)
-            case celtypes.MapType():
-                return self.__format_map(arg)
-            case celtypes.StringType():
-                return arg
-            case celtypes.TimestampType():
-                base = arg.isoformat()
-                if arg.getMilliseconds() != 0:
-                    base = arg.isoformat(timespec="milliseconds")
-                return base.removesuffix("+00:00") + "Z"
-            case _:
-                return "unknown"
+        if arg is None:
+            return "null"
+        if isinstance(arg, type):
+            return self.__type_str(arg)
+        if isinstance(arg, celtypes.BoolType):
+            # True -> true
+            return str(arg).lower()
+        if isinstance(arg, celtypes.BytesType):
+            decoded = arg.decode("utf-8", errors="replace")
+            # Collapse any contiguous placeholders into one
+            return re.sub("\\ufffd+", "\ufffd", decoded)
+
+        if isinstance(arg, celtypes.DoubleType):
+            result = self.__validate_number(arg)
+            if result is not None:
+                return result
+            return f"{arg:g}"
+        if isinstance(arg, celtypes.DurationType):
+            return self.__format_duration(arg)
+        if isinstance(arg, celtypes.IntType) or isinstance(arg, celtypes.UintType):
+            result = self.__validate_number(arg)
+            if result is not None:
+                return result
+            return f"{arg}"
+        if isinstance(arg, celtypes.ListType):
+            return self.__format_list(arg)
+        if isinstance(arg, celtypes.MapType):
+            return self.__format_map(arg)
+        if isinstance(arg, celtypes.StringType):
+            return arg
+        if isinstance(arg, celtypes.TimestampType):
+            base = arg.isoformat()
+            if arg.getMilliseconds() != 0:
+                base = arg.isoformat(timespec="milliseconds")
+            return base.removesuffix("+00:00") + "Z"
+        return "unknown"
 
     def __format_list(self, arg: celtypes.ListType) -> str:
         return "[" + ", ".join(self.__format_string(val) for val in arg) + "]"
@@ -230,4 +212,26 @@ class StringFormat:
         return f"{arg.seconds + Decimal(arg.microseconds) / Decimal(1_000_000):f}s"
 
     def __type_str(self, arg: celtypes.Type) -> str:
-        return _TYPE_NAMES.get(arg, "unknown")
+        if arg is type(None):
+            return "null_type"
+        if arg is celtypes.BoolType:
+            return "bool"
+        if arg is celtypes.BytesType:
+            return "bytes"
+        if arg is celtypes.DoubleType:
+            return "double"
+        if arg is celtypes.DurationType:
+            return "google.protobuf.Duration"
+        if arg is celtypes.IntType:
+            return "int"
+        if arg is celtypes.ListType:
+            return "list"
+        if arg is celtypes.MapType:
+            return "map"
+        if arg is celtypes.StringType:
+            return "string"
+        if arg is celtypes.TimestampType:
+            return "google.protobuf.Timestamp"
+        if arg is celtypes.UintType:
+            return "uint"
+        return "unknown"

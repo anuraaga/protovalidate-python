@@ -137,9 +137,6 @@ def _enum_of(subject: DescField | ScalarType | DescMessage | DescEnum) -> DescEn
             return None
 
 
-# ----- value conversion: protobuf-py -> celpy celtypes -----
-
-
 def make_duration(msg: Duration) -> celtypes.DurationType:
     return celtypes.DurationType(seconds=msg.seconds, nanos=msg.nanos)
 
@@ -149,12 +146,7 @@ def make_timestamp(msg: Timestamp) -> celtypes.TimestampType:
 
 
 class MessageConverter:
-    """Converts protobuf-py values into celpy celtypes for CEL evaluation.
-
-    Caches each message type's fields-by-name (protobuf-py has no public
-    fields_by_name). One converter is owned by each :class:`RuleFactory`, so the
-    cache lives and dies with its Validator rather than as global state.
-    """
+    """Converts protobuf-py values into celpy celtypes for CEL evaluation."""
 
     def __init__(self):
         self._fields_by_name: dict[DescMessage, dict[str, DescField]] = {}
@@ -214,7 +206,7 @@ class MessageConverter:
                 return self.message(val)
             case DescEnum():
                 return celtypes.IntType(int(val))
-            case _:  # kind: ScalarType
+            case ScalarType():
                 ctor = _TYPE_CTORS.get(kind)
                 if ctor is None:
                     msg = "unknown field type"
@@ -248,13 +240,10 @@ class MessageType(celtypes.MapType):
         self.msg = msg
         self._conv = conv
         self._fields = conv.fields_by_name(type(msg).desc())
-        # Iterating a message yields exactly its set fields, with the active
-        # oneof member resolved; unset fields are synthesized by __getitem__.
         for field in msg:
             self[celtypes.StringType(field.name)] = conv.field(msg, field)
 
-    def field_view(self, name: str) -> DescField | None:
-        """The field of this message's type with the given name, or None."""
+    def get_field(self, name: str) -> DescField | None:
         return self._fields.get(name)
 
     def convert_field(self, field: DescField) -> celtypes.Value:
@@ -268,9 +257,6 @@ class MessageType(celtypes.MapType):
                 raise KeyError
             return self._conv.zero(field)
         return super().__getitem__(key)
-
-
-# ----- protobuf-py validate_pb path / element construction -----
 
 
 def _field_to_element(field: DescField | DescExtension) -> validate_pb.FieldPathElement:
@@ -328,7 +314,6 @@ def _map_key_element(field: DescField, key: typing.Any) -> validate_pb.FieldPath
 
 
 def _spec_field(rules_cls: type[Message], name: str) -> DescField:
-    """The named field of a rules message (protobuf-py has no field-number constants)."""
     return next(f for f in rules_cls.desc().fields if f.name == name)
 
 
@@ -337,12 +322,7 @@ def _which_type(field_level: validate_pb.FieldRules) -> str | None:
 
 
 class Violation:
-    """A singular rule violation.
-
-    Field/rule paths accumulate as element lists during recursion (protobuf-py
-    messages are immutable and do not auto-vivify), materialized into a
-    ``validate_pb.Violation`` lazily via :attr:`proto`.
-    """
+    """A singular rule violation."""
 
     field_value: typing.Any
     rule_value: typing.Any
@@ -366,16 +346,6 @@ class Violation:
         self._message = message
         self._for_key = for_key
 
-    def append_field_element(self, element: validate_pb.FieldPathElement) -> None:
-        self._field_elements.append(element)
-
-    def extend_rule_elements(self, elements: list[validate_pb.FieldPathElement]) -> None:
-        self._rule_elements.extend(elements)
-
-    def finalize_paths(self) -> None:
-        self._field_elements.reverse()
-        self._rule_elements.reverse()
-
     @property
     def proto(self) -> validate_pb.Violation:
         kwargs: dict[str, typing.Any] = {
@@ -388,6 +358,16 @@ class Violation:
         if self._rule_elements:
             kwargs["rule"] = validate_pb.FieldPath(elements=list(self._rule_elements))
         return validate_pb.Violation(**kwargs)
+
+    def _finalize_paths(self) -> None:
+        self._field_elements.reverse()
+        self._rule_elements.reverse()
+
+    def _append_field_element(self, element: validate_pb.FieldPathElement) -> None:
+        self._field_elements.append(element)
+
+    def _extend_rule_elements(self, elements: list[validate_pb.FieldPathElement]) -> None:
+        self._rule_elements.extend(elements)
 
 
 class RuleContext:
@@ -411,11 +391,11 @@ class RuleContext:
 
     def add_field_path_element(self, element: validate_pb.FieldPathElement):
         for violation in self._violations:
-            violation.append_field_element(element)
+            violation._append_field_element(element)
 
     def add_rule_path_elements(self, elements: list[validate_pb.FieldPathElement]):
         for violation in self._violations:
-            violation.extend_rule_elements(elements)
+            violation._extend_rule_elements(elements)
 
     @property
     def done(self) -> bool:
@@ -652,7 +632,7 @@ def _type_mismatch(subject: DescField | ScalarType | DescMessage | DescEnum, exp
     return CompilationError(f"field {name} has type {actual} but expected {expected}")
 
 
-def check_field_type(
+def _check_field_type(
     subject: DescField | ScalarType | DescMessage | DescEnum,
     expected: ScalarType | None,
     wrapper_name: str | None = None,
@@ -719,10 +699,8 @@ class FieldRules(CelRules):
                             elements=[_field_to_element(rule_field), _field_to_element(type_field)]
                         ),
                     )
-            # Custom predefined rules are proto2 extensions on the rules message
-            # that the bundled stub cannot decode; a caller-supplied Registry
-            # knows them, so apply each extension of this rules message that is
-            # set and carries a predefined rule.
+            # Custom predefined rules are extensions on the rules message,
+            # read using the user-provided Registry.
             if registry is not None:
                 rules_type_name = type(rules_pb).desc().type_name
                 for ext in registry:
@@ -1118,11 +1096,11 @@ class RuleFactory:
                     raise _type_mismatch(field, "enum")
                 return EnumRules(self._env, self._funcs, field, field_level, **kw)
             case "any":
-                check_field_type(field, None, "google.protobuf.Any")
+                _check_field_type(field, None, "google.protobuf.Any")
                 return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry, conv=self._conv)
             case _ if type_case in _RULE_FIELD_TYPES:
                 expected, wrapper = _RULE_FIELD_TYPES[type_case]
-                check_field_type(field, expected, wrapper)
+                _check_field_type(field, expected, wrapper)
                 return FieldRules(self._env, self._funcs, field, field_level, **kw)
             case _:
                 msg = f"unknown rule type {type_case!r}"

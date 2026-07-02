@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from google.protobuf import message as google_message
+from typing import TYPE_CHECKING
 from protobuf import Message, Registry
 
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal import extra_func
 from protovalidate.internal import rules as _rules
 from protovalidate.internal.legacy import LegacyMessageConverter
+
+if TYPE_CHECKING:
+    from google.protobuf import message as google_message
 
 CompilationError = _rules.CompilationError
 Violations = validate_pb.Violations
@@ -27,11 +30,7 @@ Violation = _rules.Violation
 
 class Validator:
     """
-    Validates protobuf-py messages against static rules.
-
-    Legacy google.protobuf messages are also accepted: they are copied into
-    protobuf-py messages of the same type and validated identically. Violation
-    field values then refer to the copy's values.
+    Validates Protobuf messages against static rules.
 
     Each validator instance caches internal state generated from the static
     rules, so reusing the same instance for multiple validations
@@ -43,16 +42,19 @@ class Validator:
     def __init__(self, registry: Registry | None = None):
         """
         Parameters:
-            registry: An optional protobuf-py Registry used to resolve custom
-                predefined-rule extensions (proto2 extensions on the standard
-                rule messages). Without it, only standard rules and rules whose
-                extensions are known to the bundled stub are applied. For
-                legacy google.protobuf messages, such a Registry can be built
+            registry: An optional Registry used to resolve custom
+                predefined-rule extensions. If omitted, only standard rules are applied.
+
+                For legacy google.protobuf messages, such a Registry can be built
                 with ``FileDescriptorSet.to_registry()``.
         """
         funcs = extra_func.make_extra_funcs()
         self._factory = _rules.RuleFactory(funcs, registry)
-        self._legacy = LegacyMessageConverter()
+        try:
+            import google.protobuf.message  # noqa: F401, PLC0415
+            self._legacy = LegacyMessageConverter()
+        except ImportError:
+            self._legacy = None
 
     def validate(self, message: Message | google_message.Message, *, fail_fast: bool = False):
         """
@@ -101,12 +103,12 @@ class Validator:
             if ctx.done:
                 break
         for violation in ctx.violations:
-            violation.finalize_paths()
+            violation._finalize_paths()
         return ctx.violations
 
     def _coerce(self, message: Message | google_message.Message) -> Message:
-        if isinstance(message, google_message.Message):
-            return self._legacy.convert(message)
+        if self._legacy:
+            return self._legacy.normalize(message)
         return message
 
 

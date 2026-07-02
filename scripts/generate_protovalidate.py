@@ -32,18 +32,12 @@ def main(version: str) -> None:
 
     repo = Path(__file__).parent.parent
 
-    # Vendor the protovalidate protos into proto/ and generate the bundled,
-    # relocatable buf.validate stub into protovalidate/_gen. Vendoring keeps the
-    # protos editable for testing local schema changes.
     protos_dir = repo / "proto"
     shutil.rmtree(protos_dir, ignore_errors=True)
     protos_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(["buf", "export", protovalidate_path, "-o", protos_dir], check=True)  # noqa: S603, S607
     subprocess.run(["buf", "generate"], cwd=repo, check=True)  # noqa: S607
 
-    # Vendor the protovalidate-testing protos alongside the local test protos in
-    # test/proto; the conformance harness and cases are generated from them by
-    # the generate-test task.
     subprocess.run(  # noqa: S603
         ["buf", "export", protovalidate_testing_path, "-o", repo / "test" / "proto"],  # noqa: S607
         check=True,

@@ -1,7 +1,5 @@
-# Generated code — collapse diffs and exclude from language stats.
 protovalidate/_gen/** linguist-generated=true
 test/gen/** linguist-generated=true
 
-# Vendored upstream protos (buf export); the local test protos are not vendored.
 proto/** linguist-vendored=true
 test/proto/buf/** linguist-vendored=true
