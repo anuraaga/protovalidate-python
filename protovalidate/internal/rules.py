@@ -105,15 +105,17 @@ def _wire_type(field: DescField | DescExtension | ScalarType | DescMessage | Des
     boundary needs it: protobuf-py reports it on desc.proto.type, except a bare
     element (no .proto) and an editions-delimited field (reported as MESSAGE but
     pathed as GROUP)."""
-    if isinstance(field, ScalarType):
-        return FieldDescriptorProto.Type(int(field))
-    if isinstance(field, DescMessage):
-        return FieldDescriptorProto.Type.MESSAGE
-    if isinstance(field, DescEnum):
-        return FieldDescriptorProto.Type.ENUM
-    if getattr(field.value, "delimited_encoding", False):
-        return FieldDescriptorProto.Type.GROUP
-    return field.proto.type
+    match field:
+        case ScalarType():
+            return FieldDescriptorProto.Type(int(field))
+        case DescMessage():
+            return FieldDescriptorProto.Type.MESSAGE
+        case DescEnum():
+            return FieldDescriptorProto.Type.ENUM
+        case _ if getattr(field.value, "delimited_encoding", False):
+            return FieldDescriptorProto.Type.GROUP
+        case _:
+            return field.proto.type
 
 
 def _path_name(field: DescField | DescExtension) -> str:
@@ -128,29 +130,35 @@ def _read_key(field: DescField | DescExtension) -> DescField | Extension:
 
 def _scalar_of(subject: DescField | ScalarType | DescMessage | DescEnum) -> ScalarType | None:
     """The ScalarType a field or element holds, if it is a scalar."""
-    if isinstance(subject, ScalarType):
-        return subject
-    if isinstance(subject, DescField) and isinstance(subject.value, DescFieldValueScalar):
-        return subject.value.scalar
-    return None
+    match subject:
+        case ScalarType():
+            return subject
+        case DescField(value=DescFieldValueScalar(scalar=scalar)):
+            return scalar
+        case _:
+            return None
 
 
 def _message_of(subject: DescField | ScalarType | DescMessage | DescEnum) -> DescMessage | None:
     """The DescMessage a field or element holds, if it is message-typed."""
-    if isinstance(subject, DescMessage):
-        return subject
-    if isinstance(subject, DescField) and isinstance(subject.value, DescFieldValueMessage):
-        return subject.value.message
-    return None
+    match subject:
+        case DescMessage():
+            return subject
+        case DescField(value=DescFieldValueMessage(message=message)):
+            return message
+        case _:
+            return None
 
 
 def _enum_of(subject: DescField | ScalarType | DescMessage | DescEnum) -> DescEnum | None:
     """The DescEnum a field or element holds, if it is enum-typed."""
-    if isinstance(subject, DescEnum):
-        return subject
-    if isinstance(subject, DescField) and isinstance(subject.value, DescFieldValueEnum):
-        return subject.value.enum
-    return None
+    match subject:
+        case DescEnum():
+            return subject
+        case DescField(value=DescFieldValueEnum(enum=enum)):
+            return enum
+        case _:
+            return None
 
 
 # ----- value conversion: protobuf-py -> celpy celtypes -----
@@ -210,41 +218,46 @@ class MessageConverter:
 
     def field_value(self, val: typing.Any, value: typing.Any) -> celtypes.Value:
         # value is the field's DescFieldValue{Scalar,Enum,Message,List,Map}.
-        if isinstance(value, DescFieldValueMap):
-            result = celtypes.MapType()
-            for k, v in val.items():
-                result[self.scalar(k, value.key)] = self.scalar(v, value.value)
-            return result
-        if isinstance(value, DescFieldValueList):
-            return celtypes.ListType(self.scalar(item, value.element) for item in val)
-        if isinstance(value, DescFieldValueMessage):
-            return self.message(val)
-        if isinstance(value, DescFieldValueEnum):
-            return celtypes.IntType(int(val))
-        return self.scalar(val, value.scalar)  # DescFieldValueScalar
+        match value:
+            case DescFieldValueMap(key=key_kind, value=value_kind):
+                result = celtypes.MapType()
+                for k, v in val.items():
+                    result[self.scalar(k, key_kind)] = self.scalar(v, value_kind)
+                return result
+            case DescFieldValueList(element=element):
+                return celtypes.ListType(self.scalar(item, element) for item in val)
+            case DescFieldValueMessage():
+                return self.message(val)
+            case DescFieldValueEnum():
+                return celtypes.IntType(int(val))
+            case _:  # DescFieldValueScalar
+                return self.scalar(val, value.scalar)
 
     def scalar(self, val: typing.Any, kind: ScalarType | DescMessage | DescEnum) -> celtypes.Value:
-        if isinstance(kind, DescMessage):
-            return self.message(val)
-        if isinstance(kind, DescEnum):
-            return celtypes.IntType(int(val))
-        ctor = _TYPE_CTORS.get(kind)  # kind: ScalarType
-        if ctor is None:
-            msg = "unknown field type"
-            raise CompilationError(msg)
-        return ctor(val)
+        match kind:
+            case DescMessage():
+                return self.message(val)
+            case DescEnum():
+                return celtypes.IntType(int(val))
+            case _:  # kind: ScalarType
+                ctor = _TYPE_CTORS.get(kind)
+                if ctor is None:
+                    msg = "unknown field type"
+                    raise CompilationError(msg)
+                return ctor(val)
 
     def zero(self, field: DescField) -> celtypes.Value:
-        value = field.value
-        if isinstance(value, DescFieldValueMap):
-            return celtypes.MapType()
-        if isinstance(value, DescFieldValueList):
-            return celtypes.ListType()
-        if isinstance(value, DescFieldValueMessage):
-            return self.message(value.message.type())
-        if isinstance(value, DescFieldValueEnum):
-            return celtypes.IntType(0)
-        return self.scalar(_scalar_zero(value.scalar), value.scalar)  # DescFieldValueScalar
+        match field.value:
+            case DescFieldValueMap():
+                return celtypes.MapType()
+            case DescFieldValueList():
+                return celtypes.ListType()
+            case DescFieldValueMessage(message=message):
+                return self.message(message.type())
+            case DescFieldValueEnum():
+                return celtypes.IntType(0)
+            case value:  # DescFieldValueScalar
+                return self.scalar(_scalar_zero(value.scalar), value.scalar)
 
     def _unwrap(self, msg: Message) -> celtypes.Value:
         return self.field(msg, self.fields_by_name(type(msg).desc())["value"])
@@ -306,34 +319,29 @@ def _oneof_to_element(oneof: DescOneof) -> validate_pb.FieldPathElement:
     return validate_pb.FieldPathElement(field_name=oneof.name)
 
 
-_INT_KEY_TYPES = frozenset(
-    (
-        ScalarType.INT32,
-        ScalarType.SFIXED32,
-        ScalarType.INT64,
-        ScalarType.SFIXED64,
-        ScalarType.SINT32,
-        ScalarType.SINT64,
-    )
-)
-_UINT_KEY_TYPES = frozenset((ScalarType.UINT32, ScalarType.FIXED32, ScalarType.UINT64, ScalarType.FIXED64))
-
-
 def _map_key_element(field: DescField, key: typing.Any) -> validate_pb.FieldPathElement:
     value = field.value
     assert isinstance(value, DescFieldValueMap)  # noqa: S101
     subscript: Oneof
-    if value.key == ScalarType.BOOL:
-        subscript = Oneof(field="bool_key", value=key)
-    elif value.key in _INT_KEY_TYPES:
-        subscript = Oneof(field="int_key", value=key)
-    elif value.key in _UINT_KEY_TYPES:
-        subscript = Oneof(field="uint_key", value=key)
-    elif value.key == ScalarType.STRING:
-        subscript = Oneof(field="string_key", value=key)
-    else:
-        msg = "unexpected map type"
-        raise CompilationError(msg)
+    match value.key:
+        case ScalarType.BOOL:
+            subscript = Oneof(field="bool_key", value=key)
+        case (
+            ScalarType.INT32
+            | ScalarType.SFIXED32
+            | ScalarType.INT64
+            | ScalarType.SFIXED64
+            | ScalarType.SINT32
+            | ScalarType.SINT64
+        ):
+            subscript = Oneof(field="int_key", value=key)
+        case ScalarType.UINT32 | ScalarType.FIXED32 | ScalarType.UINT64 | ScalarType.FIXED64:
+            subscript = Oneof(field="uint_key", value=key)
+        case ScalarType.STRING:
+            subscript = Oneof(field="string_key", value=key)
+        case _:
+            msg = "unexpected map type"
+            raise CompilationError(msg)
     return validate_pb.FieldPathElement(
         field_number=field.number,
         field_name=field.name,
@@ -506,8 +514,8 @@ class CelRules(Rules):
         for cel in self._cel:
             activation["rule"] = cel.rule_cel
             result = cel.runner.evaluate(activation)
-            if isinstance(result, celtypes.BoolType):
-                if not result:
+            match result:
+                case celtypes.BoolType() if not result:
                     message = cel.rule.message
                     if len(message) == 0:
                         message = f'"{cel.rule.expression}" returned false'
@@ -521,8 +529,7 @@ class CelRules(Rules):
                             for_key=for_key,
                         ),
                     )
-            elif isinstance(result, celtypes.StringType):
-                if result:
+                case celtypes.StringType() if result:
                     ctx.add(
                         Violation(
                             field_value=this_value,
@@ -533,8 +540,8 @@ class CelRules(Rules):
                             for_key=for_key,
                         ),
                     )
-            elif isinstance(result, Exception):
-                raise result
+                case Exception():
+                    raise result
 
     def add_rule(
         self,
@@ -1062,14 +1069,15 @@ class OneofRules(Rules):
 def _message_child(field: DescField) -> DescMessage | None:
     """The sub-message a field recurses into: a map value, list element, or
     singular message, if message-typed."""
-    value = field.value
-    if isinstance(value, DescFieldValueMap):
-        return value.value if isinstance(value.value, DescMessage) else None
-    if isinstance(value, DescFieldValueList):
-        return value.element if isinstance(value.element, DescMessage) else None
-    if isinstance(value, DescFieldValueMessage):
-        return value.message
-    return None
+    match field.value:
+        case DescFieldValueMap(value=DescMessage() as message):
+            return message
+        case DescFieldValueList(element=DescMessage() as message):
+            return message
+        case DescFieldValueMessage(message=message):
+            return message
+        case _:
+            return None
 
 
 class RuleFactory:
@@ -1124,48 +1132,60 @@ class RuleFactory:
             "registry": self._registry,
             "conv": self._conv,
         }
-        if type_case is None:
-            return FieldRules(self._env, self._funcs, field, field_level, **kw)
-        if type_case == "enum":
-            if _enum_of(field) is None:
-                actual = _wire_type(field).name.lower()
-                name = field.name if isinstance(field, DescField) else actual
-                msg = f"field {name} has type {actual} but expected enum"
+        match type_case:
+            case None:
+                return FieldRules(self._env, self._funcs, field, field_level, **kw)
+            case "enum":
+                if _enum_of(field) is None:
+                    actual = _wire_type(field).name.lower()
+                    name = field.name if isinstance(field, DescField) else actual
+                    msg = f"field {name} has type {actual} but expected enum"
+                    raise CompilationError(msg)
+                return EnumRules(self._env, self._funcs, field, field_level, **kw)
+            case "any":
+                check_field_type(field, None, "google.protobuf.Any")
+                return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry, conv=self._conv)
+            case _ if type_case in _RULE_FIELD_TYPES:
+                expected, wrapper = _RULE_FIELD_TYPES[type_case]
+                check_field_type(field, expected, wrapper)
+                return FieldRules(self._env, self._funcs, field, field_level, **kw)
+            case _:
+                msg = f"unknown rule type {type_case!r}"
                 raise CompilationError(msg)
-            return EnumRules(self._env, self._funcs, field, field_level, **kw)
-        if type_case == "any":
-            check_field_type(field, None, "google.protobuf.Any")
-            return AnyRules(self._env, self._funcs, field, field_level, registry=self._registry, conv=self._conv)
-        if type_case in _RULE_FIELD_TYPES:
-            expected, wrapper = _RULE_FIELD_TYPES[type_case]
-            check_field_type(field, expected, wrapper)
-            return FieldRules(self._env, self._funcs, field, field_level, **kw)
-        msg = f"unknown rule type {type_case!r}"
-        raise CompilationError(msg)
 
     def _new_field_rule(
         self, field: DescField, rules: validate_pb.FieldRules, *, force_ignore_empty: bool = False
     ) -> FieldRules:
-        value = field.value
-        if not isinstance(value, (DescFieldValueList, DescFieldValueMap)):
-            return self._new_scalar_field_rule(field, rules, force_ignore_empty=force_ignore_empty)
         type_oneof = rules.type
-        if isinstance(value, DescFieldValueMap):
-            map_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "map" else None
-            key_rules = None
-            value_rules = None
-            if map_rules is not None and map_rules.keys is not None:
-                key_rules = self._new_scalar_field_rule(value.key, map_rules.keys, for_items=True)
-            if map_rules is not None and map_rules.values is not None:
-                value_rules = self._new_scalar_field_rule(value.value, map_rules.values, for_items=True)
-            return MapRules(
-                self._env, self._funcs, field, rules, key_rules, value_rules, registry=self._registry, conv=self._conv
-            )
-        item_rule = None
-        rep_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "repeated" else None
-        if rep_rules is not None and rep_rules.items is not None:
-            item_rule = self._new_scalar_field_rule(value.element, rep_rules.items)
-        return RepeatedRules(self._env, self._funcs, field, rules, item_rule, registry=self._registry, conv=self._conv)
+        match field.value:
+            case DescFieldValueMap() as value:
+                map_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "map" else None
+                key_rules = None
+                value_rules = None
+                if map_rules is not None and map_rules.keys is not None:
+                    key_rules = self._new_scalar_field_rule(value.key, map_rules.keys, for_items=True)
+                if map_rules is not None and map_rules.values is not None:
+                    value_rules = self._new_scalar_field_rule(value.value, map_rules.values, for_items=True)
+                return MapRules(
+                    self._env,
+                    self._funcs,
+                    field,
+                    rules,
+                    key_rules,
+                    value_rules,
+                    registry=self._registry,
+                    conv=self._conv,
+                )
+            case DescFieldValueList() as value:
+                item_rule = None
+                rep_rules = type_oneof.value if type_oneof is not None and type_oneof.field == "repeated" else None
+                if rep_rules is not None and rep_rules.items is not None:
+                    item_rule = self._new_scalar_field_rule(value.element, rep_rules.items)
+                return RepeatedRules(
+                    self._env, self._funcs, field, rules, item_rule, registry=self._registry, conv=self._conv
+                )
+            case _:
+                return self._new_scalar_field_rule(field, rules, force_ignore_empty=force_ignore_empty)
 
     def _new_rules(self, desc: DescMessage) -> list[Rules]:
         result: list[Rules] = []
@@ -1203,12 +1223,13 @@ class RuleFactory:
             sub_desc = _message_child(field)
             if sub_desc is None:
                 continue
-            if isinstance(field.value, DescFieldValueMap):
-                result.append(MapValMsgRule(self, field, sub_desc))
-            elif isinstance(field.value, DescFieldValueList):
-                result.append(RepeatedMsgRule(self, field, sub_desc))
-            else:
-                result.append(SubMsgRule(self, field, sub_desc))
+            match field.value:
+                case DescFieldValueMap():
+                    result.append(MapValMsgRule(self, field, sub_desc))
+                case DescFieldValueList():
+                    result.append(RepeatedMsgRule(self, field, sub_desc))
+                case _:
+                    result.append(SubMsgRule(self, field, sub_desc))
         return result
 
 

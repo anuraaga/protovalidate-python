@@ -71,15 +71,15 @@ def cel_is_ip(val: celtypes.Value, ver: celtypes.Value | None = None) -> celpy.R
 
 def _is_ip(string: str, version: int) -> bool:
     """Internal implementation"""
-    valid = False
-    if version == 6:
-        valid = Ipv6(string).address()
-    elif version == 4:
-        valid = Ipv4(string).address()
-    elif version == 0:
-        valid = Ipv4(string).address() or Ipv6(string).address()
-
-    return valid
+    match version:
+        case 6:
+            return Ipv6(string).address()
+        case 4:
+            return Ipv4(string).address()
+        case 0:
+            return Ipv4(string).address() or Ipv6(string).address()
+        case _:
+            return False
 
 
 def cel_is_ip_prefix(val: celtypes.Value, *args) -> celpy.Result:
@@ -107,36 +107,37 @@ def cel_is_ip_prefix(val: celtypes.Value, *args) -> celpy.Result:
         raise celpy.CELEvalError(msg)
     version = 0
     strict = False
-    if len(args) == 1 and isinstance(args[0], celtypes.BoolType):
-        strict = bool(args[0])
-    elif len(args) == 1 and isinstance(args[0], celtypes.IntType):
-        version = args[0]
-    elif len(args) == 1 and (not isinstance(args[0], celtypes.BoolType) or not isinstance(args[0], celtypes.IntType)):
-        msg = "invalid argument, expected bool or int"
-        raise celpy.CELEvalError(msg)
-    elif len(args) == 2 and isinstance(args[0], celtypes.IntType) and isinstance(args[1], celtypes.BoolType):
-        version = args[0]
-        strict = bool(args[1])
-    elif len(args) == 2 and (not isinstance(args[0], celtypes.IntType) or not isinstance(args[1], celtypes.BoolType)):
-        msg = "invalid argument, expected int and bool"
-        raise celpy.CELEvalError(msg)
+    match args:
+        case (celtypes.BoolType() as strict_arg,):
+            strict = bool(strict_arg)
+        case (celtypes.IntType() as version_arg,):
+            version = version_arg
+        case (_,):
+            msg = "invalid argument, expected bool or int"
+            raise celpy.CELEvalError(msg)
+        case (celtypes.IntType() as version_arg, celtypes.BoolType() as strict_arg):
+            version = version_arg
+            strict = bool(strict_arg)
+        case (_, _):
+            msg = "invalid argument, expected int and bool"
+            raise celpy.CELEvalError(msg)
 
     return celtypes.BoolType(_is_ip_prefix(val, version, strict=strict))
 
 
 def _is_ip_prefix(string: str, version: int, *, strict=False) -> bool:
     """Internal implementation"""
-    valid = False
-    if version == 6:
-        v6 = Ipv6(string)
-        valid = v6.address_prefix() and (not strict or v6.is_prefix_only())
-    elif version == 4:
-        v4 = Ipv4(string)
-        valid = v4.address_prefix() and (not strict or v4.is_prefix_only())
-    elif version == 0:
-        valid = _is_ip_prefix(string, 6, strict=strict) or _is_ip_prefix(string, 4, strict=strict)
-
-    return valid
+    match version:
+        case 6:
+            v6 = Ipv6(string)
+            return v6.address_prefix() and (not strict or v6.is_prefix_only())
+        case 4:
+            v4 = Ipv4(string)
+            return v4.address_prefix() and (not strict or v4.is_prefix_only())
+        case 0:
+            return _is_ip_prefix(string, 6, strict=strict) or _is_ip_prefix(string, 4, strict=strict)
+        case _:
+            return False
 
 
 def cel_is_email(string: celtypes.Value) -> celpy.Result:
