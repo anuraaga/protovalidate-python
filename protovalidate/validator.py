@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
+
 from protobuf import Message, Registry
 
 from protovalidate._gen.buf.validate import validate_pb
@@ -52,6 +55,7 @@ class Validator:
         self._factory = _rules.RuleFactory(funcs, registry)
         try:
             import google.protobuf.message  # noqa: F401, PLC0415
+
             self._legacy = LegacyMessageConverter()
         except ImportError:
             self._legacy = None

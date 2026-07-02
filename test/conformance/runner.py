@@ -15,11 +15,6 @@
 import os
 import sys
 
-# The buf.validate stubs (including the conformance harness) live in test/gen;
-# put it on the path before the `buf` imports so the top-level `buf` package
-# resolves there.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gen"))
-
 import celpy
 import protobuf
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
@@ -28,11 +23,14 @@ from protobuf import Oneof, Registry
 from protobuf import wkt as pb_wkt
 
 import protovalidate
-from buf.validate import validate_pb
-from buf.validate.conformance.harness import harness_pb
+from test.gen.buf.validate import validate_pb
+from test.gen.buf.validate.conformance.harness.harness_pb import (
+    TestConformanceRequest,
+    TestConformanceResponse,
+    TestResult,
+)
 
-# When set, test messages are parsed as google.protobuf messages so the suite
-# exercises the legacy conversion path instead of protobuf-py directly.
+# Set to test google.protobuf messages instead of protobuf-py
 _LEGACY = os.environ.get("PROTOVALIDATE_CONFORMANCE_LEGACY") == "1"
 
 
@@ -56,77 +54,70 @@ def build_google_pool(fdset: pb_wkt.FileDescriptorSet) -> descriptor_pool.Descri
     return pool
 
 
-def run_test_case(
-    validator: protovalidate.Validator, tc: protobuf.Message | google_message.Message, result: harness_pb.TestResult
-) -> harness_pb.TestResult:
+def run_test_case(validator: protovalidate.Validator, tc: protobuf.Message | google_message.Message) -> TestResult:
     # Run the validator
     try:
         violations = validator.collect_violations(tc)
         if len(violations) > 0:
-            # protovalidate bundles its own relocatable validate_pb stub, a
-            # distinct class identity from the harness gen here; cross by binary.
+            # Convert from protovalidate bundled proto to test harness's.
             pv_violations = protovalidate.Violations(violations=[violation.proto for violation in violations])
-            result.result = Oneof(
-                field="validation_error",
-                value=validate_pb.Violations.from_binary(pv_violations.to_binary()),
+            return TestResult(
+                result=Oneof(
+                    field="validation_error",
+                    value=validate_pb.Violations.from_binary(pv_violations.to_binary()),
+                )
             )
         else:
-            result.result = Oneof(field="success", value=True)
+            return TestResult(result=Oneof(field="success", value=True))
     except celpy.CELEvalError as e:
-        result.result = Oneof(field="runtime_error", value=str(e))
+        return TestResult(result=Oneof(field="runtime_error", value=str(e)))
     except protovalidate.CompilationError as e:
-        result.result = Oneof(field="compilation_error", value=str(e))
+        return TestResult(result=Oneof(field="compilation_error", value=str(e)))
     except Exception as e:
-        result.result = Oneof(field="unexpected_error", value=str(e))
-    return result
+        return TestResult(result=Oneof(field="unexpected_error", value=str(e)))
 
 
 def run_any_test_case(
     validator: protovalidate.Validator,
-    registry: Registry,
+    registry: Registry | descriptor_pool.DescriptorPool,
     tc: pb_wkt.Any,
-    result: harness_pb.TestResult,
-    google_pool: descriptor_pool.DescriptorPool | None = None,
-) -> harness_pb.TestResult:
+) -> TestResult:
     type_name = tc.type_url.split("/")[-1]
     msg: protobuf.Message | google_message.Message
-    if google_pool is not None:
-        try:
-            google_desc = google_pool.FindMessageTypeByName(type_name)
-        except KeyError:
-            result.result = Oneof(field="unexpected_error", value=f"unknown type: {type_name}")
-            return result
-        msg = message_factory.GetMessageClass(google_desc)()
-        msg.ParseFromString(tc.value)
-    else:
+    if isinstance(registry, Registry):
         desc = registry.message(type_name)
         if desc is None:
-            result.result = Oneof(field="unexpected_error", value=f"unknown type: {type_name}")
-            return result
+            return TestResult(result=Oneof(field="unexpected_error", value=f"unknown type: {type_name}"))
         unpacked = tc.unpack(desc)
         if unpacked is None:
-            result.result = Oneof(field="unexpected_error", value=f"cannot unpack {tc.type_url}")
-            return result
+            return TestResult(result=Oneof(field="unexpected_error", value=f"cannot unpack {tc.type_url}"))
         msg = unpacked
-    return run_test_case(validator, msg, result)
+    else:
+        try:
+            google_desc = registry.FindMessageTypeByName(type_name)
+        except KeyError:
+            return TestResult(result=Oneof(field="unexpected_error", value=f"unknown type: {type_name}"))
+        msg = message_factory.GetMessageClass(google_desc)()
+        msg.ParseFromString(tc.value)
+    return run_test_case(validator, msg)
 
 
 def run_conformance_test(
-    request: harness_pb.TestConformanceRequest,
-) -> harness_pb.TestConformanceResponse:
+    request: TestConformanceRequest,
+) -> TestConformanceResponse:
     registry = request.fdset.to_registry()
     # The registry resolves the conformance suite's custom predefined-rule extensions.
     validator = protovalidate.Validator(registry=registry)
-    google_pool = build_google_pool(request.fdset) if _LEGACY else None
-    response = harness_pb.TestConformanceResponse()
+    test_registry = registry if not _LEGACY else build_google_pool(request.fdset)
+    response = TestConformanceResponse()
     for name, tc in request.cases.items():
-        response.results[name] = run_any_test_case(validator, registry, tc, harness_pb.TestResult(), google_pool)
+        response.results[name] = run_any_test_case(validator, test_registry, tc)
     return response
 
 
 if __name__ == "__main__":
     # Read a serialized TestConformanceRequest from stdin
-    request = harness_pb.TestConformanceRequest.from_binary(sys.stdin.buffer.read())
+    request = TestConformanceRequest.from_binary(sys.stdin.buffer.read())
     # Run the test
     result = run_conformance_test(request)
     # Write a serialized TestConformanceResponse to stdout
