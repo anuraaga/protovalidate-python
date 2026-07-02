@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from google.protobuf import message as google_message
 from protobuf import Message, Registry
 
 from protovalidate._gen.buf.validate import validate_pb
 from protovalidate.internal import extra_func
 from protovalidate.internal import rules as _rules
+from protovalidate.internal.legacy import LegacyMessageConverter
 
 CompilationError = _rules.CompilationError
 Violations = validate_pb.Violations
@@ -26,6 +28,10 @@ Violation = _rules.Violation
 class Validator:
     """
     Validates protobuf-py messages against static rules.
+
+    Legacy google.protobuf messages are also accepted: they are copied into
+    protobuf-py messages of the same type and validated identically. Violation
+    field values then refer to the copy's values.
 
     Each validator instance caches internal state generated from the static
     rules, so reusing the same instance for multiple validations
@@ -40,12 +46,15 @@ class Validator:
             registry: An optional protobuf-py Registry used to resolve custom
                 predefined-rule extensions (proto2 extensions on the standard
                 rule messages). Without it, only standard rules and rules whose
-                extensions are known to the bundled stub are applied.
+                extensions are known to the bundled stub are applied. For
+                legacy google.protobuf messages, such a Registry can be built
+                with ``FileDescriptorSet.to_registry()``.
         """
         funcs = extra_func.make_extra_funcs()
         self._factory = _rules.RuleFactory(funcs, registry)
+        self._legacy = LegacyMessageConverter()
 
-    def validate(self, message: Message, *, fail_fast: bool = False):
+    def validate(self, message: Message | google_message.Message, *, fail_fast: bool = False):
         """
         Validates the given message against the static rules defined in
         the message's descriptor.
@@ -58,6 +67,7 @@ class Validator:
             ValidationError: If the message is invalid. The violations raised as part of this error should
             always be equal to the list of violations returned by `collect_violations`.
         """
+        message = self._coerce(message)
         violations = self.collect_violations(message, fail_fast=fail_fast)
         if len(violations) > 0:
             msg = f"invalid {type(message).desc().name}"
@@ -65,7 +75,7 @@ class Validator:
 
     def collect_violations(
         self,
-        message: Message,
+        message: Message | google_message.Message,
         *,
         fail_fast: bool = False,
     ) -> list[Violation]:
@@ -84,6 +94,7 @@ class Validator:
         Raises:
             CompilationError: If the static rules could not be compiled.
         """
+        message = self._coerce(message)
         ctx = _rules.RuleContext(fail_fast=fail_fast)
         for rule in self._factory.get(type(message).desc()):
             rule.validate(ctx, message)
@@ -92,6 +103,11 @@ class Validator:
         for violation in ctx.violations:
             violation.finalize_paths()
         return ctx.violations
+
+    def _coerce(self, message: Message | google_message.Message) -> Message:
+        if isinstance(message, google_message.Message):
+            return self._legacy.convert(message)
+        return message
 
 
 class ValidationError(ValueError):

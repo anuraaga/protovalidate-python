@@ -19,7 +19,7 @@ from protobuf import Oneof
 import protovalidate
 from protovalidate.internal import rules
 
-from .gen.tests.example.v1 import validations_pb
+from .gen.tests.example.v1 import validations_pb, validations_pb2
 
 validators: list[protovalidate.Validator] = [
     protovalidate,  # global module singleton
@@ -195,6 +195,54 @@ def test_fail_fast(validator):
 
     # Test collect_violations
     violations = validator.collect_violations(msg, fail_fast=True)
+    _compare_violations(violations, [expected_violation])
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_legacy_message_valid(validator):
+    """A google.protobuf message validates through the legacy conversion path."""
+    msg = validations_pb2.DoubleFinite()
+    msg.val = 1.0
+
+    check_valid(validator, msg)
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_legacy_message_invalid(validator):
+    msg = validations_pb2.DoubleFinite()
+    msg.val = float("-inf")
+
+    expected_violation = rules.Violation(
+        message="must be finite",
+        rule_id="double.finite",
+        field_value=msg.val,
+        rule_value=True,
+    )
+
+    with pytest.raises(protovalidate.ValidationError) as exc_info:
+        validator.validate(msg)
+    e = exc_info.value
+    assert str(e) == f"invalid {msg.DESCRIPTOR.name}"
+    _compare_violations(e.violations, [expected_violation])  # ty: ignore
+
+    violations = validator.collect_violations(msg)
+    _compare_violations(violations, [expected_violation])
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_legacy_message_map_key(validator):
+    msg = validations_pb2.MapKeys()
+    msg.val[1] = "a"
+
+    expected_violation = rules.Violation(
+        message="must be less than 0",
+        rule_id="sint64.lt",
+        for_key=True,
+        field_value=1,
+        rule_value=0,
+    )
+
+    violations = validator.collect_violations(msg)
     _compare_violations(violations, [expected_violation])
 
 

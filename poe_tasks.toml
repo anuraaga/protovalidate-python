@@ -29,6 +29,7 @@ sequence = [
   "lint",
   "test",
   "test-conformance",
+  "test-conformance-legacy",
 ]
 
 [tasks.diffcheck]
@@ -116,6 +117,17 @@ sequence = [
 
 [tasks.test-conformance]
 help = "Run the CEL conformance tests"
+cmd = """
+go run github.com/bufbuild/protovalidate/tools/protovalidate-conformance@${PROTOVALIDATE_VERSION}
+    --strict_message
+    --expected_failures=test/conformance/nonconforming.yaml
+    --timeout 10s
+    python test/conformance/runner.py
+"""
+
+[tasks.test-conformance-legacy]
+help = "Run the CEL conformance tests through the legacy google.protobuf message path"
+env = { PROTOVALIDATE_CONFORMANCE_LEGACY = "1" }
 cmd = """
 go run github.com/bufbuild/protovalidate/tools/protovalidate-conformance@${PROTOVALIDATE_VERSION}
     --strict_message
