@@ -113,6 +113,7 @@ class Validator:
     def _coerce(self, message: Message | google_message.Message) -> Message:
         if self._legacy:
             return self._legacy.normalize(message)
+        assert isinstance(message, Message)  # noqa: S101
         return message
 
 
