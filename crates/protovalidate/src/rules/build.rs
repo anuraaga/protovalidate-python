@@ -14,9 +14,7 @@
 
 //! Building evaluators from a message type's `buf.validate` options.
 //!
-//! The standard rules become native checks: for every rule field a
-//! `FieldRules` sets, `standard::build` yields the checks `validate.proto`
-//! defines for it, in field-number order. Only custom CEL reaches the CEL
+//! Standard rules are checked with directly. Only custom CEL reaches the CEL
 //! backend: message- and field-level `cel` options, and user-defined
 //! predefined rules on extension fields, whose expressions are compiled with
 //! `rules` bound to the rules message and `rule` to that field. The
@@ -58,7 +56,7 @@ pub(crate) struct Builder<'a> {
 }
 
 /// A standard rules message (`StringRules`, `RepeatedRules`, ...), by full
-/// name and serialized form: how the builder reads it and CEL is handed it.
+/// name and serialized form.
 trait RulesMessage {
     fn full_name(&self) -> &'static str;
     fn to_bytes(&self) -> Vec<u8>;
@@ -750,10 +748,7 @@ impl<'a> Builder<'a> {
     }
 
     /// The rules of every rule field the rules message sets, in field-number
-    /// order. The standard fields become
-    /// native checks; extension fields carry user-defined predefined rules,
-    /// which are CEL and are compiled as such, with the rules message
-    /// recorded in `compiled` for them to bind as `rules`.
+    /// order.
     fn predefined_rules(
         &self,
         type_field: &'static str,

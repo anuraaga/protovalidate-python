@@ -323,6 +323,15 @@ impl<'a> MessageView<'a> {
 }
 
 impl Message<PyRuntime> for MessageView<'_> {
+    fn encode(&self) -> Vec<u8> {
+        // An unset protobuf-py message field is `None`, and reads as a
+        // message with nothing set, which encodes to nothing.
+        if self.object.is_none() {
+            return Vec::new();
+        }
+        self.ctx.serialize(&self.object)
+    }
+
     fn has(&self, field: &Field) -> bool {
         let Some(info) = &self.info else {
             return false;

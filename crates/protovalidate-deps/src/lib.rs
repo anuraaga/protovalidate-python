@@ -17,7 +17,7 @@
 //!
 //! An [`Engine`] holds a descriptor pool and compiles expressions into
 //! [`Program`]s; a [`Frame`] is a parsed message that programs evaluate
-//! against, reached through [`MessageRef`]s. Functions written in Rust are
+//! against. Functions written in Rust are
 //! added to an engine with [`Engine::register`].
 //!
 //! This is an internal support crate: its API follows the shim's needs and
@@ -31,7 +31,7 @@ mod function;
 
 use std::fmt;
 
-pub use engine::{Engine, Frame, MessageRef, Program};
+pub use engine::{Engine, Frame, Program};
 pub use function::{Arg, Element, Kind, NativeFn};
 
 /// A scalar, as an expression's `this` or a map key.
@@ -49,11 +49,11 @@ pub enum Scalar<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum This<'a> {
     Scalar(Scalar<'a>),
-    /// The message itself.
-    Message(MessageRef<'a>),
-    /// A field of the message, by number: a list, a map, or a singular
-    /// value, as the field's descriptor says.
-    Field(MessageRef<'a>, i32),
+    /// The frame's message.
+    Message(&'a Frame),
+    /// A field of the frame's message, by number: a list, a map, or a
+    /// singular value, as the field's descriptor says.
+    Field(&'a Frame, i32),
 }
 
 /// One expression to compile.

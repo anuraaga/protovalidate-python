@@ -88,14 +88,6 @@ void SetError(char** error, absl::string_view message) {
   if (error != nullptr) *error = CopyCString(message);
 }
 
-const google::protobuf::Message* AsMessage(const cel_message* message) {
-  return reinterpret_cast<const google::protobuf::Message*>(message);
-}
-
-const cel_message* AsHandle(const google::protobuf::Message* message) {
-  return reinterpret_cast<const cel_message*>(message);
-}
-
 // Resolves a field of `message` by number, extensions included.
 const google::protobuf::FieldDescriptor* FindField(
     const google::protobuf::Message& message, int32_t number) {
@@ -148,40 +140,6 @@ celrt::CelValue ScalarToCelValue(const cel_value& value) {
           reinterpret_cast<const char*>(value.data), value.len));
     default:
       return celrt::CelValue::CreateNull();
-  }
-}
-
-// Whether a map entry's key equals `key`, comparing by the key field's type.
-bool MapKeyEquals(const google::protobuf::Message& entry,
-                  const google::protobuf::FieldDescriptor* key_field,
-                  const cel_value& key) {
-  const google::protobuf::Reflection* reflection = entry.GetReflection();
-  switch (key_field->cpp_type()) {
-    case google::protobuf::FieldDescriptor::CPPTYPE_BOOL:
-      return key.kind == CEL_VALUE_BOOL &&
-             reflection->GetBool(entry, key_field) == (key.bool_value != 0);
-    case google::protobuf::FieldDescriptor::CPPTYPE_INT32:
-      return key.kind == CEL_VALUE_INT &&
-             reflection->GetInt32(entry, key_field) == key.int_value;
-    case google::protobuf::FieldDescriptor::CPPTYPE_INT64:
-      return key.kind == CEL_VALUE_INT &&
-             reflection->GetInt64(entry, key_field) == key.int_value;
-    case google::protobuf::FieldDescriptor::CPPTYPE_UINT32:
-      return key.kind == CEL_VALUE_UINT &&
-             reflection->GetUInt32(entry, key_field) == key.uint_value;
-    case google::protobuf::FieldDescriptor::CPPTYPE_UINT64:
-      return key.kind == CEL_VALUE_UINT &&
-             reflection->GetUInt64(entry, key_field) == key.uint_value;
-    case google::protobuf::FieldDescriptor::CPPTYPE_STRING: {
-      if (key.kind != CEL_VALUE_STRING) return false;
-      std::string scratch;
-      absl::string_view actual =
-          reflection->GetStringReference(entry, key_field, &scratch);
-      return actual == absl::string_view(
-                           reinterpret_cast<const char*>(key.data), key.len);
-    }
-    default:
-      return false;
   }
 }
 
@@ -662,91 +620,16 @@ int cel_frame_new(cel_engine* engine, const char* type_name,
 
 void cel_frame_free(cel_frame* frame) { delete frame; }
 
-const cel_message* cel_frame_message(const cel_frame* frame) {
-  return AsHandle(frame->message);
-}
-
-int cel_message_field(const cel_message* handle, int32_t field_number,
-                     const cel_message** out, char** error) {
-  const google::protobuf::Message& message = *AsMessage(handle);
-  const google::protobuf::FieldDescriptor* field =
-      FindField(message, field_number);
-  if (field == nullptr || field->is_repeated() ||
-      field->cpp_type() != google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-    SetError(error, absl::StrCat("no singular message field ", field_number,
-                                 " in ", message.GetDescriptor()->full_name()));
-    return CEL_ERR_ARGUMENT;
-  }
-  *out = AsHandle(&message.GetReflection()->GetMessage(message, field));
-  return CEL_OK;
-}
-
-int cel_message_repeated(const cel_message* handle, int32_t field_number,
-                        size_t index, const cel_message** out, char** error) {
-  const google::protobuf::Message& message = *AsMessage(handle);
-  const google::protobuf::FieldDescriptor* field =
-      FindField(message, field_number);
-  if (field == nullptr || !field->is_repeated() || field->is_map() ||
-      field->cpp_type() != google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-    SetError(error, absl::StrCat("no repeated message field ", field_number,
-                                 " in ", message.GetDescriptor()->full_name()));
-    return CEL_ERR_ARGUMENT;
-  }
-  int size = message.GetReflection()->FieldSize(message, field);
-  if (index >= static_cast<size_t>(size)) {
-    SetError(error, absl::StrCat("index ", index, " out of range for field ",
-                                 field->full_name(), " of size ", size));
-    return CEL_ERR_ARGUMENT;
-  }
-  *out = AsHandle(&message.GetReflection()->GetRepeatedMessage(
-      message, field, static_cast<int>(index)));
-  return CEL_OK;
-}
-
-int cel_message_map_value(const cel_message* handle, int32_t field_number,
-                         const cel_value* key, const cel_message** out,
-                         char** error) {
-  const google::protobuf::Message& message = *AsMessage(handle);
-  const google::protobuf::FieldDescriptor* field =
-      FindField(message, field_number);
-  if (field == nullptr || !field->is_map()) {
-    SetError(error, absl::StrCat("no map field ", field_number, " in ",
-                                 message.GetDescriptor()->full_name()));
-    return CEL_ERR_ARGUMENT;
-  }
-  const google::protobuf::Descriptor* entry = field->message_type();
-  const google::protobuf::FieldDescriptor* key_field = entry->map_key();
-  const google::protobuf::FieldDescriptor* value_field = entry->map_value();
-  if (value_field->cpp_type() !=
-      google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
-    SetError(error, absl::StrCat("map field ", field->full_name(),
-                                 " does not have message values"));
-    return CEL_ERR_ARGUMENT;
-  }
-  const google::protobuf::Reflection* reflection = message.GetReflection();
-  int size = reflection->FieldSize(message, field);
-  for (int i = 0; i < size; i++) {
-    const google::protobuf::Message& pair =
-        reflection->GetRepeatedMessage(message, field, i);
-    if (MapKeyEquals(pair, key_field, *key)) {
-      *out = AsHandle(&pair.GetReflection()->GetMessage(pair, value_field));
-      return CEL_OK;
-    }
-  }
-  SetError(error, absl::StrCat("key not present in map field ",
-                               field->full_name()));
-  return CEL_ERR_ARGUMENT;
-}
-
 int cel_program_eval(const cel_program* program, int this_kind,
-                    const cel_value* scalar, const cel_message* message,
+                    const cel_value* scalar, const cel_frame* frame,
                     int32_t field_number, int fail_fast, cel_failure** out,
                     size_t* out_len, char** error) {
   *out = nullptr;
   *out_len = 0;
   google::protobuf::Arena arena;
-  auto this_value =
-      ThisValue(this_kind, scalar, AsMessage(message), field_number, &arena);
+  const google::protobuf::Message* message =
+      frame != nullptr ? frame->message : nullptr;
+  auto this_value = ThisValue(this_kind, scalar, message, field_number, &arena);
   if (!this_value.ok()) {
     SetError(error, this_value.status().message());
     return CEL_ERR_ARGUMENT;

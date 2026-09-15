@@ -16,7 +16,6 @@
 //! marshalling of values across the boundary.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::marker::PhantomData;
 use std::ptr;
 use std::slice;
 
@@ -24,11 +23,10 @@ use crate::ffi::{
     CEL_ERR_ARGUMENT, CEL_ERR_COMPILATION, CEL_ERR_RUNTIME, CEL_ERR_UNEXPECTED, CEL_OK,
     CEL_THIS_FIELD, CEL_THIS_MESSAGE, CEL_THIS_SCALAR, CEL_VALUE_BOOL, CEL_VALUE_BYTES,
     CEL_VALUE_DOUBLE, CEL_VALUE_INT, CEL_VALUE_LIST, CEL_VALUE_NULL, CEL_VALUE_STRING,
-    CEL_VALUE_UINT, CelEngine, CelFailure, CelFrame, CelList, CelMessage, CelProgram, CelRule,
-    CelValue, cel_engine_add_file, cel_engine_add_file_set, cel_engine_free, cel_engine_new,
-    cel_engine_register, cel_failures_free, cel_frame_free, cel_frame_message, cel_frame_new,
-    cel_free, cel_list_get, cel_list_len, cel_message_field, cel_message_map_value,
-    cel_message_repeated, cel_program_eval, cel_program_free, cel_program_new, cel_string_new,
+    CEL_VALUE_UINT, CelEngine, CelFailure, CelFrame, CelList, CelProgram, CelRule, CelValue,
+    cel_engine_add_file, cel_engine_add_file_set, cel_engine_free, cel_engine_new,
+    cel_engine_register, cel_failures_free, cel_frame_free, cel_frame_new, cel_free, cel_list_get,
+    cel_list_len, cel_program_eval, cel_program_free, cel_program_new, cel_string_new,
 };
 use crate::{Arg, Element, Error, Expression, Failure, Kind, NativeFn, Scalar, This};
 
@@ -455,18 +453,17 @@ impl Program {
     /// produces neither a bool nor a string; [`Error::Argument`] for a
     /// `this` field that does not exist.
     pub fn eval(&self, this: This<'_>, fail_fast: bool) -> Result<Vec<Failure>, Error> {
-        let (kind, scalar, message, field_number) = match this {
+        let (kind, scalar, frame, field_number) = match this {
             This::Scalar(scalar) => (CEL_THIS_SCALAR, Some(scalar.to_ffi()), ptr::null(), 0),
-            This::Message(message) => (CEL_THIS_MESSAGE, None, message.0, 0),
-            This::Field(message, number) => (CEL_THIS_FIELD, None, message.0, number),
+            This::Message(frame) => (CEL_THIS_MESSAGE, None, frame.0.cast_const(), 0),
+            This::Field(frame, number) => (CEL_THIS_FIELD, None, frame.0.cast_const(), number),
         };
         let mut out: *mut CelFailure = ptr::null_mut();
         let mut out_len: usize = 0;
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: `self.0` is a live program; the scalar and its borrowed
-        // string storage outlive the call, as does the frame `message`
-        // belongs to (`MessageRef`'s lifetime); `out`, `out_len` and `error`
-        // are live out-params.
+        // string storage outlive the call, as does `frame` (`This`'s
+        // lifetime); `out`, `out_len` and `error` are live out-params.
         let code = unsafe {
             cel_program_eval(
                 self.0,
@@ -474,7 +471,7 @@ impl Program {
                 scalar
                     .as_ref()
                     .map_or(ptr::null(), |scalar| &raw const *scalar),
-                message,
+                frame,
                 field_number,
                 c_int::from(fail_fast),
                 &raw mut out,
@@ -518,7 +515,8 @@ impl Drop for Program {
     }
 }
 
-/// A parsed message, owning the storage its sub-messages live in.
+/// A parsed message, owning its storage.
+#[derive(Debug)]
 pub struct Frame(*mut CelFrame);
 
 // SAFETY: a frame is immutable once parsed.
@@ -526,79 +524,9 @@ unsafe impl Send for Frame {}
 // SAFETY: as above.
 unsafe impl Sync for Frame {}
 
-impl Frame {
-    /// The parsed message.
-    #[must_use]
-    pub fn message(&self) -> MessageRef<'_> {
-        // SAFETY: `self.0` is a live frame; the message it returns lives as
-        // long as the frame, which the returned lifetime says.
-        MessageRef(unsafe { cel_frame_message(self.0) }, PhantomData)
-    }
-}
-
 impl Drop for Frame {
     fn drop(&mut self) {
         // SAFETY: `self.0` came from `cel_frame_new` and is freed once.
         unsafe { cel_frame_free(self.0) };
-    }
-}
-
-/// A message inside a [`Frame`], live as long as the frame is.
-#[derive(Clone, Copy, Debug)]
-pub struct MessageRef<'a>(*const CelMessage, PhantomData<&'a Frame>);
-
-// SAFETY: a message inside a frame is immutable.
-unsafe impl Send for MessageRef<'_> {}
-// SAFETY: as above.
-unsafe impl Sync for MessageRef<'_> {}
-
-impl<'a> MessageRef<'a> {
-    fn sub(
-        lookup: impl FnOnce(*mut *const CelMessage, *mut *mut c_char) -> c_int,
-    ) -> Result<MessageRef<'a>, Error> {
-        let mut out: *const CelMessage = ptr::null();
-        let mut error: *mut c_char = ptr::null_mut();
-        let code = lookup(&raw mut out, &raw mut error);
-        if code != CEL_OK {
-            // SAFETY: a non-OK code means the shim stored an owned message.
-            return Err(unsafe { status_error(code, error) });
-        }
-        Ok(MessageRef(out, PhantomData))
-    }
-
-    /// The message in singular field `number`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Argument`] for a field that does not exist or is not a
-    /// singular message.
-    pub fn field(self, number: i32) -> Result<MessageRef<'a>, Error> {
-        // SAFETY: `self.0` is live for `'a`; `out` and `error` are live
-        // out-params.
-        Self::sub(|out, error| unsafe { cel_message_field(self.0, number, out, error) })
-    }
-
-    /// The message at `index` of repeated field `number`.
-    ///
-    /// # Errors
-    ///
-    /// As [`field`](Self::field), and for an index past the end.
-    pub fn repeated(self, number: i32, index: usize) -> Result<MessageRef<'a>, Error> {
-        // SAFETY: as `field`.
-        Self::sub(|out, error| unsafe { cel_message_repeated(self.0, number, index, out, error) })
-    }
-
-    /// The message under `key` of map field `number`.
-    ///
-    /// # Errors
-    ///
-    /// As [`field`](Self::field), and for a key that is not in the map.
-    pub fn map_value(self, number: i32, key: Scalar<'_>) -> Result<MessageRef<'a>, Error> {
-        let key = key.to_ffi();
-        // SAFETY: as `field`; `key` and the storage it borrows outlive the
-        // call.
-        Self::sub(|out, error| unsafe {
-            cel_message_map_value(self.0, number, &raw const key, out, error)
-        })
     }
 }

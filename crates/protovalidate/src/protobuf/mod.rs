@@ -21,8 +21,9 @@
 //! message is read in place -- string and bytes values borrow from it,
 //! sub-messages are further views -- and nothing is copied into an
 //! intermediate representation. Only when a CEL rule binds a message, list
-//! or map to `this` is the root message encoded, once, for the CEL runtime
-//! to parse; that is what [`Payload::Encode`] defers.
+//! or map to `this` is the message it is read from encoded, for the CEL
+//! runtime to parse: the root through [`Payload::Encode`], a sub-message
+//! through [`Message::encode`].
 //!
 //! A runtime plugs in by implementing these and calling
 //! [`Validator::validate_message`](crate::Validator::validate_message).
@@ -83,6 +84,10 @@ pub trait Message<R: Runtime> {
     /// when the message has no such field, as when its runtime knows an
     /// older schema than the validator.
     fn get(&self, field: &Field) -> Option<Val<'_, R>>;
+
+    /// The message serialized, for the CEL runtime to parse when a rule binds
+    /// it, or one of its repeated or map fields, to `this`.
+    fn encode(&self) -> Vec<u8>;
 }
 
 /// A repeated field.

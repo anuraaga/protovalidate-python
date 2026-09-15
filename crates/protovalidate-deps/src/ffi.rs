@@ -54,12 +54,6 @@ pub(crate) struct CelFrame {
     _opaque: [u8; 0],
 }
 
-/// Opaque message within a frame; see `cel_message` in `shim/cel_shim.h`.
-#[repr(C)]
-pub(crate) struct CelMessage {
-    _opaque: [u8; 0],
-}
-
 /// A value; see `cel_value` in `shim/cel_shim.h`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -167,34 +161,11 @@ unsafe extern "C" {
         error: *mut *mut c_char,
     ) -> c_int;
     pub(crate) fn cel_frame_free(frame: *mut CelFrame);
-    pub(crate) fn cel_frame_message(frame: *const CelFrame) -> *const CelMessage;
-
-    pub(crate) fn cel_message_field(
-        message: *const CelMessage,
-        field_number: i32,
-        out: *mut *const CelMessage,
-        error: *mut *mut c_char,
-    ) -> c_int;
-    pub(crate) fn cel_message_repeated(
-        message: *const CelMessage,
-        field_number: i32,
-        index: usize,
-        out: *mut *const CelMessage,
-        error: *mut *mut c_char,
-    ) -> c_int;
-    pub(crate) fn cel_message_map_value(
-        message: *const CelMessage,
-        field_number: i32,
-        key: *const CelValue,
-        out: *mut *const CelMessage,
-        error: *mut *mut c_char,
-    ) -> c_int;
-
     pub(crate) fn cel_program_eval(
         program: *const CelProgram,
         this_kind: c_int,
         scalar: *const CelValue,
-        message: *const CelMessage,
+        frame: *const CelFrame,
         field_number: i32,
         fail_fast: c_int,
         out: *mut *mut CelFailure,

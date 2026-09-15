@@ -43,10 +43,6 @@ typedef struct cel_program cel_program;
 // A parsed message, owning the arena it and its sub-messages live in.
 typedef struct cel_frame cel_frame;
 
-// A message inside a frame: the frame's root or one of its sub-messages.
-// Valid only while the owning frame is alive.
-typedef struct cel_message cel_message;
-
 // Status codes returned by the fallible entry points.
 enum {
   CEL_OK = 0,
@@ -95,9 +91,9 @@ typedef struct cel_rule {
 // What the `this` variable is bound to during evaluation.
 enum {
   CEL_THIS_SCALAR = 0,   // `scalar`
-  CEL_THIS_MESSAGE = 1,  // `message` itself
-  CEL_THIS_FIELD = 2,    // field `field_number` of `message`: a list, a map, or
-                        // a singular value, by the field's descriptor
+  CEL_THIS_MESSAGE = 1,  // the frame's message
+  CEL_THIS_FIELD = 2,    // field `field_number` of the frame's message: a list,
+                        // a map, or a singular value, by the field's descriptor
 };
 
 // One failed expression: `index` into the compiled rules, and the message the
@@ -184,23 +180,8 @@ int cel_frame_new(cel_engine* engine, const char* type_name,
 
 void cel_frame_free(cel_frame* frame);
 
-// The frame's root message.
-const cel_message* cel_frame_message(const cel_frame* frame);
-
-// Sub-message access. Each stores the sub-message in *out on CEL_OK, and
-// returns CEL_ERR_ARGUMENT with a malloc'd message in *error when the field is
-// not a message field of the expected shape or the index/key is not present.
-// The results live as long as the owning frame and need no release.
-int cel_message_field(const cel_message* message, int32_t field_number,
-                     const cel_message** out, char** error);
-int cel_message_repeated(const cel_message* message, int32_t field_number,
-                        size_t index, const cel_message** out, char** error);
-int cel_message_map_value(const cel_message* message, int32_t field_number,
-                         const cel_value* key, const cel_message** out,
-                         char** error);
-
 // Evaluates every expression of `program` against `this`, described by
-// `this_kind` and, depending on it, `scalar`, `message`, and `field_number`.
+// `this_kind` and, depending on it, `scalar`, `frame`, and `field_number`.
 //
 // On CEL_OK stores a malloc'd array of the failed expressions in *out and its
 // length in *out_len (NULL and 0 when everything passed); release it with
@@ -209,7 +190,7 @@ int cel_message_map_value(const cel_message* message, int32_t field_number,
 // or a value that is neither bool nor string) or CEL_ERR_ARGUMENT (a field
 // that does not exist) and stores a malloc'd message in *error.
 int cel_program_eval(const cel_program* program, int this_kind,
-                    const cel_value* scalar, const cel_message* message,
+                    const cel_value* scalar, const cel_frame* frame,
                     int32_t field_number, int fail_fast, cel_failure** out,
                     size_t* out_len, char** error);
 

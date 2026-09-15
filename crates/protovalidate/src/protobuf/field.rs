@@ -25,8 +25,7 @@ use crate::descriptors;
 /// when asking a [`Message`](super::Message) for it.
 ///
 /// The description is resolved from the descriptors registered with the
-/// validator, so a runtime needs none of its own to answer: how the field
-/// is stored is all that is left to it.
+/// validator, and provided to a runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
     number: u32,

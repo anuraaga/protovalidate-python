@@ -41,7 +41,7 @@ use super::{
 #[cfg(feature = "cel")]
 use super::{ProgramSet, ScalarKind};
 #[cfg(feature = "cel")]
-use crate::cel::{self, Env, MessageRef, Scalar, This};
+use crate::cel::{self, Env, Scalar, This};
 use crate::descriptors::{self, Descriptors, Schema};
 use crate::protobuf::{Field, Key, List as _, Map as _, Message as _, Payload, Runtime, Val};
 use crate::validate::__buffa::oneof::field_path_element::Subscript;
@@ -71,40 +71,18 @@ impl From<cel::Error> for EvalError {
     }
 }
 
-/// Where a frame's message comes from.
-#[cfg(feature = "cel")]
-enum Source<'a> {
-    Root {
-        type_name: &'a str,
-        payload: Payload<'a>,
-    },
-    Field {
-        parent: &'a LazyFrame<'a>,
-        number: i32,
-    },
-    Repeated {
-        parent: &'a LazyFrame<'a>,
-        number: i32,
-        index: usize,
-    },
-    MapValue {
-        parent: &'a LazyFrame<'a>,
-        number: i32,
-        key: Scalar<'a>,
-    },
-}
-
-/// A message as CEL sees it, resolved on use.
+/// A message as CEL sees it, parsed on first use.
 ///
-/// The root parses the payload once; every other frame is a sub-message of
-/// its parent's, looked up in that parse without copying. Frames nest on
-/// the stack the way the walk does, so a parent always outlives its children
-/// and the root's parse outlives every message borrowed from it.
+/// A frame holds one message serialized -- the root as the caller's payload,
+/// a sub-message as its runtime encodes it when a rule binds it to `this` --
+/// and parses it the first time a program asks. Frames nest on the stack the
+/// way the walk does, so one outlives every program run against it.
 #[cfg(feature = "cel")]
 pub(crate) struct LazyFrame<'a> {
     env: &'a Env,
-    source: Source<'a>,
-    root: OnceCell<cel::Frame>,
+    type_name: &'a str,
+    payload: Payload<'a>,
+    parsed: OnceCell<cel::Frame>,
 }
 
 /// Where CEL would see a message; without the `cel` feature no rule ever
@@ -118,94 +96,52 @@ impl<'a> LazyFrame<'a> {
         Self(PhantomData)
     }
 
-    fn field(_parent: &'a LazyFrame<'a>, _number: u32) -> Self {
-        Self(PhantomData)
-    }
-
-    fn repeated(_parent: &'a LazyFrame<'a>, _number: u32, _index: usize) -> Self {
-        Self(PhantomData)
-    }
-
-    fn map_value(_parent: &'a LazyFrame<'a>, _number: u32, _key: &Key<'_>) -> Self {
+    fn child(_parent: &LazyFrame<'a>, _type_name: &'a str, _payload: Payload<'a>) -> Self {
         Self(PhantomData)
     }
 }
 
 #[cfg(feature = "cel")]
 impl<'a> LazyFrame<'a> {
-    fn new(env: &'a Env, source: Source<'a>) -> Self {
+    fn new(env: &'a Env, type_name: &'a str, payload: Payload<'a>) -> Self {
         Self {
             env,
-            source,
-            root: OnceCell::new(),
+            type_name,
+            payload,
+            parsed: OnceCell::new(),
         }
     }
 
     fn root(env: &'a Env, type_name: &'a str, payload: Payload<'a>) -> Self {
-        Self::new(env, Source::Root { type_name, payload })
+        Self::new(env, type_name, payload)
     }
 
-    fn field(parent: &'a LazyFrame<'a>, number: u32) -> Self {
-        Self::new(
-            parent.env,
-            Source::Field {
-                parent,
-                number: field_number(number),
-            },
-        )
+    /// A sub-message of `parent`'s, from its own encoding.
+    fn child(parent: &LazyFrame<'a>, type_name: &'a str, payload: Payload<'a>) -> Self {
+        Self::new(parent.env, type_name, payload)
     }
 
-    fn repeated(parent: &'a LazyFrame<'a>, number: u32, index: usize) -> Self {
-        Self::new(
-            parent.env,
-            Source::Repeated {
-                parent,
-                number: field_number(number),
-                index,
-            },
-        )
-    }
-
-    fn map_value(parent: &'a LazyFrame<'a>, number: u32, key: &'a Key<'a>) -> Self {
-        Self::new(
-            parent.env,
-            Source::MapValue {
-                parent,
-                number: field_number(number),
-                key: key.scalar(),
-            },
-        )
-    }
-
-    /// The message: the root's parse, or the sub-message of the parent's
-    /// this frame stands for.
-    fn message(&self) -> Result<MessageRef<'_>, EvalError> {
-        Ok(match &self.source {
-            Source::Root { type_name, payload } => {
-                if self.root.get().is_none() {
-                    let frame = self.env.frame(type_name, &payload.bytes())?;
-                    let _ = self.root.set(frame);
-                }
-                self.root.get().expect("root frame was just set").message()
-            }
-            Source::Field { parent, number } => parent.message()?.field(*number)?,
-            Source::Repeated {
-                parent,
-                number,
-                index,
-            } => parent.message()?.repeated(*number, *index)?,
-            Source::MapValue {
-                parent,
-                number,
-                key,
-            } => parent.message()?.map_value(*number, *key)?,
-        })
+    /// The parsed message.
+    fn parsed(&self) -> Result<&cel::Frame, EvalError> {
+        if self.parsed.get().is_none() {
+            let frame = self.env.frame(self.type_name, &self.payload.bytes())?;
+            let _ = self.parsed.set(frame);
+        }
+        Ok(self.parsed.get().expect("frame was just set"))
     }
 }
 
 #[cfg(feature = "cel")]
 fn field_number(number: u32) -> i32 {
     i32::try_from(number).unwrap_or(i32::MAX)
+}
+
+/// The type of the messages a field holds, which a frame of one of them is
+/// parsed as.
+fn message_type(field: &Field) -> Result<&str, EvalError> {
+    field
+        .message_type()
+        .ok_or_else(|| EvalError::Unexpected(format!("{} does not hold messages", field.name())))
 }
 
 /// Whether a repeated element or map value is the zero of its type, as
@@ -487,7 +423,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
     ) -> Result<(), EvalError> {
         #[cfg(feature = "cel")]
         if let Some(programs) = &evaluator.cel {
-            let this = This::Message(frame.message()?);
+            let this = This::Message(frame.parsed()?);
             self.run(programs, this)?;
             if self.should_return() {
                 return Ok(());
@@ -633,7 +569,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
                 // CEL only sees the message if a custom rule needs it.
                 let this = match (field.shape, field.scalar) {
                     (Shape::Singular, Some(kind)) => This::Scalar(scalar_of(value.as_ref(), kind)),
-                    _ => This::Field(frame.message()?, field_number(field.field.number())),
+                    _ => This::Field(frame.parsed()?, field_number(field.field.number())),
                 };
                 self.run(programs, this)?;
             }
@@ -696,12 +632,26 @@ impl<'a, R: Runtime> Walker<'a, R> {
             #[cfg(feature = "cel")]
             if let Some(programs) = &items.programs {
                 if !self.should_return() {
-                    let child = LazyFrame::repeated(frame, field.field.number(), index);
-                    let this = match items.scalar {
-                        Some(kind) => This::Scalar(scalar_of(Some(&item), kind)),
-                        None => This::Message(child.message()?),
-                    };
-                    self.run(programs, this)?;
+                    match (items.scalar, &item) {
+                        (Some(kind), _) => {
+                            self.run(programs, This::Scalar(scalar_of(Some(&item), kind)))?;
+                        }
+                        (None, Val::Message(sub)) => {
+                            let encode = || sub.encode();
+                            let child = LazyFrame::child(
+                                frame,
+                                message_type(&field.field)?,
+                                Payload::Encode(&encode),
+                            );
+                            self.run(programs, This::Message(child.parsed()?))?;
+                        }
+                        (None, _) => {
+                            return Err(EvalError::Unexpected(format!(
+                                "{} holds no message to bind this to",
+                                field.field.name()
+                            )));
+                        }
+                    }
                 }
             }
             if let (Some(check), Val::Message(any)) = (&items.any, &item) {
@@ -772,12 +722,26 @@ impl<'a, R: Runtime> Walker<'a, R> {
                 #[cfg(feature = "cel")]
                 if let Some(programs) = &values.programs {
                     if !self.should_return() {
-                        let child = LazyFrame::map_value(frame, field.field.number(), key);
-                        let this = match values.scalar {
-                            Some(kind) => This::Scalar(scalar_of(Some(value), kind)),
-                            None => This::Message(child.message()?),
-                        };
-                        self.run(programs, this)?;
+                        match (values.scalar, value) {
+                            (Some(kind), _) => {
+                                self.run(programs, This::Scalar(scalar_of(Some(value), kind)))?;
+                            }
+                            (None, Val::Message(sub)) => {
+                                let encode = || sub.encode();
+                                let child = LazyFrame::child(
+                                    frame,
+                                    message_type(&field.field)?,
+                                    Payload::Encode(&encode),
+                                );
+                                self.run(programs, This::Message(child.parsed()?))?;
+                            }
+                            (None, _) => {
+                                return Err(EvalError::Unexpected(format!(
+                                    "{} holds no message to bind this to",
+                                    field.field.name()
+                                )));
+                            }
+                        }
                     }
                 }
                 if self.violations.len() > value_from {
@@ -816,9 +780,11 @@ impl<'a, R: Runtime> Walker<'a, R> {
                     self.pool.message(nested.message).full_name()
                 )));
             };
+            let type_name = message_type(&nested.field)?;
             match (nested.shape, &value) {
                 (Shape::Singular, Val::Message(sub)) => {
-                    let child = LazyFrame::field(frame, nested.field.number());
+                    let encode = || sub.encode();
+                    let child = LazyFrame::child(frame, type_name, Payload::Encode(&encode));
                     let from = self.violations.len();
                     self.message(sub, &child, sub_evaluator)?;
                     if self.violations.len() > from {
@@ -833,7 +799,8 @@ impl<'a, R: Runtime> Walker<'a, R> {
                         let Some(Val::Message(sub)) = list.get(index) else {
                             continue;
                         };
-                        let child = LazyFrame::repeated(frame, nested.field.number(), index);
+                        let encode = || sub.encode();
+                        let child = LazyFrame::child(frame, type_name, Payload::Encode(&encode));
                         let from = self.violations.len();
                         self.message(&sub, &child, sub_evaluator)?;
                         if self.violations.len() > from {
@@ -854,7 +821,8 @@ impl<'a, R: Runtime> Walker<'a, R> {
                         let Val::Message(sub) = &item else {
                             return ControlFlow::Continue(());
                         };
-                        let child = LazyFrame::map_value(frame, nested.field.number(), &key);
+                        let encode = || sub.encode();
+                        let child = LazyFrame::child(frame, type_name, Payload::Encode(&encode));
                         let from = self.violations.len();
                         if let Err(error) = self.message(sub, &child, sub_evaluator) {
                             result = Err(error);
