@@ -12,62 +12,74 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Python bindings for protovalidate-cc.
+//! Python bindings for the `protovalidate` crate.
 
 mod constants;
 mod hints;
-mod proto;
+mod runtime;
+mod view;
 mod violation;
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::import_exception;
 use pyo3::prelude::*;
 use pyo3::sync::RwLockExt;
 use pyo3::types::{PyBytes, PyList, PyString};
 
-use protovalidate::{Engine, PvError};
+use protovalidate::{DescriptorError, Error, Validator as Engine};
 
 use constants::{Constants, Imports};
 use hints::{PbMessage, PbRegistry, ViolationList};
-use proto::{ProtoAdapter, ProtoRuntime};
+use runtime::{ProtoAdapter, ProtoRuntime};
+use view::{Ctx, TypeCache};
 
 import_exception!(protovalidate._errors, ValidationError);
 import_exception!(protovalidate._errors, CompilationError);
 import_exception!(protovalidate._errors, EvaluationError);
 
-fn to_py_err(error: PvError) -> PyErr {
+/// Maps a failure of validation itself; `Error::Validation` is handled by
+/// the caller, as it is a result rather than a failure.
+fn to_py_err(error: Error<Box<PyErr>>) -> PyErr {
     match error {
-        PvError::Compilation(message) => CompilationError::new_err(message),
-        PvError::Evaluation(message) => EvaluationError::new_err(message),
-        PvError::Argument(message) => PyValueError::new_err(message),
+        // The Python error raised while the message was being read, as it
+        // was raised.
+        Error::Read(error) => *error,
+        Error::Compilation(message) => CompilationError::new_err(message),
+        Error::Evaluation(message) => EvaluationError::new_err(message),
+        Error::Argument(message) => PyValueError::new_err(message),
         // Neither a compilation nor an evaluation failure; a plain Exception
         // keeps it out of both buckets rather than mislabelling it.
-        PvError::Unexpected(message) => PyException::new_err(message),
-        PvError::Unknown(code, message) => {
-            PyException::new_err(format!("unknown status {code}: {message}"))
-        }
+        Error::Unexpected(message) => PyException::new_err(message),
+        other => PyException::new_err(other.to_string()),
     }
+}
+
+fn descriptor_err(error: &DescriptorError) -> PyErr {
+    PyValueError::new_err(error.to_string())
 }
 
 /// Validate Protobuf messages against static rules.
 ///
 /// Both protobuf-py messages and legacy google.protobuf messages are
-/// accepted; either is handed to the native engine in serialized form.
+/// accepted; either is validated in place, and only serialized if a custom
+/// CEL rule needs a message, list or map as a value.
 ///
 /// Each validator instance caches internal state generated from the static
 /// rules, so reusing the same instance for multiple validations
 /// significantly improves performance.
 #[pyclass(module = "protovalidate._protovalidate", frozen)]
 struct Validator {
-    /// Engine isn't thread-safe when adding descriptors. Since this only happens when
-    /// warming up, we use a `RwLock` to allow the steady state to have no blocking.
+    /// Adding descriptors needs exclusive access and happens only while
+    /// warming up; a `RwLock` leaves the steady state unblocked.
     engine: RwLock<Engine>,
     /// Descriptor files already added to the pool, by name. Mutated together
     /// with the engine, under both write locks; see `register`.
     registered: RwLock<HashSet<String>>,
+    /// How each message type's fields are read off its Python objects.
+    types: TypeCache,
     /// Interned strings, shared by every call site.
     constants: Constants,
     /// Python types and extensions.
@@ -79,15 +91,16 @@ impl Validator {
     /// Create a new validator.
     ///
     /// Parameters:
-    ///     registry: An optional Registry used to resolve custom
-    ///         predefined-rule extensions. If omitted, only standard rules are applied.
+    ///     registry: An optional Registry whose files declaring extensions are
+    ///         registered up front, so predefined rules defined in files the
+    ///         validated messages do not import are still found.
     #[new]
     #[pyo3(signature = (registry = None))]
     fn new(py: Python<'_>, registry: Option<PbRegistry<'_, '_>>) -> PyResult<Self> {
-        let engine = Engine::new().map_err(PyRuntimeError::new_err)?;
         let validator = Self {
-            engine: RwLock::new(engine),
+            engine: RwLock::new(Engine::new()),
             registered: RwLock::new(HashSet::new()),
+            types: TypeCache::default(),
             constants: Constants::get(py),
             imports: Arc::new(Imports::resolve(py)?),
         };
@@ -173,10 +186,8 @@ impl Validator {
         self.register(py, &file, &adapter)?;
 
         let type_name = adapter.type_name(py, &self.constants)?;
-        let payload = adapter.runtime.payload(&message.0, &self.constants)?;
-
         let Some(serialized) =
-            self.evaluate(py, type_name.to_str()?, payload.as_bytes(), fail_fast)?
+            self.evaluate(py, &adapter, type_name.to_str()?, &message.0, fail_fast)?
         else {
             // `descriptor` keeps the adapter borrowed for `'py`, so hand the
             // caller a cheap reference clone rather than the local.
@@ -198,7 +209,9 @@ impl Validator {
         let mut registered = self.registered.write_py_attached(py).unwrap();
         let mut engine = self.engine.write_py_attached(py).unwrap();
         collect_registry(registry, &self.constants, &mut registered, &mut |bytes| {
-            engine.add_file(bytes.as_bytes()).map_err(to_py_err)
+            engine
+                .add_file_descriptor_bytes(bytes.as_bytes())
+                .map_err(|error| descriptor_err(&error))
         })
     }
 
@@ -221,7 +234,9 @@ impl Validator {
         adapter
             .runtime
             .collect_files(file, &self.constants, &mut registered, &mut |bytes| {
-                engine.add_file(bytes.as_bytes()).map_err(to_py_err)
+                engine
+                    .add_file_descriptor_bytes(bytes.as_bytes())
+                    .map_err(|error| descriptor_err(&error))
             })
     }
 
@@ -229,22 +244,28 @@ impl Validator {
         self.registered.read_py_attached(py).unwrap().contains(name)
     }
 
-    /// Runs validation over serialized bytes, returning serialized violations,
-    /// or `None` when the message is valid.
+    /// Validates the message in place, returning serialized violations, or
+    /// `None` when the message is valid.
+    ///
+    /// Reading the message calls into Python, so the interpreter stays
+    /// attached throughout; the engine lock is taken with the
+    /// interpreter-aware variant so a registration waiting on it cannot
+    /// deadlock with a validation that Python has preempted.
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
+        adapter: &ProtoAdapter,
         type_name: &str,
-        payload: &[u8],
+        message: &Bound<'py, PyAny>,
         fail_fast: bool,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let violations = py
-            .detach(|| {
-                let engine = self.engine.read().unwrap();
-                engine.validate(type_name, payload, fail_fast)
-            })
-            .map_err(to_py_err)?;
-        Ok(violations.map(|buffer| PyBytes::new(py, buffer.as_slice())))
+        let engine = self.engine.read_py_attached(py).unwrap();
+        let ctx = Ctx::new(py, adapter.runtime, &self.types, &self.constants);
+        match ctx.validate(&engine, type_name, message, fail_fast) {
+            Ok(()) => Ok(None),
+            Err(Error::Validation(error)) => Ok(Some(PyBytes::new(py, error.violations()))),
+            Err(error) => Err(to_py_err(error)),
+        }
     }
 }
 

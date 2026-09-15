@@ -46,6 +46,8 @@ pub(crate) struct ConstantsInner {
     pub(crate) descriptor_upper: Py<PyString>,
     /// The string `GetOptions`.
     pub(crate) get_options: Py<PyString>,
+    /// The string `HasField`.
+    pub(crate) has_field: Py<PyString>,
     /// The string `SerializeToString`.
     pub(crate) serialize_to_string: Py<PyString>,
     /// The string `dependencies`.
@@ -76,14 +78,22 @@ pub(crate) struct ConstantsInner {
     pub(crate) from_binary: Py<PyString>,
     /// The string `full_name`.
     pub(crate) full_name: Py<PyString>,
+    /// The string `items`.
+    pub(crate) items: Py<PyString>,
+    /// The string `local_name`.
+    pub(crate) local_name: Py<PyString>,
     /// The string `message`.
     pub(crate) message: Py<PyString>,
     /// The string `name`.
     pub(crate) name: Py<PyString>,
     /// The string `number`.
     pub(crate) number: Py<PyString>,
+    /// The string `oneof`.
+    pub(crate) oneof: Py<PyString>,
     /// The string `options`.
     pub(crate) options: Py<PyString>,
+    /// The string `_present`.
+    pub(crate) present: Py<PyString>,
     /// The string `proto`.
     pub(crate) proto: Py<PyString>,
     /// The string `rule`.
@@ -123,6 +133,7 @@ impl Constants {
             inner: Arc::new(ConstantsInner {
                 descriptor_upper: PyString::intern(py, "DESCRIPTOR").unbind(),
                 get_options: PyString::intern(py, "GetOptions").unbind(),
+                has_field: PyString::intern(py, "HasField").unbind(),
                 serialize_to_string: PyString::intern(py, "SerializeToString").unbind(),
                 dependencies: PyString::intern(py, "dependencies").unbind(),
                 desc: PyString::intern(py, "desc").unbind(),
@@ -138,10 +149,14 @@ impl Constants {
                 for_key: PyString::intern(py, "for_key").unbind(),
                 from_binary: PyString::intern(py, "from_binary").unbind(),
                 full_name: PyString::intern(py, "full_name").unbind(),
+                items: PyString::intern(py, "items").unbind(),
+                local_name: PyString::intern(py, "local_name").unbind(),
                 message: PyString::intern(py, "message").unbind(),
                 name: PyString::intern(py, "name").unbind(),
                 number: PyString::intern(py, "number").unbind(),
+                oneof: PyString::intern(py, "oneof").unbind(),
                 options: PyString::intern(py, "options").unbind(),
+                present: PyString::intern(py, "_present").unbind(),
                 proto: PyString::intern(py, "proto").unbind(),
                 rule: PyString::intern(py, "rule").unbind(),
                 rule_id: PyString::intern(py, "rule_id").unbind(),
