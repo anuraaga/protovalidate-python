@@ -54,7 +54,7 @@ use crate::validate::{FieldPathElement, FieldRules, Ignore, MessageRules, Rule};
 pub(crate) struct Builder<'a> {
     descriptors: &'a Descriptors,
     #[cfg(feature = "cel")]
-    env: &'a Env,
+    env: &'a mut Env,
 }
 
 /// A standard rules message (`StringRules`, `RepeatedRules`, ...), by full
@@ -301,7 +301,7 @@ fn scalar_rules(
 
 impl<'a> Builder<'a> {
     #[cfg(feature = "cel")]
-    pub(crate) fn new(descriptors: &'a Descriptors, env: &'a Env) -> Self {
+    pub(crate) fn new(descriptors: &'a Descriptors, env: &'a mut Env) -> Self {
         Self { descriptors, env }
     }
 
@@ -317,12 +317,15 @@ impl<'a> Builder<'a> {
     /// compile anywhere below the root is reported before any message is
     /// validated.
     pub(crate) fn build_closure(
-        &self,
+        &mut self,
         root: MessageIndex,
         known: &HashMap<MessageIndex, Arc<MessageEvaluator>>,
         out: &mut HashMap<MessageIndex, Arc<MessageEvaluator>>,
     ) -> Result<(), CompileError> {
-        let pool = &self.descriptors.pool;
+        // The reference is copied out of `self`, so the loop below can still
+        // take `&mut self`.
+        let descriptors: &'a Descriptors = self.descriptors;
+        let pool = &descriptors.pool;
         let mut pending = vec![root];
         while let Some(idx) = pending.pop() {
             if known.contains_key(&idx) || out.contains_key(&idx) {
@@ -340,7 +343,10 @@ impl<'a> Builder<'a> {
     }
 
     /// The rules of a message type.
-    fn build_message(&self, message: &MessageDescriptor) -> Result<MessageEvaluator, CompileError> {
+    fn build_message(
+        &mut self,
+        message: &MessageDescriptor,
+    ) -> Result<MessageEvaluator, CompileError> {
         let pool = &*self.descriptors.pool;
         let rules = descriptors::message_rules(message);
         let compiled = rules
@@ -439,7 +445,7 @@ impl<'a> Builder<'a> {
     }
 
     fn build_field(
-        &self,
+        &mut self,
         message: &MessageDescriptor,
         field: &FieldDescriptor,
         rules: &FieldRules,
@@ -485,7 +491,7 @@ impl<'a> Builder<'a> {
 
     /// The rules of one value.
     fn build_value(
-        &self,
+        &mut self,
         target: Target,
         rules: &FieldRules,
     ) -> Result<Option<Built>, CompileError> {
@@ -540,7 +546,7 @@ impl<'a> Builder<'a> {
     /// The standard rules a `FieldRules` sets, checked against the value's
     /// type.
     fn standard_rules(
-        &self,
+        &mut self,
         target: Target,
         standard: &RulesType,
         built: &mut Built,
@@ -620,7 +626,7 @@ impl<'a> Builder<'a> {
     /// as a value of the element type that still belongs to a repeated
     /// field.
     fn item_rules(
-        &self,
+        &mut self,
         target: Target,
         items: Option<&FieldRules>,
     ) -> Result<Option<ItemEvaluator>, CompileError> {
@@ -651,7 +657,7 @@ impl<'a> Builder<'a> {
 
     /// The rules of a map field's keys and values.
     fn entry_rules(
-        &self,
+        &mut self,
         target: Target,
         keys: Option<&FieldRules>,
         values: Option<&FieldRules>,
@@ -809,7 +815,7 @@ impl<'a> Builder<'a> {
     }
 
     #[cfg(feature = "cel")]
-    fn compile(&self, compiled: Compiled) -> Result<Option<ProgramSet>, CompileError> {
+    fn compile(&mut self, compiled: Compiled) -> Result<Option<ProgramSet>, CompileError> {
         if compiled.expressions.is_empty() {
             return Ok(None);
         }

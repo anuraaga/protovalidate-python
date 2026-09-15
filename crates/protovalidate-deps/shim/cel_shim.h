@@ -32,8 +32,8 @@
 extern "C" {
 #endif
 
-// A descriptor pool, message factory, and CEL expression builder. Thread-safe
-// once built, except that cel_engine_add_file* need exclusive access.
+// A descriptor pool, message factory, and CEL expression builder. Not thread-safe
+// for concurrent compile along with evaluation.
 typedef struct cel_engine cel_engine;
 
 // A set of compiled CEL expressions sharing one `rules` message. Immutable and

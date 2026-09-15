@@ -61,7 +61,7 @@ fn cel_env() -> cel::Env {
 pub struct Validator {
     descriptors: Descriptors,
     #[cfg(feature = "cel")]
-    env: cel::Env,
+    env: RwLock<cel::Env>,
     cache: RwLock<Cache>,
 }
 
@@ -86,7 +86,7 @@ impl Validator {
         Self {
             descriptors: Descriptors::new(),
             #[cfg(feature = "cel")]
-            env: cel_env(),
+            env: RwLock::new(cel_env()),
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -112,6 +112,8 @@ impl Validator {
             .map_err(DescriptorError::new)?;
         #[cfg(feature = "cel")]
         self.env
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
             .add_file(file)
             .map_err(|error| DescriptorError::new(error.to_string()))?;
         Ok(())
@@ -160,7 +162,9 @@ impl Validator {
         let index = self.message_index(type_name)?;
         let evaluators = self.evaluators(index)?;
         #[cfg(feature = "cel")]
-        let walker = Walker::<R>::new(&self.descriptors, &self.env, &evaluators, fail_fast);
+        let env = self.env.read().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(feature = "cel")]
+        let walker = Walker::<R>::new(&self.descriptors, &env, &evaluators, fail_fast);
         #[cfg(not(feature = "cel"))]
         let walker = Walker::<R>::new(&self.descriptors, &evaluators, fail_fast);
         Ok(walker.validate(message, type_name, payload, &evaluators[&index])?)
@@ -186,10 +190,16 @@ impl Validator {
         }
         let mut built = HashMap::new();
         #[cfg(feature = "cel")]
-        let builder = Builder::new(&self.descriptors, &self.env);
+        {
+            let mut env = self.env.write().unwrap_or_else(PoisonError::into_inner);
+            let mut builder = Builder::new(&self.descriptors, &mut env);
+            builder.build_closure(index, &cache, &mut built)?;
+        }
         #[cfg(not(feature = "cel"))]
-        let builder = Builder::new(&self.descriptors);
-        builder.build_closure(index, &cache, &mut built)?;
+        {
+            let mut builder = Builder::new(&self.descriptors);
+            builder.build_closure(index, &cache, &mut built)?;
+        }
         drop(cache);
         self.cache
             .write()

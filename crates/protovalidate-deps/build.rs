@@ -15,12 +15,11 @@
 //! Compiles the CEL runtime behind the shim: cel-cpp and the C++ libraries
 //! it builds on, plus the shim itself.
 //!
-//! Sources are git submodules under `third_party/`; generated code with no
-//! upstream file (protoc output, the ANTLR-generated CEL parser) is checked
-//! in under `gen/`; the files each library compiles are listed in
-//! `filelists/`. `scripts/extract_native_sources.py` (`poe
-//! generate-vendored`) produces all three from bazel's action graph.
-//! `shim/` is this crate's own code and is compiled whole.
+//! Upstream sources are git submodules under `third_party/` with code generated
+//! by Bazel (protoc output, the ANTLR-generated CEL parser) checked
+//! in under `gen/`. The files each library compiles are listed in
+//! `filelists/`.All of it is produced by `scripts/extract_native_sources.py`
+//! from bazel's action graph without hand maintenance.
 
 use std::env;
 use std::ffi::OsStr;

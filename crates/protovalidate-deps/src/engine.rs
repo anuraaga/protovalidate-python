@@ -236,8 +236,11 @@ pub struct Engine {
 
 // SAFETY: the engine has no thread affinity, so it may move between threads.
 unsafe impl Send for Engine {}
-// SAFETY: compilation and evaluation are thread-safe (compilation locks
-// internally), while `add_file*` and `register` take `&mut self`.
+// SAFETY: nothing reachable through `&Engine` mutates it. Every call that
+// touches the expression builder -- `add_file*`, `register`, `compile` --
+// takes `&mut self` and is serialized by the borrow checker. What is left
+// on `&self` is `frame`, which only reads the descriptor pool and the
+// message factory, both thread-safe for concurrent reads.
 unsafe impl Sync for Engine {}
 
 impl Engine {
@@ -357,7 +360,7 @@ impl Engine {
     /// [`Error::Compilation`] for an expression that does not compile;
     /// [`Error::Argument`] for a rules message that does not parse.
     pub fn compile(
-        &self,
+        &mut self,
         rules: Option<(&str, &[u8])>,
         expressions: &[Expression<'_>],
     ) -> Result<Program, Error> {

@@ -26,7 +26,6 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/types/optional.h"
 #include "buf/validate/internal/extra_func.h"
@@ -72,7 +71,7 @@ class StringErrorCollector : public google::protobuf::DescriptorPool::ErrorColle
 
 // ParseFromArray takes an int length, so a buffer at or above 2 GiB would
 // narrow to a negative one. Protobuf cannot represent a message that large
-// either, so reject it at the boundary.
+// either, so safe to reject it.
 bool FitsInInt(size_t len) {
   return len <= static_cast<size_t>(std::numeric_limits<int>::max());
 }
@@ -215,11 +214,10 @@ struct cel_engine {
 
   google::protobuf::DescriptorPool pool;
   google::protobuf::DynamicMessageFactory message_factory;
-  // Guards the builder and the arena constant folding allocates into, both of
-  // which are used by every compilation.
-  absl::Mutex mutex;
-  google::protobuf::Arena constant_arena ABSL_GUARDED_BY(mutex);
-  std::unique_ptr<celrt::CelExpressionBuilder> builder ABSL_GUARDED_BY(mutex);
+  // The builder and the arena constant folding allocates into, both used by
+  // every compilation.
+  google::protobuf::Arena constant_arena;
+  std::unique_ptr<celrt::CelExpressionBuilder> builder;
 };
 
 struct cel_program {
@@ -476,7 +474,6 @@ extern "C" {
 
 cel_engine* cel_engine_new(char** error) {
   auto engine = std::make_unique<cel_engine>();
-  absl::MutexLock lock(&engine->mutex);
   auto builder = NewBuilder(&engine->constant_arena);
   if (!builder.ok()) {
     SetError(error, builder.status().message());
@@ -509,7 +506,6 @@ int cel_engine_register(cel_engine* engine, const char* name, size_t name_len,
   celrt::CelFunctionDescriptor descriptor(std::string(name, name_len),
                                           receiver_style != 0,
                                           std::move(types));
-  absl::MutexLock lock(&engine->mutex);
   absl::Status status = engine->builder->GetRegistry()->Register(
       std::make_unique<NativeFunction>(std::move(descriptor), fn, ctx));
   if (!status.ok()) {
@@ -605,7 +601,6 @@ int cel_program_new(cel_engine* engine, const char* rules_type_name,
         celrt::CelProtoWrapper::CreateMessage(rules_message, &program->arena);
   }
 
-  absl::MutexLock lock(&engine->mutex);
   program->exprs.reserve(exprs_len);
   for (size_t i = 0; i < exprs_len; i++) {
     const cel_rule& rule = exprs[i];
