@@ -15,7 +15,8 @@
 //! The adapter over the two Python Protobuf runtimes. Everything that must be
 //! asked differently of protobuf-py and google.protobuf -- descriptors, type
 //! names, serialization, field access -- goes through [`ProtoAdapter`], so the
-//! rest of the crate is runtime-agnostic.
+//! rest of the crate is runtime-agnostic. How the validator reads a message's
+//! fields during validation is in [`runtime`](crate::runtime).
 
 use std::collections::HashSet;
 
@@ -26,7 +27,7 @@ use pyo3::types::{PyBytes, PyString, PyType};
 use crate::constants::Constants;
 
 /// Which Python protobuf runtime a message comes from.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtoRuntime {
     /// protobuf-py: message classes carry a `desc` classmethod.
     ProtobufPy,
@@ -173,10 +174,10 @@ impl ProtoRuntime {
 
     /// Adds a descriptor file and its imports to the engine, imports first.
     ///
-    /// The shim adds descriptors with `BuildFile`, which resolves dependencies
-    /// eagerly, so a file's imports have to be added before the file itself;
-    /// the recursion order preserves that. `registered` doubles as the walk's
-    /// visited set; a file is recorded only once `add` has accepted it.
+    /// The validator resolves a file's imports when it is added, so they have
+    /// to be added before the file itself; the recursion order preserves
+    /// that. `registered` doubles as the walk's visited set; a file is
+    /// recorded only once `add` has accepted it.
     pub(crate) fn collect_files(
         self,
         file: &Bound<'_, PyAny>,

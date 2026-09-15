@@ -1,0 +1,601 @@
+// Copyright (c) 2023-2026 Buf Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The safe API over the shim: engines, programs, frames and the
+//! marshalling of values across the boundary.
+
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::marker::PhantomData;
+use std::ptr;
+use std::slice;
+
+use crate::ffi::{
+    CEL_ERR_ARGUMENT, CEL_ERR_COMPILATION, CEL_ERR_RUNTIME, CEL_ERR_UNEXPECTED, CEL_OK,
+    CEL_THIS_FIELD, CEL_THIS_MESSAGE, CEL_THIS_SCALAR, CEL_VALUE_BOOL, CEL_VALUE_BYTES,
+    CEL_VALUE_DOUBLE, CEL_VALUE_INT, CEL_VALUE_LIST, CEL_VALUE_NULL, CEL_VALUE_STRING,
+    CEL_VALUE_UINT, CelEngine, CelFailure, CelFrame, CelList, CelMessage, CelProgram, CelRule,
+    CelValue, cel_engine_add_file, cel_engine_add_file_set, cel_engine_free, cel_engine_new,
+    cel_engine_register, cel_failures_free, cel_frame_free, cel_frame_message, cel_frame_new,
+    cel_free, cel_list_get, cel_list_len, cel_message_field, cel_message_map_value,
+    cel_message_repeated, cel_program_eval, cel_program_free, cel_program_new, cel_string_new,
+};
+use crate::{Arg, Element, Error, Expression, Failure, Kind, NativeFn, Scalar, This};
+
+/// A `cel_value` with nothing set.
+fn null_value() -> CelValue {
+    CelValue {
+        kind: CEL_VALUE_NULL,
+        bool_value: 0,
+        int_value: 0,
+        uint_value: 0,
+        double_value: 0.0,
+        data: ptr::null(),
+        len: 0,
+        list: ptr::null(),
+    }
+}
+
+/// Takes ownership of a shim-allocated error string.
+unsafe fn take_error(error: *mut c_char) -> String {
+    if error.is_null() {
+        return "unknown error".to_owned();
+    }
+    // SAFETY: the shim allocated a NUL-terminated string the caller has not
+    // released, so it stays live until the free below.
+    let message = unsafe { CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: shim-allocated, and this is the last use of the pointer.
+    unsafe { cel_free(error.cast()) };
+    message
+}
+
+/// Takes ownership of a shim-allocated error string, classified by `code`.
+unsafe fn status_error(code: c_int, error: *mut c_char) -> Error {
+    // SAFETY: this function inherits `take_error`'s contract.
+    let message = unsafe { take_error(error) };
+    match code {
+        CEL_ERR_COMPILATION => Error::Compilation(message),
+        CEL_ERR_RUNTIME => Error::Runtime(message),
+        CEL_ERR_ARGUMENT => Error::Argument(message),
+        CEL_ERR_UNEXPECTED => Error::Unexpected(message),
+        code => Error::Unexpected(format!("unknown status {code}: {message}")),
+    }
+}
+
+impl Scalar<'_> {
+    fn to_ffi(self) -> CelValue {
+        let mut value = null_value();
+        match self {
+            Self::Bool(b) => {
+                value.kind = CEL_VALUE_BOOL;
+                value.bool_value = c_int::from(b);
+            }
+            Self::Int(i) => {
+                value.kind = CEL_VALUE_INT;
+                value.int_value = i;
+            }
+            Self::Uint(u) => {
+                value.kind = CEL_VALUE_UINT;
+                value.uint_value = u;
+            }
+            Self::Double(d) => {
+                value.kind = CEL_VALUE_DOUBLE;
+                value.double_value = d;
+            }
+            Self::String(s) => {
+                value.kind = CEL_VALUE_STRING;
+                value.data = s.as_ptr();
+                value.len = s.len();
+            }
+            Self::Bytes(b) => {
+                value.kind = CEL_VALUE_BYTES;
+                value.data = b.as_ptr();
+                value.len = b.len();
+            }
+        }
+        value
+    }
+}
+
+impl Kind {
+    fn code(self) -> i32 {
+        match self {
+            Self::Bool => CEL_VALUE_BOOL,
+            Self::Int => CEL_VALUE_INT,
+            Self::Uint => CEL_VALUE_UINT,
+            Self::Double => CEL_VALUE_DOUBLE,
+            Self::String => CEL_VALUE_STRING,
+            Self::Bytes => CEL_VALUE_BYTES,
+            Self::List => CEL_VALUE_LIST,
+        }
+    }
+}
+
+/// The bytes a `cel_value` points at, borrowed for the call.
+unsafe fn ffi_bytes<'a>(value: &CelValue) -> &'a [u8] {
+    if value.data.is_null() {
+        return &[];
+    }
+    // SAFETY: the shim points `data` at `len` bytes that outlive the call.
+    unsafe { slice::from_raw_parts(value.data, value.len) }
+}
+
+/// A list element, read through the shim.
+unsafe fn element<'a>(list: *const CelList, index: usize) -> Result<Element<'a>, String> {
+    let mut value = null_value();
+    let mut error: *mut c_char = ptr::null_mut();
+    // SAFETY: `list` is the live list of the current call, `value` and
+    // `error` are live out-params.
+    let code = unsafe { cel_list_get(list, index, &raw mut value, &raw mut error) };
+    if code != CEL_OK {
+        // SAFETY: a failure code means the shim stored an owned message.
+        return Err(unsafe { take_error(error) });
+    }
+    Ok(match value.kind {
+        CEL_VALUE_BOOL => Element::Bool(value.bool_value != 0),
+        CEL_VALUE_INT => Element::Int(value.int_value),
+        CEL_VALUE_UINT => Element::Uint(value.uint_value),
+        CEL_VALUE_DOUBLE => Element::Double(value.double_value),
+        // SAFETY: a string value points at bytes that outlive the call.
+        CEL_VALUE_STRING => Element::String(String::from_utf8_lossy(unsafe { ffi_bytes(&value) })),
+        // SAFETY: a bytes value points at bytes that outlive the call.
+        CEL_VALUE_BYTES => Element::Bytes(unsafe { ffi_bytes(&value) }),
+        _ => Element::Other,
+    })
+}
+
+/// An argument of a registered function, as the shim hands it over.
+unsafe fn argument<'a>(value: &CelValue) -> Result<Arg<'a>, String> {
+    Ok(match value.kind {
+        CEL_VALUE_BOOL => Arg::Bool(value.bool_value != 0),
+        CEL_VALUE_INT => Arg::Int(value.int_value),
+        CEL_VALUE_UINT => Arg::Uint(value.uint_value),
+        CEL_VALUE_DOUBLE => Arg::Double(value.double_value),
+        // SAFETY: a string value points at bytes that outlive the call.
+        CEL_VALUE_STRING => Arg::String(String::from_utf8_lossy(unsafe { ffi_bytes(value) })),
+        // SAFETY: a bytes value points at bytes that outlive the call.
+        CEL_VALUE_BYTES => Arg::Bytes(unsafe { ffi_bytes(value) }),
+        CEL_VALUE_LIST => {
+            // SAFETY: `list` is the live list of the current call.
+            let len = unsafe { cel_list_len(value.list) };
+            let mut elements = Vec::with_capacity(len);
+            for index in 0..len {
+                // SAFETY: as above.
+                elements.push(unsafe { element(value.list, index) }?);
+            }
+            Arg::List(elements)
+        }
+        kind => return Err(format!("unsupported argument kind {kind}")),
+    })
+}
+
+/// The shim's entry into a registered function: `ctx` is the [`NativeFn`]
+/// the engine holds for it.
+unsafe extern "C" fn call_function(
+    ctx: *mut c_void,
+    args: *const CelValue,
+    len: usize,
+    out: *mut CelValue,
+    error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: `ctx` is a `NativeFn` the engine keeps alive for as long as it
+    // lives, and `args` is valid for `len` values for the call.
+    let function = unsafe { *ctx.cast::<NativeFn>() };
+    // SAFETY: as above.
+    let values = unsafe { slice::from_raw_parts(args, len) };
+    let result = values
+        .iter()
+        // SAFETY: each value's data outlives the call.
+        .map(|value| unsafe { argument(value) })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|arguments| function(&arguments));
+    match result {
+        Ok(value) => {
+            let mut result = null_value();
+            result.kind = CEL_VALUE_BOOL;
+            result.bool_value = c_int::from(value);
+            // SAFETY: `out` is a live out-param.
+            unsafe { out.write(result) };
+            CEL_OK
+        }
+        Err(message) => {
+            // SAFETY: `error` is a live out-param, and the shim releases the
+            // string it allocates here.
+            unsafe {
+                error.write(cel_string_new(
+                    message.as_ptr().cast::<c_char>(),
+                    message.len(),
+                ));
+            }
+            CEL_ERR_RUNTIME
+        }
+    }
+}
+
+/// The CEL environment: a descriptor pool for the messages expressions see,
+/// the functions they can call, and the expression builder.
+pub struct Engine {
+    raw: *mut CelEngine,
+    /// The registered functions, boxed so the addresses handed to the shim
+    /// survive the vector growing.
+    #[allow(clippy::vec_box)]
+    functions: Vec<Box<NativeFn>>,
+}
+
+// SAFETY: the engine has no thread affinity, so it may move between threads.
+unsafe impl Send for Engine {}
+// SAFETY: compilation and evaluation are thread-safe (compilation locks
+// internally), while `add_file*` and `register` take `&mut self`.
+unsafe impl Sync for Engine {}
+
+impl Engine {
+    /// Creates an engine with CEL's own functions and the well-known types.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the runtime cannot be initialized, which indicates a broken
+    /// build rather than bad input.
+    pub fn new() -> Result<Self, Error> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `error` is a live out-param the shim writes only on failure.
+        let raw = unsafe { cel_engine_new(&raw mut error) };
+        if raw.is_null() {
+            // SAFETY: a null engine means the shim stored an owned message.
+            return Err(Error::Unexpected(unsafe { take_error(error) }));
+        }
+        Ok(Self {
+            raw,
+            functions: Vec::new(),
+        })
+    }
+
+    /// Makes `function` callable from expressions as `name`, on arguments of
+    /// the given kinds; `receiver` makes the first argument the receiver, as
+    /// in `this.isEmail()`. The same name may be registered for several kind
+    /// lists, which CEL resolves by argument type. Register before compiling.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] for a registration CEL rejects, such as a
+    /// duplicate.
+    pub fn register(
+        &mut self,
+        name: &str,
+        receiver: bool,
+        args: &[Kind],
+        function: NativeFn,
+    ) -> Result<(), Error> {
+        let kinds: Vec<i32> = args.iter().map(|kind| kind.code()).collect();
+        let function = Box::new(function);
+        // The actual Rust function pointer is stored as opaque ctx which is passed to
+        // call_function, which is a normal C-ABI function that can be invoked from C++.
+        let ctx = ptr::from_ref::<NativeFn>(&function)
+            .cast_mut()
+            .cast::<c_void>();
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `self.raw` is live; the name and kinds are valid for their
+        // lengths for the call; `ctx` points into a box `self.functions`
+        // keeps for the engine's life; `error` is a live out-param.
+        let code = unsafe {
+            cel_engine_register(
+                self.raw,
+                name.as_ptr().cast::<c_char>(),
+                name.len(),
+                c_int::from(receiver),
+                kinds.as_ptr(),
+                kinds.len(),
+                call_function,
+                ctx,
+                &raw mut error,
+            )
+        };
+        if code != CEL_OK {
+            // SAFETY: a failure code means the shim stored an owned message.
+            return Err(unsafe { status_error(code, error) });
+        }
+        self.functions.push(function);
+        Ok(())
+    }
+
+    /// Adds a serialized `FileDescriptorProto` to the pool. Its imports must
+    /// already be there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] for a file that does not parse or link.
+    pub fn add_file(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `self.raw` is a live engine, `bytes` is valid for its own
+        // length, and `error` is a live out-param.
+        let code =
+            unsafe { cel_engine_add_file(self.raw, bytes.as_ptr(), bytes.len(), &raw mut error) };
+        if code == CEL_OK {
+            Ok(())
+        } else {
+            // SAFETY: a non-OK code means the shim stored an owned message.
+            Err(unsafe { status_error(code, error) })
+        }
+    }
+
+    /// Adds every file in a serialized `FileDescriptorSet` to the pool, in
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_file`](Self::add_file).
+    pub fn add_file_set(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: as `add_file`.
+        let code = unsafe {
+            cel_engine_add_file_set(self.raw, bytes.as_ptr(), bytes.len(), &raw mut error)
+        };
+        if code == CEL_OK {
+            Ok(())
+        } else {
+            // SAFETY: a non-OK code means the shim stored an owned message.
+            Err(unsafe { status_error(code, error) })
+        }
+    }
+
+    /// Compiles `expressions` sharing one `rules` message: a serialized
+    /// message of the named type, or none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Compilation`] for an expression that does not compile;
+    /// [`Error::Argument`] for a rules message that does not parse.
+    pub fn compile(
+        &self,
+        rules: Option<(&str, &[u8])>,
+        expressions: &[Expression<'_>],
+    ) -> Result<Program, Error> {
+        let (type_name, bytes) = rules.unwrap_or(("", &[]));
+        let ffi_rules: Vec<CelRule> = expressions
+            .iter()
+            .map(|expression| CelRule {
+                expression: expression.expression.as_ptr().cast::<c_char>(),
+                expression_len: expression.expression.len(),
+                rule_field_number: expression.rule_field_number,
+            })
+            .collect();
+        let mut out: *mut CelProgram = ptr::null_mut();
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `self.raw` is a live engine; every pointer/length pair is
+        // valid for the duration of the call, which does not retain them;
+        // `out` and `error` are live out-params.
+        let code = unsafe {
+            cel_program_new(
+                self.raw,
+                type_name.as_ptr().cast::<c_char>(),
+                type_name.len(),
+                bytes.as_ptr(),
+                bytes.len(),
+                ffi_rules.as_ptr(),
+                ffi_rules.len(),
+                &raw mut out,
+                &raw mut error,
+            )
+        };
+        if code != CEL_OK {
+            // SAFETY: a non-OK code means the shim stored an owned message.
+            return Err(unsafe { status_error(code, error) });
+        }
+        Ok(Program(out))
+    }
+
+    /// Parses `payload` as the named message type.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] for an unknown type or a payload that does not
+    /// parse.
+    pub fn frame(&self, type_name: &str, payload: &[u8]) -> Result<Frame, Error> {
+        let mut out: *mut CelFrame = ptr::null_mut();
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `self.raw` is a live engine; `type_name` and `payload` are
+        // valid for their lengths and not retained; `out` and `error` are
+        // live out-params.
+        let code = unsafe {
+            cel_frame_new(
+                self.raw,
+                type_name.as_ptr().cast::<c_char>(),
+                type_name.len(),
+                payload.as_ptr(),
+                payload.len(),
+                &raw mut out,
+                &raw mut error,
+            )
+        };
+        if code != CEL_OK {
+            // SAFETY: a non-OK code means the shim stored an owned message.
+            return Err(unsafe { status_error(code, error) });
+        }
+        Ok(Frame(out))
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` came from `cel_engine_new` and is freed once;
+        // the registered functions it points at are dropped after it.
+        unsafe { cel_engine_free(self.raw) };
+    }
+}
+
+/// A set of compiled expressions sharing one `rules` message.
+pub struct Program(*mut CelProgram);
+
+// SAFETY: a program is immutable once built, and evaluation is thread-safe.
+unsafe impl Send for Program {}
+// SAFETY: as above.
+unsafe impl Sync for Program {}
+
+impl Program {
+    /// Evaluates every expression against `this`, returning the ones that
+    /// failed. With `fail_fast`, stops after the first failure.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] for an expression that fails to evaluate or
+    /// produces neither a bool nor a string; [`Error::Argument`] for a
+    /// `this` field that does not exist.
+    pub fn eval(&self, this: This<'_>, fail_fast: bool) -> Result<Vec<Failure>, Error> {
+        let (kind, scalar, message, field_number) = match this {
+            This::Scalar(scalar) => (CEL_THIS_SCALAR, Some(scalar.to_ffi()), ptr::null(), 0),
+            This::Message(message) => (CEL_THIS_MESSAGE, None, message.0, 0),
+            This::Field(message, number) => (CEL_THIS_FIELD, None, message.0, number),
+        };
+        let mut out: *mut CelFailure = ptr::null_mut();
+        let mut out_len: usize = 0;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: `self.0` is a live program; the scalar and its borrowed
+        // string storage outlive the call, as does the frame `message`
+        // belongs to (`MessageRef`'s lifetime); `out`, `out_len` and `error`
+        // are live out-params.
+        let code = unsafe {
+            cel_program_eval(
+                self.0,
+                kind,
+                scalar
+                    .as_ref()
+                    .map_or(ptr::null(), |scalar| &raw const *scalar),
+                message,
+                field_number,
+                c_int::from(fail_fast),
+                &raw mut out,
+                &raw mut out_len,
+                &raw mut error,
+            )
+        };
+        if code != CEL_OK {
+            // SAFETY: a non-OK code means the shim stored an owned message.
+            return Err(unsafe { status_error(code, error) });
+        }
+        if out.is_null() {
+            return Ok(Vec::new());
+        }
+        // SAFETY: the shim returned `out_len` initialized failures.
+        let raw = unsafe { slice::from_raw_parts(out, out_len) };
+        let failures = raw
+            .iter()
+            .map(|failure| Failure {
+                index: failure.index,
+                message: (!failure.message.is_null()).then(|| {
+                    // SAFETY: a non-null message is `message_len` bytes the
+                    // shim allocated, live until the free below.
+                    let bytes = unsafe {
+                        slice::from_raw_parts(failure.message.cast::<u8>(), failure.message_len)
+                    };
+                    String::from_utf8_lossy(bytes).into_owned()
+                }),
+            })
+            .collect();
+        // SAFETY: shim-allocated, and this is the last use of the array.
+        unsafe { cel_failures_free(out, out_len) };
+        Ok(failures)
+    }
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from `cel_program_new` and is freed once.
+        unsafe { cel_program_free(self.0) };
+    }
+}
+
+/// A parsed message, owning the storage its sub-messages live in.
+pub struct Frame(*mut CelFrame);
+
+// SAFETY: a frame is immutable once parsed.
+unsafe impl Send for Frame {}
+// SAFETY: as above.
+unsafe impl Sync for Frame {}
+
+impl Frame {
+    /// The parsed message.
+    #[must_use]
+    pub fn message(&self) -> MessageRef<'_> {
+        // SAFETY: `self.0` is a live frame; the message it returns lives as
+        // long as the frame, which the returned lifetime says.
+        MessageRef(unsafe { cel_frame_message(self.0) }, PhantomData)
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from `cel_frame_new` and is freed once.
+        unsafe { cel_frame_free(self.0) };
+    }
+}
+
+/// A message inside a [`Frame`], live as long as the frame is.
+#[derive(Clone, Copy, Debug)]
+pub struct MessageRef<'a>(*const CelMessage, PhantomData<&'a Frame>);
+
+// SAFETY: a message inside a frame is immutable.
+unsafe impl Send for MessageRef<'_> {}
+// SAFETY: as above.
+unsafe impl Sync for MessageRef<'_> {}
+
+impl<'a> MessageRef<'a> {
+    fn sub(
+        lookup: impl FnOnce(*mut *const CelMessage, *mut *mut c_char) -> c_int,
+    ) -> Result<MessageRef<'a>, Error> {
+        let mut out: *const CelMessage = ptr::null();
+        let mut error: *mut c_char = ptr::null_mut();
+        let code = lookup(&raw mut out, &raw mut error);
+        if code != CEL_OK {
+            // SAFETY: a non-OK code means the shim stored an owned message.
+            return Err(unsafe { status_error(code, error) });
+        }
+        Ok(MessageRef(out, PhantomData))
+    }
+
+    /// The message in singular field `number`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] for a field that does not exist or is not a
+    /// singular message.
+    pub fn field(self, number: i32) -> Result<MessageRef<'a>, Error> {
+        // SAFETY: `self.0` is live for `'a`; `out` and `error` are live
+        // out-params.
+        Self::sub(|out, error| unsafe { cel_message_field(self.0, number, out, error) })
+    }
+
+    /// The message at `index` of repeated field `number`.
+    ///
+    /// # Errors
+    ///
+    /// As [`field`](Self::field), and for an index past the end.
+    pub fn repeated(self, number: i32, index: usize) -> Result<MessageRef<'a>, Error> {
+        // SAFETY: as `field`.
+        Self::sub(|out, error| unsafe { cel_message_repeated(self.0, number, index, out, error) })
+    }
+
+    /// The message under `key` of map field `number`.
+    ///
+    /// # Errors
+    ///
+    /// As [`field`](Self::field), and for a key that is not in the map.
+    pub fn map_value(self, number: i32, key: Scalar<'_>) -> Result<MessageRef<'a>, Error> {
+        let key = key.to_ffi();
+        // SAFETY: as `field`; `key` and the storage it borrows outlive the
+        // call.
+        Self::sub(|out, error| unsafe {
+            cel_message_map_value(self.0, number, &raw const key, out, error)
+        })
+    }
+}

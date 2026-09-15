@@ -4,3 +4,10 @@ managed:
 plugins:
     - remote: buf.build/bufbuild/py:v0.1.1
       out: protovalidate/_gen
+    # The `buf.validate` types the native validator reads rules through.
+    # Views and setters are the parts of buffa's surface it never touches.
+    - remote: buf.build/anthropics/buffa:v0.9.2
+      out: crates/protovalidate/src/gen
+      opt:
+        - views=false
+        - with_setters=false

@@ -58,6 +58,16 @@ pub(crate) struct ConstantsInner {
     pub(crate) extensions: Py<PyString>,
     /// The string `field`.
     pub(crate) field: Py<PyString>,
+    /// The string `HasField`.
+    pub(crate) has_field: Py<PyString>,
+    /// The string `items`.
+    pub(crate) items: Py<PyString>,
+    /// The string `local_name`.
+    pub(crate) local_name: Py<PyString>,
+    /// The string `oneof`.
+    pub(crate) oneof: Py<PyString>,
+    /// The string `_present`.
+    pub(crate) present: Py<PyString>,
     /// The string `field_name`.
     pub(crate) field_name: Py<PyString>,
     /// The string `field_number`.
@@ -129,6 +139,11 @@ impl Constants {
                 elements: PyString::intern(py, "elements").unbind(),
                 extensions: PyString::intern(py, "extensions").unbind(),
                 field: PyString::intern(py, "field").unbind(),
+                has_field: PyString::intern(py, "HasField").unbind(),
+                items: PyString::intern(py, "items").unbind(),
+                local_name: PyString::intern(py, "local_name").unbind(),
+                oneof: PyString::intern(py, "oneof").unbind(),
+                present: PyString::intern(py, "_present").unbind(),
                 field_name: PyString::intern(py, "field_name").unbind(),
                 field_number: PyString::intern(py, "field_number").unbind(),
                 fields: PyString::intern(py, "fields").unbind(),

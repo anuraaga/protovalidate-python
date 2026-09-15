@@ -35,6 +35,38 @@ Some tasks require additional non-Python tools:
 With Go installed, you can verify that your changes pass tests and
 lint checks by running `uv run poe check`. For a list of other useful commands, run `uv run poe`.
 
+### How the native code is built
+
+The native extension is a Cargo workspace: `src/` adapts Python messages and
+descriptors to the validator, `crates/protovalidate` is the validator itself,
+and `crates/protovalidate-deps` is the C++ it evaluates custom CEL rules with.
+
+Inside `crates/protovalidate-deps`, upstream C++ sources are git submodules
+under `third_party/`: cel-cpp at the pinned ref, and its dependencies at the
+versions Bazel resolves for it. Clone with `--recurse-submodules`, or run `git
+submodule update --init --recursive` in an existing checkout. What is compiled
+is the CEL runtime behind `shim/cel_shim.cc`, with the safe Rust API over it in
+`src/`, the one place `unsafe` appears; the validation logic itself is Rust, in
+`crates/protovalidate/src/rules/`. protovalidate's CEL functions (`isEmail`,
+`isIp`, `unique`, ...) are implemented in Rust, in
+`crates/protovalidate/src/cel/library.rs`, and registered into the engine
+through the shim; only `getField` remains C++, in `shim/buf/validate/`. Which
+files to compile is recorded per library in `filelists/`, and code with no
+upstream file to point at (protoc output, the ANTLR-generated CEL parser) is
+checked in under `gen/`. All of it is produced by
+`scripts/extract_native_sources.py` from Bazel's action graph; nothing is
+maintained by hand.
+
+To bump cel-cpp:
+
+1. Edit `scripts/extract/versions.json`.
+2. Run `uv run poe generate-vendored`. It needs Bazel, and moves the
+   submodules, rewrites the filelists and `gen/`, and verifies the shim still
+   compiles against the pins.
+
+Set `PROTOVALIDATE_SKIP_CPP=1` to skip the C++ compilation for lint-only
+workflows.
+
 ### Reporting Bugs
 
 Bugs are tracked as GitHub issues. If you discover a problem

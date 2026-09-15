@@ -360,10 +360,10 @@ fn rules_of<'py>(
     Ok(options.get_item(extension.bind(py)).ok())
 }
 
-/// Turns the serialized `buf.validate.Violations` from C++ into wrappers.
+/// Turns the validator's serialized `buf.validate.Violations` into wrappers.
 ///
-/// No value resolution happens here: each wrapper keeps the proto the C++ side
-/// produced together with the message it came from, and `field_value` and
+/// No value resolution happens here: each wrapper keeps the proto the
+/// validator produced together with the message it came from, and `field_value` and
 /// `rule_value` are recovered from the paths on first access. Raising a
 /// `ValidationError` or reading `rule_id` never pays for path walking.
 pub fn build_violations<'py>(
