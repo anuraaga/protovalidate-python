@@ -61,6 +61,6 @@ pub enum Element<'a> {
 /// A function's implementation: a predicate over its arguments, or the
 /// message of the error the expression sees instead of a value.
 ///
-/// protovalidate's functions are all predicates; the ABI carries every
-/// scalar, so widen this when one is not.
+/// protovalidate's functions are all predicates, and the ABI carries only
+/// that; widen both when one is not.
 pub type NativeFn = fn(&[Arg<'_>]) -> Result<bool, String>;

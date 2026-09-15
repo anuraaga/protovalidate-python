@@ -65,13 +65,13 @@ pub struct Expression<'a> {
     pub rule_field_number: i32,
 }
 
-/// An expression that failed.
+/// What an expression produced, as far as the caller can tell them apart.
 #[derive(Debug)]
-pub struct Failure {
-    /// The index of the expression in the compiled set.
-    pub index: usize,
-    /// The string the expression produced, when it produced one.
-    pub message: Option<String>,
+pub enum Value {
+    Bool(bool),
+    String(String),
+    /// Anything else: a number, a message, a list, null.
+    Other,
 }
 
 /// Why the runtime could not do what was asked.

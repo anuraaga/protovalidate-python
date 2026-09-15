@@ -41,7 +41,7 @@ use super::{
 #[cfg(feature = "cel")]
 use super::{ProgramSet, ScalarKind};
 #[cfg(feature = "cel")]
-use crate::cel::{self, Env, Scalar, This};
+use crate::cel::{self, Env, Scalar, This, Value};
 use crate::descriptors::{self, Descriptors, Schema};
 use crate::protobuf::{Field, Key, List as _, Map as _, Message as _, Payload, Runtime, Val};
 use crate::validate::__buffa::oneof::field_path_element::Subscript;
@@ -398,19 +398,29 @@ impl<'a, R: Runtime> Walker<'a, R> {
 
     /// Runs a program set and records its failures as violations.
     #[cfg(feature = "cel")]
+    /// Runs each expression against `this`. One passes by producing `true`
+    /// or an empty string; `false` fails with the rule's own message, and a
+    /// non-empty string fails with that string as the message.
     fn run(&mut self, programs: &ProgramSet, this: This<'_>) -> Result<(), EvalError> {
-        for failure in programs.program.eval(this, self.fail_fast)? {
-            let meta = &programs.rules[failure.index];
-            let message = failure.message.unwrap_or_else(|| {
-                if meta.message.is_empty() {
+        for (index, meta) in programs.rules.iter().enumerate() {
+            let message = match programs.program.eval(index, this)? {
+                Value::Bool(true) => continue,
+                Value::Bool(false) if meta.message.is_empty() => {
                     format!("\"{}\" returned false", meta.expression)
-                } else {
-                    meta.message.clone()
                 }
-            });
+                Value::Bool(false) => meta.message.clone(),
+                Value::String(text) if text.is_empty() => continue,
+                Value::String(text) => text,
+                Value::Other => {
+                    return Err(EvalError::Runtime("invalid result type".to_owned()));
+                }
+            };
             let rule: Vec<&FieldPathElement> = meta.rule_path.iter().collect();
             self.violations
                 .push(violation(&meta.id, &message, None, &rule));
+            if self.fail_fast {
+                break;
+            }
         }
         Ok(())
     }

@@ -23,7 +23,7 @@ pub(crate) const CEL_ERR_RUNTIME: c_int = 2;
 pub(crate) const CEL_ERR_ARGUMENT: c_int = 3;
 pub(crate) const CEL_ERR_UNEXPECTED: c_int = 4;
 
-pub(crate) const CEL_VALUE_NULL: i32 = 0;
+pub(crate) const CEL_VALUE_OTHER: i32 = 0;
 pub(crate) const CEL_VALUE_BOOL: i32 = 1;
 pub(crate) const CEL_VALUE_INT: i32 = 2;
 pub(crate) const CEL_VALUE_UINT: i32 = 3;
@@ -77,15 +77,6 @@ pub(crate) struct CelRule {
     pub rule_field_number: i32,
 }
 
-/// One failed expression; see `cel_failure` in `shim/cel_shim.h`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CelFailure {
-    pub index: usize,
-    pub message: *mut c_char,
-    pub message_len: usize,
-}
-
 /// Opaque list passed to a registered function; see `cel_list` in
 /// `shim/cel_shim.h`.
 #[repr(C)]
@@ -99,12 +90,13 @@ pub(crate) type CelNativeFn = unsafe extern "C" fn(
     ctx: *mut c_void,
     args: *const CelValue,
     len: usize,
-    out: *mut CelValue,
+    out: *mut c_int,
     error: *mut *mut c_char,
 ) -> c_int;
 
 unsafe extern "C" {
     pub(crate) fn cel_engine_new(error: *mut *mut c_char) -> *mut CelEngine;
+    pub(crate) fn cel_engine_free(engine: *mut CelEngine);
     pub(crate) fn cel_engine_register(
         engine: *mut CelEngine,
         name: *const c_char,
@@ -117,23 +109,11 @@ unsafe extern "C" {
         error: *mut *mut c_char,
     ) -> c_int;
     pub(crate) fn cel_list_len(list: *const CelList) -> usize;
-    pub(crate) fn cel_list_get(
-        list: *const CelList,
-        index: usize,
-        out: *mut CelValue,
-        error: *mut *mut c_char,
-    ) -> c_int;
+    pub(crate) fn cel_list_get(list: *const CelList, index: usize, out: *mut CelValue);
     pub(crate) fn cel_string_new(data: *const c_char, len: usize) -> *mut c_char;
-    pub(crate) fn cel_engine_free(engine: *mut CelEngine);
     pub(crate) fn cel_engine_add_file(
         engine: *mut CelEngine,
         file_descriptor_proto: *const u8,
-        len: usize,
-        error: *mut *mut c_char,
-    ) -> c_int;
-    pub(crate) fn cel_engine_add_file_set(
-        engine: *mut CelEngine,
-        file_descriptor_set: *const u8,
         len: usize,
         error: *mut *mut c_char,
     ) -> c_int;
@@ -161,18 +141,17 @@ unsafe extern "C" {
         error: *mut *mut c_char,
     ) -> c_int;
     pub(crate) fn cel_frame_free(frame: *mut CelFrame);
+
     pub(crate) fn cel_program_eval(
         program: *const CelProgram,
+        index: usize,
         this_kind: c_int,
         scalar: *const CelValue,
         frame: *const CelFrame,
         field_number: i32,
-        fail_fast: c_int,
-        out: *mut *mut CelFailure,
-        out_len: *mut usize,
+        out: *mut CelValue,
         error: *mut *mut c_char,
     ) -> c_int;
-    pub(crate) fn cel_failures_free(failures: *mut CelFailure, len: usize);
 
     pub(crate) fn cel_free(ptr: *mut u8);
 }

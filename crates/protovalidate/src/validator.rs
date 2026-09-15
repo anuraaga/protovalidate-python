@@ -48,8 +48,12 @@ fn encode_violations(violations: Vec<ViolationPb>) -> Vec<u8> {
 fn cel_env() -> cel::Env {
     let mut env = cel::new_env()
         .unwrap_or_else(|error| panic!("could not initialize the CEL runtime: {error}"));
-    env.add_file_set(descriptors::BASE_DESCRIPTOR_SET)
-        .unwrap_or_else(|error| panic!("could not register the buf.validate schema: {error}"));
+    let set = descriptors::decode_file_set(descriptors::BASE_DESCRIPTOR_SET)
+        .expect("embedded descriptor set decodes");
+    for file in &set.file {
+        env.add_file(&file.encode_to_vec())
+            .unwrap_or_else(|error| panic!("could not register the buf.validate schema: {error}"));
+    }
     env
 }
 

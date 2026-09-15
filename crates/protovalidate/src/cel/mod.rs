@@ -26,4 +26,4 @@ mod cpp;
 mod library;
 
 pub(crate) use cpp::{Env, new_env};
-pub(crate) use protovalidate_deps::{Error, Expression, Frame, Program, Scalar, This};
+pub(crate) use protovalidate_deps::{Error, Expression, Frame, Program, Scalar, This, Value};

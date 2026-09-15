@@ -22,18 +22,18 @@ use std::slice;
 use crate::ffi::{
     CEL_ERR_ARGUMENT, CEL_ERR_COMPILATION, CEL_ERR_RUNTIME, CEL_ERR_UNEXPECTED, CEL_OK,
     CEL_THIS_FIELD, CEL_THIS_MESSAGE, CEL_THIS_SCALAR, CEL_VALUE_BOOL, CEL_VALUE_BYTES,
-    CEL_VALUE_DOUBLE, CEL_VALUE_INT, CEL_VALUE_LIST, CEL_VALUE_NULL, CEL_VALUE_STRING,
-    CEL_VALUE_UINT, CelEngine, CelFailure, CelFrame, CelList, CelProgram, CelRule, CelValue,
-    cel_engine_add_file, cel_engine_add_file_set, cel_engine_free, cel_engine_new,
-    cel_engine_register, cel_failures_free, cel_frame_free, cel_frame_new, cel_free, cel_list_get,
-    cel_list_len, cel_program_eval, cel_program_free, cel_program_new, cel_string_new,
+    CEL_VALUE_DOUBLE, CEL_VALUE_INT, CEL_VALUE_LIST, CEL_VALUE_OTHER, CEL_VALUE_STRING,
+    CEL_VALUE_UINT, CelEngine, CelFrame, CelList, CelProgram, CelRule, CelValue,
+    cel_engine_add_file, cel_engine_free, cel_engine_new, cel_engine_register, cel_frame_free,
+    cel_frame_new, cel_free, cel_list_get, cel_list_len, cel_program_eval, cel_program_free,
+    cel_program_new, cel_string_new,
 };
-use crate::{Arg, Element, Error, Expression, Failure, Kind, NativeFn, Scalar, This};
+use crate::{Arg, Element, Error, Expression, Kind, NativeFn, Scalar, This, Value};
 
 /// A `cel_value` with nothing set.
-fn null_value() -> CelValue {
+fn other_value() -> CelValue {
     CelValue {
-        kind: CEL_VALUE_NULL,
+        kind: CEL_VALUE_OTHER,
         bool_value: 0,
         int_value: 0,
         uint_value: 0,
@@ -41,6 +41,17 @@ fn null_value() -> CelValue {
         data: ptr::null(),
         len: 0,
         list: ptr::null(),
+    }
+}
+
+/// The shim hands lengths to protobuf as `int`, so a buffer at or above 2 GiB
+/// would narrow to a negative one. Protobuf cannot represent a message that
+/// large either.
+fn check_len(what: &str, bytes: &[u8]) -> Result<(), Error> {
+    if i32::try_from(bytes.len()).is_ok() {
+        Ok(())
+    } else {
+        Err(Error::Argument(format!("{what} is too large")))
     }
 }
 
@@ -74,7 +85,7 @@ unsafe fn status_error(code: c_int, error: *mut c_char) -> Error {
 
 impl Scalar<'_> {
     fn to_ffi(self) -> CelValue {
-        let mut value = null_value();
+        let mut value = other_value();
         match self {
             Self::Bool(b) => {
                 value.kind = CEL_VALUE_BOOL;
@@ -130,18 +141,13 @@ unsafe fn ffi_bytes<'a>(value: &CelValue) -> &'a [u8] {
     unsafe { slice::from_raw_parts(value.data, value.len) }
 }
 
-/// A list element, read through the shim.
-unsafe fn element<'a>(list: *const CelList, index: usize) -> Result<Element<'a>, String> {
-    let mut value = null_value();
-    let mut error: *mut c_char = ptr::null_mut();
-    // SAFETY: `list` is the live list of the current call, `value` and
-    // `error` are live out-params.
-    let code = unsafe { cel_list_get(list, index, &raw mut value, &raw mut error) };
-    if code != CEL_OK {
-        // SAFETY: a failure code means the shim stored an owned message.
-        return Err(unsafe { take_error(error) });
-    }
-    Ok(match value.kind {
+/// A list element, read through the shim. `index` is in range.
+unsafe fn element<'a>(list: *const CelList, index: usize) -> Element<'a> {
+    let mut value = other_value();
+    // SAFETY: `list` is the live list of the current call, `index` is below
+    // its length, and `value` is a live out-param.
+    unsafe { cel_list_get(list, index, &raw mut value) };
+    match value.kind {
         CEL_VALUE_BOOL => Element::Bool(value.bool_value != 0),
         CEL_VALUE_INT => Element::Int(value.int_value),
         CEL_VALUE_UINT => Element::Uint(value.uint_value),
@@ -151,7 +157,7 @@ unsafe fn element<'a>(list: *const CelList, index: usize) -> Result<Element<'a>,
         // SAFETY: a bytes value points at bytes that outlive the call.
         CEL_VALUE_BYTES => Element::Bytes(unsafe { ffi_bytes(&value) }),
         _ => Element::Other,
-    })
+    }
 }
 
 /// An argument of a registered function, as the shim hands it over.
@@ -170,8 +176,8 @@ unsafe fn argument<'a>(value: &CelValue) -> Result<Arg<'a>, String> {
             let len = unsafe { cel_list_len(value.list) };
             let mut elements = Vec::with_capacity(len);
             for index in 0..len {
-                // SAFETY: as above.
-                elements.push(unsafe { element(value.list, index) }?);
+                // SAFETY: as above, and `index` is below the length just read.
+                elements.push(unsafe { element(value.list, index) });
             }
             Arg::List(elements)
         }
@@ -185,7 +191,7 @@ unsafe extern "C" fn call_function(
     ctx: *mut c_void,
     args: *const CelValue,
     len: usize,
-    out: *mut CelValue,
+    out: *mut c_int,
     error: *mut *mut c_char,
 ) -> c_int {
     // SAFETY: `ctx` is a `NativeFn` the engine keeps alive for as long as it
@@ -201,11 +207,8 @@ unsafe extern "C" fn call_function(
         .and_then(|arguments| function(&arguments));
     match result {
         Ok(value) => {
-            let mut result = null_value();
-            result.kind = CEL_VALUE_BOOL;
-            result.bool_value = c_int::from(value);
             // SAFETY: `out` is a live out-param.
-            unsafe { out.write(result) };
+            unsafe { out.write(c_int::from(value)) };
             CEL_OK
         }
         Err(message) => {
@@ -317,31 +320,12 @@ impl Engine {
     ///
     /// [`Error::Argument`] for a file that does not parse or link.
     pub fn add_file(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        check_len("FileDescriptorProto", bytes)?;
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: `self.raw` is a live engine, `bytes` is valid for its own
         // length, and `error` is a live out-param.
         let code =
             unsafe { cel_engine_add_file(self.raw, bytes.as_ptr(), bytes.len(), &raw mut error) };
-        if code == CEL_OK {
-            Ok(())
-        } else {
-            // SAFETY: a non-OK code means the shim stored an owned message.
-            Err(unsafe { status_error(code, error) })
-        }
-    }
-
-    /// Adds every file in a serialized `FileDescriptorSet` to the pool, in
-    /// order.
-    ///
-    /// # Errors
-    ///
-    /// As [`add_file`](Self::add_file).
-    pub fn add_file_set(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: as `add_file`.
-        let code = unsafe {
-            cel_engine_add_file_set(self.raw, bytes.as_ptr(), bytes.len(), &raw mut error)
-        };
         if code == CEL_OK {
             Ok(())
         } else {
@@ -363,6 +347,7 @@ impl Engine {
         expressions: &[Expression<'_>],
     ) -> Result<Program, Error> {
         let (type_name, bytes) = rules.unwrap_or(("", &[]));
+        check_len("rules message", bytes)?;
         let ffi_rules: Vec<CelRule> = expressions
             .iter()
             .map(|expression| CelRule {
@@ -403,6 +388,7 @@ impl Engine {
     /// [`Error::Argument`] for an unknown type or a payload that does not
     /// parse.
     pub fn frame(&self, type_name: &str, payload: &[u8]) -> Result<Frame, Error> {
+        check_len("payload", payload)?;
         let mut out: *mut CelFrame = ptr::null_mut();
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: `self.raw` is a live engine; `type_name` and `payload` are
@@ -444,38 +430,37 @@ unsafe impl Send for Program {}
 unsafe impl Sync for Program {}
 
 impl Program {
-    /// Evaluates every expression against `this`, returning the ones that
-    /// failed. With `fail_fast`, stops after the first failure.
+    /// Evaluates expression `index` against `this`, returning what it
+    /// produced.
     ///
     /// # Errors
     ///
     /// [`Error::Runtime`] for an expression that fails to evaluate or
-    /// produces neither a bool nor a string; [`Error::Argument`] for a
-    /// `this` field that does not exist.
-    pub fn eval(&self, this: This<'_>, fail_fast: bool) -> Result<Vec<Failure>, Error> {
+    /// produces an error; [`Error::Argument`] for a `this` field that does
+    /// not exist.
+    pub fn eval(&self, index: usize, this: This<'_>) -> Result<Value, Error> {
         let (kind, scalar, frame, field_number) = match this {
             This::Scalar(scalar) => (CEL_THIS_SCALAR, Some(scalar.to_ffi()), ptr::null(), 0),
             This::Message(frame) => (CEL_THIS_MESSAGE, None, frame.0.cast_const(), 0),
             This::Field(frame, number) => (CEL_THIS_FIELD, None, frame.0.cast_const(), number),
         };
-        let mut out: *mut CelFailure = ptr::null_mut();
-        let mut out_len: usize = 0;
+        let mut out = other_value();
         let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: `self.0` is a live program; the scalar and its borrowed
-        // string storage outlive the call, as does `frame` (`This`'s
-        // lifetime); `out`, `out_len` and `error` are live out-params.
+        // SAFETY: `self.0` is a live program and `index` is one of its
+        // expressions; the scalar and its borrowed string storage outlive the
+        // call, as does `frame` (`This`'s lifetime); `out` and `error` are
+        // live out-params.
         let code = unsafe {
             cel_program_eval(
                 self.0,
+                index,
                 kind,
                 scalar
                     .as_ref()
                     .map_or(ptr::null(), |scalar| &raw const *scalar),
                 frame,
                 field_number,
-                c_int::from(fail_fast),
                 &raw mut out,
-                &raw mut out_len,
                 &raw mut error,
             )
         };
@@ -483,28 +468,18 @@ impl Program {
             // SAFETY: a non-OK code means the shim stored an owned message.
             return Err(unsafe { status_error(code, error) });
         }
-        if out.is_null() {
-            return Ok(Vec::new());
-        }
-        // SAFETY: the shim returned `out_len` initialized failures.
-        let raw = unsafe { slice::from_raw_parts(out, out_len) };
-        let failures = raw
-            .iter()
-            .map(|failure| Failure {
-                index: failure.index,
-                message: (!failure.message.is_null()).then(|| {
-                    // SAFETY: a non-null message is `message_len` bytes the
-                    // shim allocated, live until the free below.
-                    let bytes = unsafe {
-                        slice::from_raw_parts(failure.message.cast::<u8>(), failure.message_len)
-                    };
-                    String::from_utf8_lossy(bytes).into_owned()
-                }),
-            })
-            .collect();
-        // SAFETY: shim-allocated, and this is the last use of the array.
-        unsafe { cel_failures_free(out, out_len) };
-        Ok(failures)
+        Ok(match out.kind {
+            CEL_VALUE_BOOL => Value::Bool(out.bool_value != 0),
+            CEL_VALUE_STRING => {
+                // SAFETY: a string result points at `len` bytes the shim
+                // allocated, live until the free below.
+                let text = String::from_utf8_lossy(unsafe { ffi_bytes(&out) }).into_owned();
+                // SAFETY: shim-allocated, and this is the last use of it.
+                unsafe { cel_free(out.data.cast_mut()) };
+                Value::String(text)
+            }
+            _ => Value::Other,
+        })
     }
 }
 

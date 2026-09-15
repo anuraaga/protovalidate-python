@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// C ABI over cel-cpp with the standard functions, the string extensions, and
-// the functions the Rust side registers (isEmail, isIp, unique, ...). The
-// protovalidate logic itself -- walking messages, deciding which rules apply,
-// building violations -- lives on the Rust side; this shim only compiles CEL
-// expressions and evaluates them against values the Rust side describes.
+// The C ABI over cel-cpp that the `protovalidate-deps` crate calls.
 //
-// Nothing but bytes and primitives crosses this boundary. Descriptors arrive
-// as serialized google.protobuf.FileDescriptorProto, messages as serialized
-// payloads parsed here into a pool the Rust side keeps in sync with its own.
+// This is a marshalling layer, nothing more: it parses, compiles and
+// evaluates through cel-cpp and protobuf and reports what they say. Every
+// precondition is the caller's -- pointers are valid for the call, lengths
+// fit in an int, indices are in range, an engine is never used from two
+// threads while it is being mutated -- and nothing here checks them.
 
 #ifndef PROTOVALIDATE_SHIM_CEL_SHIM_H_
 #define PROTOVALIDATE_SHIM_CEL_SHIM_H_
@@ -32,18 +30,21 @@
 extern "C" {
 #endif
 
-// A descriptor pool, message factory, and CEL expression builder. Not thread-safe
-// for concurrent compile along with evaluation.
+// A descriptor pool, message factory, and CEL expression builder.
+// cel_engine_add_file, cel_engine_register and cel_program_new mutate it.
+// cel_frame_new only reads the pool and the message factory, both safe for
+// concurrent readers.
 typedef struct cel_engine cel_engine;
 
-// A set of compiled CEL expressions sharing one `rules` message. Immutable and
-// thread-safe once built.
+// A set of compiled CEL expressions sharing one `rules` message. Immutable
+// once built.
 typedef struct cel_program cel_program;
 
-// A parsed message, owning the arena it and its sub-messages live in.
+// A parsed message, owning the arena it lives in.
 typedef struct cel_frame cel_frame;
 
-// Status codes returned by the fallible entry points.
+// Status codes returned by the fallible entry points. Every failure stores a
+// malloc'd message in *error, which the caller releases with cel_free.
 enum {
   CEL_OK = 0,
   CEL_ERR_COMPILATION = 1,  // an expression could not be compiled
@@ -52,9 +53,10 @@ enum {
   CEL_ERR_UNEXPECTED = 4,   // anything else
 };
 
-// The kind of a cel_value.
+// The kind of a cel_value. CEL_VALUE_OTHER is anything without a cel_value
+// form -- a message, a map, null -- where it can be handed over at all.
 enum {
-  CEL_VALUE_NULL = 0,
+  CEL_VALUE_OTHER = 0,
   CEL_VALUE_BOOL = 1,
   CEL_VALUE_INT = 2,     // int32/int64/sint*/sfixed*/enum
   CEL_VALUE_UINT = 3,    // uint32/uint64/fixed*
@@ -67,7 +69,7 @@ enum {
 typedef struct cel_list cel_list;
 
 // A value. `data`/`len` are only read for strings and bytes, `list` only for
-// lists; all are borrowed for the duration of the call they are passed to.
+// lists. Unless a function says otherwise they are borrowed for the call.
 typedef struct cel_value {
   int32_t kind;
   int32_t bool_value;
@@ -79,9 +81,9 @@ typedef struct cel_value {
   const cel_list* list;
 } cel_value;
 
-// One expression to compile. Strings are borrowed for the duration of the
-// call. `rule_field_number` names the field of the rules message that the
-// `rule` variable is bound to while this expression runs, or 0 for none.
+// One expression to compile. `rule_field_number` names the field of the
+// rules message that the `rule` variable is bound to while this expression
+// runs, or 0 for none.
 typedef struct cel_rule {
   const char* expression;
   size_t expression_len;
@@ -96,38 +98,24 @@ enum {
                         // a map, or a singular value, by the field's descriptor
 };
 
-// One failed expression: `index` into the compiled rules, and the message the
-// expression produced when it evaluated to a string (NULL when it evaluated
-// to false).
-typedef struct cel_failure {
-  size_t index;
-  char* message;
-  size_t message_len;
-} cel_failure;
-
 // Creates an engine over a descriptor pool layered on the descriptors linked
 // into this library (the well-known types).
-//
-// On failure returns NULL and, if `error` is non-NULL, stores a malloc'd
-// message in *error which the caller must release with cel_free.
 cel_engine* cel_engine_new(char** error);
 
 void cel_engine_free(cel_engine* engine);
 
-// A function implemented by the caller. `args` are the call's arguments, of
-// the kinds the function was registered with. On success returns CEL_OK with
-// the result in *out (a scalar; strings and bytes are copied). Otherwise
-// returns another code with a message from cel_string_new in *error, which
-// the expression sees as an error value.
+// A predicate implemented by the caller. `args` are the call's arguments, of
+// the kinds the function was registered with. Returns CEL_OK with the result
+// in *out, or another code with a message from cel_string_new in *error,
+// which the expression sees as an error value.
 typedef int (*cel_native_fn)(void* ctx, const cel_value* args, size_t len,
-                             cel_value* out, char** error);
+                             int* out, char** error);
 
 // Registers `fn` as CEL function `name`, callable on arguments of the given
 // kinds (CEL_VALUE_*, one per argument); `receiver_style` makes the first
 // argument the receiver, as in `this.isEmail()`. The same name may be
 // registered with several kind lists, which CEL resolves by argument type.
-// Register before compiling anything. Returns CEL_ERR_ARGUMENT for an
-// unusable kind or a duplicate registration.
+// Register before compiling anything.
 int cel_engine_register(cel_engine* engine, const char* name, size_t name_len,
                         int receiver_style, const int32_t* arg_kinds,
                         size_t arity, cel_native_fn fn, void* ctx,
@@ -136,33 +124,26 @@ int cel_engine_register(cel_engine* engine, const char* name, size_t name_len,
 // A list passed to a registered function, valid for that call.
 size_t cel_list_len(const cel_list* list);
 
-// Reads element `index` into *out. Elements that are not scalars or lists
-// read as CEL_VALUE_NULL. Returns CEL_ERR_ARGUMENT past the end.
-int cel_list_get(const cel_list* list, size_t index, cel_value* out,
-                 char** error);
+// Reads element `index` into *out; one without a cel_value form reads as
+// CEL_VALUE_OTHER.
+void cel_list_get(const cel_list* list, size_t index, cel_value* out);
 
 // Allocates a string the shim releases: for a registered function's error.
 char* cel_string_new(const char* data, size_t len);
 
 // Adds one serialized FileDescriptorProto to the engine's pool. Adding a file
-// whose name is already known is a no-op success. A file's imports must be
-// added before the file itself.
+// the pool already has -- linked in, or added before -- is a no-op success.
+// A file's imports must be added before the file itself.
 int cel_engine_add_file(cel_engine* engine, const uint8_t* file_descriptor_proto,
                        size_t len, char** error);
 
-// Adds every file in one serialized FileDescriptorSet, in order, with the
-// same semantics as cel_engine_add_file.
-int cel_engine_add_file_set(cel_engine* engine,
-                           const uint8_t* file_descriptor_set, size_t len,
-                           char** error);
-
-// Compiles `rules` expressions that share one `rules` message: a serialized
-// message of the type named by `rules_type_name`, or none when
-// `rules_type_name_len` is 0, in which case `rules` is bound to null.
+// Compiles expressions that share one `rules` message: a serialized message
+// of the type named by `rules_type_name`, or none when `rules_type_name_len`
+// is 0, in which case `rules` is bound to null.
 //
-// On CEL_OK stores the program in *out. On failure returns CEL_ERR_COMPILATION
-// (or CEL_ERR_ARGUMENT for an unknown rules type or unparsable rules) and
-// stores a malloc'd message in *error.
+// On CEL_OK stores the program in *out. Returns CEL_ERR_COMPILATION for an
+// expression that does not compile and CEL_ERR_ARGUMENT for an unknown rules
+// type, unparsable rules, or a rule field that does not exist.
 int cel_program_new(cel_engine* engine, const char* rules_type_name,
                    size_t rules_type_name_len, const uint8_t* rules,
                    size_t rules_len, const cel_rule* exprs, size_t exprs_len,
@@ -170,33 +151,28 @@ int cel_program_new(cel_engine* engine, const char* rules_type_name,
 
 void cel_program_free(cel_program* program);
 
-// Parses `payload` as the message type named by `type_name`.
-//
-// On CEL_OK stores the frame in *out. On failure returns CEL_ERR_ARGUMENT and
-// stores a malloc'd message in *error.
+// Parses `payload` as the message type named by `type_name`. On CEL_OK stores
+// the frame in *out; returns CEL_ERR_ARGUMENT for an unknown type or a payload
+// that does not parse.
 int cel_frame_new(cel_engine* engine, const char* type_name,
                  size_t type_name_len, const uint8_t* payload,
                  size_t payload_len, cel_frame** out, char** error);
 
 void cel_frame_free(cel_frame* frame);
 
-// Evaluates every expression of `program` against `this`, described by
+// Evaluates expression `index` of `program` against `this`, described by
 // `this_kind` and, depending on it, `scalar`, `frame`, and `field_number`.
 //
-// On CEL_OK stores a malloc'd array of the failed expressions in *out and its
-// length in *out_len (NULL and 0 when everything passed); release it with
-// cel_failures_free. With `fail_fast`, evaluation stops after the first
-// failure. On failure returns CEL_ERR_RUNTIME (an expression produced an error
-// or a value that is neither bool nor string) or CEL_ERR_ARGUMENT (a field
-// that does not exist) and stores a malloc'd message in *error.
-int cel_program_eval(const cel_program* program, int this_kind,
+// On CEL_OK stores the result in *out: CEL_VALUE_BOOL, CEL_VALUE_STRING with
+// `data` malloc'd for the caller to release with cel_free, or CEL_VALUE_OTHER
+// for anything else. Returns CEL_ERR_RUNTIME when the expression fails to
+// evaluate or produces an error value, and CEL_ERR_ARGUMENT for a `this`
+// field that does not exist.
+int cel_program_eval(const cel_program* program, size_t index, int this_kind,
                     const cel_value* scalar, const cel_frame* frame,
-                    int32_t field_number, int fail_fast, cel_failure** out,
-                    size_t* out_len, char** error);
+                    int32_t field_number, cel_value* out, char** error);
 
-void cel_failures_free(cel_failure* failures, size_t len);
-
-// Releases an error string.
+// Releases a string or buffer the shim allocated.
 void cel_free(void* ptr);
 
 #ifdef __cplusplus
