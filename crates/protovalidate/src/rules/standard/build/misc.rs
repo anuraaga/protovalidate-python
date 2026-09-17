@@ -15,7 +15,7 @@
 //! The bool, enum, bytes, repeated, map and field mask rules.
 
 use super::{Native, regex};
-use crate::rules::CompileError;
+use crate::Error;
 use crate::rules::standard::format::{Hex, List, Text};
 use crate::rules::standard::{BytesTest, Cmp, FieldMaskTest, ListTest, MapTest, Test};
 use crate::validate::__buffa::oneof;
@@ -67,7 +67,7 @@ pub(super) fn bytes_checks(
     prefix: &str,
     r: &BytesRules,
     number: u32,
-) -> Result<Vec<Native>, CompileError> {
+) -> Result<Vec<Native>, Error> {
     let bytes_check = |suffix: &str, message: String, test: BytesTest| {
         Ok(vec![Native::new(
             prefix,

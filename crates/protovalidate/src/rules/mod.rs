@@ -32,11 +32,6 @@ use crate::protobuf::Field;
 use crate::validate::FieldPathElement;
 use standard::Check;
 
-/// Compilation failed: a rule does not fit its field, does not parse, or
-/// cannot be planned.
-#[derive(Debug)]
-pub(crate) struct CompileError(pub String);
-
 #[cfg(feature = "cel")]
 /// What a CEL expression reports when it fails.
 pub(crate) struct RuleMeta {
@@ -101,6 +96,25 @@ pub(crate) enum Shape {
     Map { key: ScalarType },
 }
 
+/// The rules of one value: a field's, or one element, key or value of a
+/// container field's. The checks run first, then the custom CEL.
+pub(crate) struct ValueRules {
+    /// The value is a scalar (as opposed to a message) so `this` is bound
+    /// directly rather than through the frame.
+    #[cfg(feature = "cel")]
+    pub scalar: Option<ScalarKind>,
+    pub ignore_empty: bool,
+    pub any: Option<AnyCheck>,
+    /// The standard rules, in evaluation order.
+    pub checks: Vec<Check>,
+    /// The value is a wrapper message, and the checks apply to this field
+    /// of it: its `value`.
+    pub wrapper: Option<Field>,
+    /// The custom CEL rules, which run after the standard ones.
+    #[cfg(feature = "cel")]
+    pub programs: Option<ProgramSet>,
+}
+
 /// The rules of one field.
 pub(crate) struct FieldEvaluator {
     pub field: Field,
@@ -109,21 +123,8 @@ pub(crate) struct FieldEvaluator {
     /// the key subscript is added for per-entry violations.
     pub entry_element: Option<FieldPathElement>,
     pub shape: Shape,
-    /// The field holds scalars (as opposed to messages) so `this` is bound
-    /// directly rather than through the frame.
-    #[cfg(feature = "cel")]
-    pub scalar: Option<ScalarKind>,
     pub required: bool,
-    pub ignore_empty: bool,
-    pub any: Option<AnyCheck>,
-    /// The standard rules, in evaluation order.
-    pub checks: Vec<Check>,
-    /// The field is a wrapper message, and the checks apply to this field
-    /// of it: its `value`.
-    pub wrapper: Option<Field>,
-    /// The custom CEL rules, which run after the standard ones.
-    #[cfg(feature = "cel")]
-    pub programs: Option<ProgramSet>,
+    pub rules: ValueRules,
     /// `enum.defined_only`, checked against this enum's values.
     pub defined_only: Option<EnumIndex>,
     pub items: Option<ItemEvaluator>,
@@ -134,15 +135,7 @@ pub(crate) struct FieldEvaluator {
 /// The rules of the elements of a repeated field, or the keys or values of
 /// a map.
 pub(crate) struct ItemEvaluator {
-    /// As [`FieldEvaluator::scalar`].
-    #[cfg(feature = "cel")]
-    pub scalar: Option<ScalarKind>,
-    pub ignore_empty: bool,
-    pub any: Option<AnyCheck>,
-    pub checks: Vec<Check>,
-    pub wrapper: Option<Field>,
-    #[cfg(feature = "cel")]
-    pub programs: Option<ProgramSet>,
+    pub rules: ValueRules,
     /// The rule path elements between the item rules and `FieldRules`, leaf
     /// first: `[RepeatedRules.items, FieldRules.repeated]`.
     pub rule_prefix: [FieldPathElement; 2],

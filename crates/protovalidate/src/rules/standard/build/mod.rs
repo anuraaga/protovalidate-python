@@ -32,7 +32,7 @@ use regex::Regex;
 
 use super::format::{Duration, List, Timestamp};
 use super::{Cmp, MaybeNan, NowTest, Test};
-use crate::rules::CompileError;
+use crate::Error;
 use crate::validate::__buffa::oneof;
 use crate::validate::__buffa::oneof::field_rules::Type as RulesType;
 use crate::validate::TimestampRules;
@@ -277,18 +277,14 @@ fn timestamp(t: &TimestampPb) -> Timestamp {
     Timestamp(i128::from(t.seconds) * 1_000_000_000 + i128::from(t.nanos))
 }
 
-pub(super) fn regex(pattern: &str) -> Result<Regex, CompileError> {
+pub(super) fn regex(pattern: &str) -> Result<Regex, Error> {
     Regex::new(pattern)
-        .map_err(|error| CompileError(format!("invalid regex pattern `{pattern}`: {error}")))
+        .map_err(|error| Error::Compilation(format!("invalid regex pattern `{pattern}`: {error}")))
 }
 
 /// The checks of rule field `number` of `rules`; `prefix` is the rule id's
 /// type, `string` say.
-pub(crate) fn checks(
-    prefix: &str,
-    rules: &RulesType,
-    number: u32,
-) -> Result<Vec<Native>, CompileError> {
+pub(crate) fn checks(prefix: &str, rules: &RulesType, number: u32) -> Result<Vec<Native>, Error> {
     let one = |native: Option<Native>| Ok(native.into_iter().collect());
     match rules {
         RulesType::Float(r) => {

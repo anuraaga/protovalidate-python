@@ -21,18 +21,25 @@
 //! the message itself, a repeated field or a map to `this`.
 //!
 //! The validator describes each field it asks for, so what is left to know
-//! is runtime-specific: the attribute a field is read from, and when it
-//! counts as set, which [`TypeInfo`] records once per message class. The
-//! traits have no error channel, so the first Python error is kept on the
-//! [`Ctx`] and raised once validation returns.
+//! is runtime-specific: the attribute a field is read from, and how the
+//! runtime tracks that it is set, which [`TypeInfo`] records once per
+//! message class. A Python error raised while reading goes back through
+//! the validator as a `ReadError`, and is raised again from the call.
 
-use std::cell::{OnceCell, RefCell};
+// The value chain -- the trait's `get`s through `convert`, `singular` and
+// `scalar_value` -- has to be inlined into the walk. Left to the optimizer
+// it is not, and element-heavy messages validate 5-12% slower; `#[inline]`
+// alone does not do it. Measured with the throughput loop in the
+// benchmarks, not assumed.
+#![allow(clippy::inline_always)]
+
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::{Arc, RwLock};
 
 use protovalidate::protobuf::{
-    Field, Key, Kind, List, Map, Message, Payload, Runtime, Scalar, Singular, Val,
+    Field, Key, Kind, List, Map, Message, ReadError, Runtime, Scalar, Singular, Val,
 };
 use protovalidate::{Error, Validator};
 use pyo3::prelude::*;
@@ -67,22 +74,8 @@ struct FieldInfo {
     oneof: Option<(Py<PyString>, Py<PyString>)>,
 }
 
-/// When a field counts as set.
-#[derive(Clone, Copy)]
-enum Presence {
-    /// google.protobuf tracks it: `HasField`.
-    HasField,
-    /// protobuf-py tracks it in the message's `_present` set.
-    Tracked,
-    /// protobuf-py oneof member: set when the oneof selects it.
-    Oneof,
-    /// Derived from the value: non-default scalar, non-`None` message,
-    /// non-empty list or map.
-    Value,
-}
-
 impl TypeInfo {
-    fn build(ctx: &Ctx<'_>, class: &Bound<'_, PyType>) -> PyResult<Self> {
+    fn build(ctx: &Ctx<'_>, class: &Bound<'_, PyType>) -> Result<Self, ReadError> {
         let constants = ctx.constants;
         let intern = |name: Bound<'_, PyAny>| -> PyResult<Py<PyString>> {
             let name = name.cast_into::<PyString>()?;
@@ -156,8 +149,6 @@ pub(crate) struct Ctx<'py> {
     runtime: ProtoRuntime,
     types: &'py TypeCache,
     constants: &'py Constants,
-    /// The first Python error raised while reading the message.
-    error: RefCell<Option<PyErr>>,
 }
 
 impl<'py> Ctx<'py> {
@@ -172,67 +163,44 @@ impl<'py> Ctx<'py> {
             runtime,
             types,
             constants,
-            error: RefCell::new(None),
         }
     }
 
     /// Validates `message`, of type `type_name`, in place.
-    ///
-    /// A Python error raised while reading the message takes precedence
-    /// over the validation result.
     pub(crate) fn validate(
         &self,
         validator: &Validator,
         type_name: &str,
         message: &Bound<'py, PyAny>,
         fail_fast: bool,
-    ) -> PyResult<Result<(), Error>> {
-        let root = MessageView::new(self, message.clone());
-        let encode = || self.serialize(message);
-        let result = validator.validate_message::<PyRuntime>(
-            type_name,
-            &root,
-            Payload::Encode(&encode),
-            fail_fast,
-        );
-        match self.error.take() {
-            Some(error) => Err(error),
-            None => Ok(result),
-        }
+    ) -> Result<(), Error> {
+        let root = MessageView::new(self, message.clone())?;
+        validator.validate_message::<PyRuntime>(type_name, &root, fail_fast)
     }
 
     /// The serialized message, for CEL.
-    fn serialize(&self, message: &Bound<'py, PyAny>) -> Vec<u8> {
-        self.ok(self.runtime.payload(message, self.constants))
-            .map(|bytes| bytes.as_bytes().to_vec())
-            .unwrap_or_default()
-    }
-
-    /// Unwraps a Python result, keeping the first error for `validate`.
-    fn ok<T>(&self, result: PyResult<T>) -> Option<T> {
-        match result {
-            Ok(value) => Some(value),
-            Err(error) => {
-                self.error.borrow_mut().get_or_insert(error);
-                None
-            }
-        }
+    fn serialize(&self, message: &Bound<'py, PyAny>) -> Result<Vec<u8>, ReadError> {
+        Ok(self
+            .runtime
+            .payload(message, self.constants)?
+            .as_bytes()
+            .to_vec())
     }
 
     /// The type information of `object`'s class, built on first use.
-    fn type_info(&self, object: &Bound<'py, PyAny>) -> Option<Arc<TypeInfo>> {
+    fn type_info(&self, object: &Bound<'py, PyAny>) -> Result<Arc<TypeInfo>, ReadError> {
         let class = object.get_type();
         let key = class.as_ptr().addr();
         if let Some(cached) = self.types.0.read_py_attached(self.py).unwrap().get(&key) {
-            return Some(Arc::clone(&cached.info));
+            return Ok(Arc::clone(&cached.info));
         }
-        let info = Arc::new(self.ok(TypeInfo::build(self, &class))?);
+        let info = Arc::new(TypeInfo::build(self, &class)?);
         let mut types = self.types.0.write_py_attached(self.py).unwrap();
         let cached = types.entry(key).or_insert(CachedType {
             _class: class.unbind(),
             info,
         });
-        Some(Arc::clone(&cached.info))
+        Ok(Arc::clone(&cached.info))
     }
 }
 
@@ -240,8 +208,7 @@ impl<'py> Ctx<'py> {
 pub(crate) struct MessageView<'a> {
     ctx: &'a Ctx<'a>,
     /// `None` for a protobuf-py message field that is not set, which reads
-    /// as a message with nothing set; also `None` when building the type
-    /// information failed.
+    /// as a message with nothing set.
     info: Option<Arc<TypeInfo>>,
     object: Bound<'a, PyAny>,
     /// Field values already fetched, by position in `info.fields`, so a
@@ -250,31 +217,42 @@ pub(crate) struct MessageView<'a> {
 }
 
 impl<'a> MessageView<'a> {
-    fn new(ctx: &'a Ctx<'a>, object: Bound<'a, PyAny>) -> Self {
+    fn new(ctx: &'a Ctx<'a>, object: Bound<'a, PyAny>) -> Result<Self, ReadError> {
         let info = if object.is_none() {
             None
         } else {
-            ctx.type_info(&object)
+            Some(ctx.type_info(&object)?)
         };
         let slots = info.as_ref().map_or(0, |info| info.fields.len());
-        Self {
+        Ok(Self {
             ctx,
             info,
             object,
             slots: std::iter::repeat_with(OnceCell::new).take(slots).collect(),
-        }
+        })
     }
 
     /// The field's value, `None` when it is not set and the runtime has no
     /// default object for it: a protobuf-py message field, or a oneof
     /// member the oneof does not select.
-    fn value(&self, slot: usize, field: &FieldInfo) -> Option<&Bound<'a, PyAny>> {
-        self.slots[slot]
-            .get_or_init(|| self.ctx.ok(self.fetch(field)).flatten())
-            .as_ref()
+    fn value(
+        &self,
+        slot: usize,
+        field: &FieldInfo,
+    ) -> Result<Option<&Bound<'a, PyAny>>, ReadError> {
+        let cell = &self.slots[slot];
+        if let Some(value) = cell.get() {
+            return Ok(value.as_ref());
+        }
+        let fetched = self.fetch(field)?;
+        Ok(cell.get_or_init(|| fetched).as_ref())
     }
 
-    fn fetch(&self, field: &FieldInfo) -> PyResult<Option<Bound<'a, PyAny>>> {
+    /// Reads the field off the Python object. Out of line, so that
+    /// [`value`](Self::value), which runs per field, stays small enough to
+    /// inline into the walk.
+    #[inline(never)]
+    fn fetch(&self, field: &FieldInfo) -> Result<Option<Bound<'a, PyAny>>, ReadError> {
         let constants = self.ctx.constants;
         if let Some((oneof, name)) = &field.oneof {
             let selected = self.object.getattr(oneof)?;
@@ -290,104 +268,92 @@ impl<'a> MessageView<'a> {
         Ok((!value.is_none()).then_some(value))
     }
 
-    fn has_field(&self, field: &FieldInfo) -> PyResult<bool> {
+    fn has_field(&self, field: &FieldInfo) -> Result<bool, ReadError> {
         let constants = self.ctx.constants;
-        self.object
+        Ok(self
+            .object
             .call_method1(&constants.has_field, (&field.attr,))?
-            .extract()
+            .extract()?)
     }
 
-    fn tracked(&self, field: &FieldInfo) -> PyResult<bool> {
-        self.object
+    fn tracked(&self, field: &FieldInfo) -> Result<bool, ReadError> {
+        Ok(self
+            .object
             .getattr(&self.ctx.constants.present)?
-            .contains(field.number)
+            .contains(field.number)?)
     }
 
-    /// When the field counts as set, by the runtime and what the validator
-    /// says of the field.
-    fn presence(&self, field: &Field, stored: &FieldInfo) -> Presence {
+    /// Whether a field that tracks presence is set, the way its runtime
+    /// tracks it.
+    fn is_set(&self, field: &Field, slot: usize, stored: &FieldInfo) -> Result<bool, ReadError> {
         match self.ctx.runtime {
-            ProtoRuntime::Google => match field.kind() {
-                Kind::Singular(Singular::Message) => Presence::HasField,
-                Kind::Singular(_) if field.has_presence() => Presence::HasField,
-                _ => Presence::Value,
-            },
+            // google.protobuf tracks it: `HasField`.
+            ProtoRuntime::Google => self.has_field(stored),
+            // protobuf-py: a oneof member is set when the oneof selects it,
+            // a message field when it is not `None`, and any other field
+            // when it is in the message's `_present` set.
+            ProtoRuntime::ProtobufPy if stored.oneof.is_some() => {
+                Ok(self.value(slot, stored)?.is_some())
+            }
             ProtoRuntime::ProtobufPy => match field.kind() {
-                _ if stored.oneof.is_some() => Presence::Oneof,
-                Kind::Singular(Singular::Message) => Presence::Value,
-                Kind::Singular(_) if field.has_presence() => Presence::Tracked,
-                _ => Presence::Value,
+                Kind::Singular(Singular::Message) => Ok(self.value(slot, stored)?.is_some()),
+                _ => self.tracked(stored),
             },
         }
+    }
+
+    fn read(&self, field: &Field) -> Result<Option<Val<'_, PyRuntime>>, ReadError> {
+        let Some(info) = &self.info else {
+            // Nothing is set: every field reads as its default.
+            return Ok(Some(convert(self.ctx, field.kind(), None)?));
+        };
+        let Some((slot, stored)) = info.find(field.number()) else {
+            return Ok(None);
+        };
+        Ok(Some(convert(
+            self.ctx,
+            field.kind(),
+            self.value(slot, stored)?,
+        )?))
     }
 }
 
 impl Message<PyRuntime> for MessageView<'_> {
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, ReadError> {
         // An unset protobuf-py message field is `None`, and reads as a
         // message with nothing set, which encodes to nothing.
         if self.object.is_none() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.ctx.serialize(&self.object)
     }
 
-    fn has(&self, field: &Field) -> bool {
+    fn has(&self, field: &Field) -> Result<bool, ReadError> {
         let Some(info) = &self.info else {
-            return false;
+            return Ok(false);
         };
         let Some((slot, stored)) = info.find(field.number()) else {
-            return false;
+            return Ok(false);
         };
-        match self.presence(field, stored) {
-            Presence::HasField => self.ctx.ok(self.has_field(stored)).unwrap_or(false),
-            Presence::Tracked => self.ctx.ok(self.tracked(stored)).unwrap_or(false),
-            Presence::Oneof => self.value(slot, stored).is_some(),
-            Presence::Value => match self.value(slot, stored) {
-                Some(value) => self.ctx.ok(is_set(field.kind(), value)).unwrap_or(false),
-                None => false,
-            },
-        }
+        self.is_set(field, slot, stored)
     }
 
-    fn get(&self, field: &Field) -> Option<Val<'_, PyRuntime>> {
-        let Some(info) = &self.info else {
-            // Nothing is set: every field reads as its default.
-            return Some(convert(self.ctx, field.kind(), None));
-        };
-        let (slot, stored) = info.find(field.number())?;
-        Some(convert(self.ctx, field.kind(), self.value(slot, stored)))
-    }
-}
-
-/// Whether a value counts as set for a field without tracked presence.
-fn is_set(kind: Kind, value: &Bound<'_, PyAny>) -> PyResult<bool> {
-    match kind {
-        Kind::Singular(Singular::Message) => Ok(!value.is_none()),
-        Kind::Singular(Singular::Enum) => Ok(value.extract::<i32>()? != 0),
-        Kind::Singular(Singular::Scalar(scalar)) => match scalar {
-            Scalar::Bool => value.extract(),
-            Scalar::Float | Scalar::Double => Ok(value.extract::<f64>()?.to_bits() != 0),
-            Scalar::String | Scalar::Bytes => Ok(value.len()? != 0),
-            // Signed or unsigned, zero is zero either way.
-            _ => Ok(value
-                .extract::<i64>()
-                .or_else(|_| value.extract::<u64>().map(u64::cast_signed))?
-                != 0),
-        },
-        Kind::List(_) | Kind::Map { .. } => Ok(value.len()? != 0),
+    #[inline(always)]
+    fn get(&self, field: &Field) -> Result<Option<Val<'_, PyRuntime>>, ReadError> {
+        self.read(field)
     }
 }
 
 /// A field's value as the validator sees it; the default when `value` is
 /// `None`.
+#[inline(always)]
 fn convert<'a>(
     ctx: &'a Ctx<'a>,
     kind: Kind,
     value: Option<&'a Bound<'a, PyAny>>,
-) -> Val<'a, PyRuntime> {
-    match kind {
-        Kind::Singular(kind) => singular(ctx, kind, value),
+) -> Result<Val<'a, PyRuntime>, ReadError> {
+    Ok(match kind {
+        Kind::Singular(kind) => singular(ctx, kind, value)?,
         Kind::List(element) => Val::List(ListView {
             ctx,
             element,
@@ -403,65 +369,65 @@ fn convert<'a>(
             element,
             object: value,
         }),
-    }
+    })
 }
 
+#[inline(always)]
 fn singular<'a>(
     ctx: &'a Ctx<'a>,
     kind: Singular,
     value: Option<&'a Bound<'a, PyAny>>,
-) -> Val<'a, PyRuntime> {
-    match kind {
+) -> Result<Val<'a, PyRuntime>, ReadError> {
+    Ok(match kind {
         Singular::Message => Val::Message(MessageView::new(
             ctx,
             value
                 .cloned()
                 .unwrap_or_else(|| ctx.py.None().into_bound(ctx.py)),
-        )),
-        Singular::Enum => Val::Enum(
-            value
-                .and_then(|value| ctx.ok(value.extract::<i32>()))
-                .unwrap_or_default(),
-        ),
+        )?),
+        Singular::Enum => Val::Enum(match value {
+            Some(value) => value.extract()?,
+            None => 0,
+        }),
         Singular::Scalar(scalar) => match value {
-            Some(value) => scalar_value(ctx, scalar, value),
+            Some(value) => scalar_value(scalar, value)?,
             None => default(scalar),
         },
-    }
+    })
 }
 
+#[inline(always)]
 fn scalar_value<'a>(
-    ctx: &'a Ctx<'a>,
     scalar: Scalar,
     value: &'a Bound<'a, PyAny>,
-) -> Val<'a, PyRuntime> {
-    match scalar {
-        Scalar::Bool => Val::Bool(ctx.ok(value.extract()).unwrap_or_default()),
+) -> Result<Val<'a, PyRuntime>, ReadError> {
+    Ok(match scalar {
+        Scalar::Bool => Val::Bool(value.extract()?),
         Scalar::Int32
         | Scalar::Int64
         | Scalar::Sint32
         | Scalar::Sint64
         | Scalar::Sfixed32
-        | Scalar::Sfixed64 => Val::Int(ctx.ok(value.extract()).unwrap_or_default()),
+        | Scalar::Sfixed64 => Val::Int(value.extract()?),
         Scalar::Uint32 | Scalar::Uint64 | Scalar::Fixed32 | Scalar::Fixed64 => {
-            Val::Uint(ctx.ok(value.extract()).unwrap_or_default())
+            Val::Uint(value.extract()?)
         }
-        Scalar::Float | Scalar::Double => Val::Double(ctx.ok(value.extract()).unwrap_or_default()),
+        Scalar::Float | Scalar::Double => Val::Double(value.extract()?),
         Scalar::String => Val::String(
-            ctx.ok(value
+            value
                 .cast::<PyString>()
-                .map_err(PyErr::from)
-                .and_then(|s| s.to_str()))
-                .unwrap_or_default()
+                .map_err(PyErr::from)?
+                .to_str()?
                 .into(),
         ),
         Scalar::Bytes => Val::Bytes(
-            ctx.ok(value.cast::<PyBytes>().map_err(PyErr::from))
-                .map(pyo3::types::PyBytesMethods::as_bytes)
-                .unwrap_or_default()
+            value
+                .cast::<PyBytes>()
+                .map_err(PyErr::from)?
+                .as_bytes()
                 .into(),
         ),
-    }
+    })
 }
 
 fn default<'a>(scalar: Scalar) -> Val<'a, PyRuntime> {
@@ -480,8 +446,8 @@ fn default<'a>(scalar: Scalar) -> Val<'a, PyRuntime> {
     }
 }
 
-fn key<'a>(ctx: &'a Ctx<'a>, scalar: Scalar, value: &'a Bound<'a, PyAny>) -> Key<'a> {
-    match scalar_value(ctx, scalar, value) {
+fn key<'a>(scalar: Scalar, value: &'a Bound<'a, PyAny>) -> Result<Key<'a>, ReadError> {
+    Ok(match scalar_value(scalar, value)? {
         Val::Bool(b) => Key::Bool(b),
         Val::Int(i) => Key::Int(i),
         Val::Uint(u) => Key::Uint(u),
@@ -493,7 +459,7 @@ fn key<'a>(ctx: &'a Ctx<'a>, scalar: Scalar, value: &'a Bound<'a, PyAny>) -> Key
         | Val::Message(_)
         | Val::List(_)
         | Val::Map(_) => Key::Int(0),
-    }
+    })
 }
 
 /// A repeated field: a `list` for protobuf-py, a repeated container for
@@ -510,36 +476,46 @@ pub(crate) struct ListView<'a> {
 }
 
 impl<'a> ListView<'a> {
-    fn items(&self) -> &[Bound<'a, PyAny>] {
-        self.items.get_or_init(|| {
-            let Some(object) = self.object else {
-                return Vec::new();
-            };
-            let items = match object.cast::<PyList>() {
-                Ok(list) => Ok(list.iter().collect()),
-                Err(_) => object
-                    .try_iter()
-                    .and_then(Iterator::collect::<PyResult<Vec<_>>>),
-            };
-            self.ctx.ok(items).unwrap_or_default()
+    fn items(&self) -> Result<&[Bound<'a, PyAny>], ReadError> {
+        if let Some(items) = self.items.get() {
+            return Ok(items);
+        }
+        let items = self.fetch_items()?;
+        Ok(self.items.get_or_init(|| items))
+    }
+
+    /// Reads the elements off the Python object. Out of line, so that
+    /// [`get`](List::get), which runs per element, stays small enough to
+    /// inline into the walk.
+    #[inline(never)]
+    fn fetch_items(&self) -> Result<Vec<Bound<'a, PyAny>>, ReadError> {
+        let Some(object) = self.object else {
+            return Ok(Vec::new());
+        };
+        Ok(match object.cast::<PyList>() {
+            Ok(list) => list.iter().collect(),
+            Err(_) => object.try_iter()?.collect::<PyResult<Vec<_>>>()?,
         })
     }
 }
 
 impl List<PyRuntime> for ListView<'_> {
-    fn len(&self) -> usize {
-        match self.items.get() {
+    fn len(&self) -> Result<usize, ReadError> {
+        Ok(match self.items.get() {
             Some(items) => items.len(),
-            None => self
-                .object
-                .and_then(|object| self.ctx.ok(object.len()))
-                .unwrap_or(0),
-        }
+            None => match self.object {
+                Some(object) => object.len()?,
+                None => 0,
+            },
+        })
     }
 
-    fn get(&self, index: usize) -> Option<Val<'_, PyRuntime>> {
-        let item = self.items().get(index)?;
-        Some(singular(self.ctx, self.element, Some(item)))
+    #[inline(always)]
+    fn get(&self, index: usize) -> Result<Option<Val<'_, PyRuntime>>, ReadError> {
+        match self.items()?.get(index) {
+            Some(item) => Ok(Some(singular(self.ctx, self.element, Some(item))?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -554,49 +530,45 @@ pub(crate) struct MapView<'a> {
 }
 
 impl Map<PyRuntime> for MapView<'_> {
-    fn len(&self) -> usize {
-        self.object
-            .and_then(|object| self.ctx.ok(object.len()))
-            .unwrap_or(0)
+    fn len(&self) -> Result<usize, ReadError> {
+        Ok(match self.object {
+            Some(object) => object.len()?,
+            None => 0,
+        })
     }
 
-    fn for_each(&self, f: &mut dyn FnMut(Key<'_>, Val<'_, PyRuntime>) -> ControlFlow<()>) {
+    fn for_each(
+        &self,
+        f: &mut dyn FnMut(Key<'_>, Val<'_, PyRuntime>) -> ControlFlow<()>,
+    ) -> Result<(), ReadError> {
         let Some(object) = self.object else {
-            return;
+            return Ok(());
         };
         if let Ok(dict) = object.cast::<PyDict>() {
             for (k, v) in dict.iter() {
-                let flow = f(
-                    key(self.ctx, self.key, &k),
-                    singular(self.ctx, self.element, Some(&v)),
-                );
-                if flow.is_break() {
-                    return;
+                if f(
+                    key(self.key, &k)?,
+                    singular(self.ctx, self.element, Some(&v))?,
+                )
+                .is_break()
+                {
+                    break;
                 }
             }
-            return;
+            return Ok(());
         }
-        let entries = object
-            .call_method0(&self.ctx.constants.items)
-            .and_then(|items| items.try_iter());
-        let Some(entries) = self.ctx.ok(entries) else {
-            return;
-        };
+        let entries = object.call_method0(&self.ctx.constants.items)?.try_iter()?;
         for entry in entries {
-            let Some((k, v)) =
-                self.ctx
-                    .ok(entry
-                        .and_then(|entry| entry.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()))
-            else {
-                return;
-            };
-            let flow = f(
-                key(self.ctx, self.key, &k),
-                singular(self.ctx, self.element, Some(&v)),
-            );
-            if flow.is_break() {
-                return;
+            let (k, v) = entry?.extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>)>()?;
+            if f(
+                key(self.key, &k)?,
+                singular(self.ctx, self.element, Some(&v))?,
+            )
+            .is_break()
+            {
+                break;
             }
         }
+        Ok(())
     }
 }

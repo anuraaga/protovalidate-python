@@ -14,8 +14,7 @@
 
 use std::fmt;
 
-use crate::rules::CompileError;
-use crate::rules::eval::EvalError;
+use crate::protobuf::ReadError;
 
 /// A descriptor that could not be registered.
 #[derive(Debug)]
@@ -53,6 +52,9 @@ pub enum Error {
     Evaluation(String),
     /// Bad input: an unparsable payload or an unknown type.
     Argument(String),
+    /// The runtime could not read the message: its own error, boxed, which
+    /// the caller that owns the runtime can downcast back.
+    Read(ReadError),
     /// A failure that fits no other category.
     Unexpected(String),
 }
@@ -64,46 +66,24 @@ impl fmt::Display for Error {
             Self::Compilation(message) => write!(f, "compilation error: {message}"),
             Self::Evaluation(message) => write!(f, "evaluation error: {message}"),
             Self::Argument(message) => write!(f, "invalid argument: {message}"),
+            Self::Read(error) => write!(f, "could not read message: {error}"),
             Self::Unexpected(message) => write!(f, "unexpected error: {message}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
-
-/// A failure of validation itself, before it is typed by violation.
-pub(crate) enum Internal {
-    Compilation(String),
-    Evaluation(String),
-    Argument(String),
-    Unexpected(String),
-}
-
-impl From<CompileError> for Internal {
-    fn from(error: CompileError) -> Self {
-        Self::Compilation(error.0)
-    }
-}
-
-impl From<EvalError> for Internal {
-    fn from(error: EvalError) -> Self {
-        match error {
-            EvalError::Runtime(message) => Self::Evaluation(message),
-            #[cfg(feature = "cel")]
-            EvalError::Argument(message) => Self::Argument(message),
-            EvalError::Unexpected(message) => Self::Unexpected(message),
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error.inner()),
+            _ => None,
         }
     }
 }
 
-impl From<Internal> for Error {
-    fn from(error: Internal) -> Self {
-        match error {
-            Internal::Compilation(message) => Self::Compilation(message),
-            Internal::Evaluation(message) => Self::Evaluation(message),
-            Internal::Argument(message) => Self::Argument(message),
-            Internal::Unexpected(message) => Self::Unexpected(message),
-        }
+impl From<ReadError> for Error {
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
     }
 }
 

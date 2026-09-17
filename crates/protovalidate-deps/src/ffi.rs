@@ -16,6 +16,7 @@
 //! here is raw; the safe API over it is the rest of the crate.
 
 use std::ffi::{c_char, c_int, c_void};
+use std::ptr;
 
 pub(crate) const CEL_OK: c_int = 0;
 pub(crate) const CEL_ERR_COMPILATION: c_int = 1;
@@ -66,6 +67,22 @@ pub(crate) struct CelValue {
     pub data: *const u8,
     pub len: usize,
     pub list: *const CelList,
+}
+
+/// Nothing set: `CEL_VALUE_OTHER` with every field zero.
+impl Default for CelValue {
+    fn default() -> Self {
+        Self {
+            kind: CEL_VALUE_OTHER,
+            bool_value: 0,
+            int_value: 0,
+            uint_value: 0,
+            double_value: 0.0,
+            data: ptr::null(),
+            len: 0,
+            list: ptr::null(),
+        }
+    }
 }
 
 /// One expression to compile; see `cel_rule` in `shim/cel_shim.h`.

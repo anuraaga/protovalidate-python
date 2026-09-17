@@ -35,13 +35,14 @@ use buffa_descriptor::{
 
 use super::standard::{self, Check};
 use super::{
-    AnyCheck, CompileError, FieldEvaluator, ItemEvaluator, MessageEvaluator, MessageOneof, Nested,
-    OneofRequired, Shape,
+    AnyCheck, FieldEvaluator, ItemEvaluator, MessageEvaluator, MessageOneof, Nested, OneofRequired,
+    Shape, ValueRules,
 };
 #[cfg(feature = "cel")]
 use super::{ProgramSet, RuleMeta, ScalarKind};
+use crate::Error;
 #[cfg(feature = "cel")]
-use crate::cel::{self, Env, Expression};
+use crate::cel::{Env, Expression};
 use crate::descriptors::{self, Descriptors};
 use crate::protobuf::Field;
 use crate::validate::__buffa::oneof::field_path_element::Subscript;
@@ -91,21 +92,14 @@ struct Target {
 }
 
 /// The rules of one value, before they are placed as a field or item
-/// evaluator.
+/// evaluator: the value's own, and the ones only a field carries.
 struct Built {
-    #[cfg(feature = "cel")]
-    scalar: Option<ScalarKind>,
-    checks: Vec<Check>,
-    wrapper: Option<Field>,
-    #[cfg(feature = "cel")]
-    programs: Option<ProgramSet>,
-    any: Option<AnyCheck>,
+    rules: ValueRules,
+    required: bool,
     defined_only: Option<EnumIndex>,
     items: Option<ItemEvaluator>,
     keys: Option<ItemEvaluator>,
     values: Option<ItemEvaluator>,
-    ignore_empty: bool,
-    required: bool,
 }
 
 /// The custom CEL of one field or message: the expressions to compile, what
@@ -145,11 +139,11 @@ impl Compiled {
 
     /// Custom CEL rules need the `cel` feature; fails if there are any.
     #[cfg(not(feature = "cel"))]
-    fn reject(self) -> Result<(), CompileError> {
+    fn reject(self) -> Result<(), Error> {
         if self.expressions.is_empty() {
             Ok(())
         } else {
-            Err(CompileError(
+            Err(Error::Compilation(
                 "custom CEL rules require the `cel` feature of the protovalidate crate".to_owned(),
             ))
         }
@@ -319,7 +313,7 @@ impl<'a> Builder<'a> {
         root: MessageIndex,
         known: &HashMap<MessageIndex, Arc<MessageEvaluator>>,
         out: &mut HashMap<MessageIndex, Arc<MessageEvaluator>>,
-    ) -> Result<(), CompileError> {
+    ) -> Result<(), Error> {
         // The reference is copied out of `self`, so the loop below can still
         // take `&mut self`.
         let descriptors: &'a Descriptors = self.descriptors;
@@ -341,10 +335,7 @@ impl<'a> Builder<'a> {
     }
 
     /// The rules of a message type.
-    fn build_message(
-        &mut self,
-        message: &MessageDescriptor,
-    ) -> Result<MessageEvaluator, CompileError> {
+    fn build_message(&mut self, message: &MessageDescriptor) -> Result<MessageEvaluator, Error> {
         let pool = &*self.descriptors.pool;
         let rules = descriptors::message_rules(message);
         let compiled = rules
@@ -372,7 +363,7 @@ impl<'a> Builder<'a> {
             if field_rules.ignore.is_none() && oneof_members.contains(field.name()) {
                 field_rules.ignore = Some(Ignore::IGNORE_IF_ZERO_VALUE);
             }
-            if let Some(evaluator) = self.build_field(message, field, &field_rules)? {
+            if let Some(evaluator) = self.build_field(field, &field_rules)? {
                 fields.push(evaluator);
             }
         }
@@ -401,7 +392,7 @@ impl<'a> Builder<'a> {
                     .field_indices()
                     .iter()
                     .filter_map(|&index| message.fields().get(usize::from(index)))
-                    .map(|field| Field::from_descriptor(pool, message, field))
+                    .map(|field| Field::from_descriptor(pool, field))
                     .collect(),
             })
             .collect()
@@ -429,7 +420,7 @@ impl<'a> Builder<'a> {
             }
             let shape = shape_of(field);
             nested.push(Nested {
-                field: Field::from_descriptor(pool, message, field),
+                field: Field::from_descriptor(pool, field),
                 element: match shape {
                     Shape::Map { .. } => entry_element(field),
                     Shape::Singular | Shape::List => descriptors::path_element(field),
@@ -444,10 +435,9 @@ impl<'a> Builder<'a> {
 
     fn build_field(
         &mut self,
-        message: &MessageDescriptor,
         field: &FieldDescriptor,
         rules: &FieldRules,
-    ) -> Result<Option<FieldEvaluator>, CompileError> {
+    ) -> Result<Option<FieldEvaluator>, Error> {
         let shape = shape_of(field);
         let kind = match field.kind() {
             FieldKind::Singular(kind) | FieldKind::List(kind) => kind,
@@ -464,22 +454,15 @@ impl<'a> Builder<'a> {
             return Ok(None);
         };
         Ok(Some(FieldEvaluator {
-            field: Field::from_descriptor(&self.descriptors.pool, message, field),
+            field: Field::from_descriptor(&self.descriptors.pool, field),
             element: descriptors::path_element(field),
             entry_element: match shape {
                 Shape::Map { .. } => Some(entry_element(field)),
                 Shape::Singular | Shape::List => None,
             },
             shape,
-            #[cfg(feature = "cel")]
-            scalar: built.scalar,
             required: built.required,
-            ignore_empty: built.ignore_empty,
-            any: built.any,
-            checks: built.checks,
-            wrapper: built.wrapper,
-            #[cfg(feature = "cel")]
-            programs: built.programs,
+            rules: built.rules,
             defined_only: built.defined_only,
             items: built.items,
             keys: built.keys,
@@ -488,11 +471,7 @@ impl<'a> Builder<'a> {
     }
 
     /// The rules of one value.
-    fn build_value(
-        &mut self,
-        target: Target,
-        rules: &FieldRules,
-    ) -> Result<Option<Built>, CompileError> {
+    fn build_value(&mut self, target: Target, rules: &FieldRules) -> Result<Option<Built>, Error> {
         if ignore_always(rules) {
             return Ok(None);
         }
@@ -501,19 +480,21 @@ impl<'a> Builder<'a> {
                 && target.presence != FieldPresence::Implicit
                 && !target.map_entry);
         let mut built = Built {
-            #[cfg(feature = "cel")]
-            scalar: scalar_kind(target.kind),
-            checks: Vec::new(),
-            wrapper: None,
-            #[cfg(feature = "cel")]
-            programs: None,
-            any: None,
+            rules: ValueRules {
+                #[cfg(feature = "cel")]
+                scalar: scalar_kind(target.kind),
+                ignore_empty,
+                any: None,
+                checks: Vec::new(),
+                wrapper: None,
+                #[cfg(feature = "cel")]
+                programs: None,
+            },
+            required: rules.required.unwrap_or(false),
             defined_only: None,
             items: None,
             keys: None,
             values: None,
-            ignore_empty,
-            required: rules.required.unwrap_or(false),
         };
 
         let mut compiled = Compiled::new();
@@ -534,7 +515,7 @@ impl<'a> Builder<'a> {
         }
         #[cfg(feature = "cel")]
         {
-            built.programs = self.compile(compiled)?;
+            built.rules.programs = self.compile(compiled)?;
         }
         #[cfg(not(feature = "cel"))]
         compiled.reject()?;
@@ -549,7 +530,7 @@ impl<'a> Builder<'a> {
         standard: &RulesType,
         built: &mut Built,
         compiled: &mut Compiled,
-    ) -> Result<(), CompileError> {
+    ) -> Result<(), Error> {
         let pool = &self.descriptors.pool;
         let message_name = |kind: SingularKind| match kind {
             SingularKind::Message(idx) => Some(pool.message(idx).full_name()),
@@ -557,7 +538,7 @@ impl<'a> Builder<'a> {
         };
         if let Some((rules, name, expected, wrapper)) = scalar_rules(standard) {
             self.check_scalar_type(&target, expected, wrapper)?;
-            built.wrapper = self.wrapper_value(&target);
+            built.rules.wrapper = self.wrapper_value(&target);
             if let RulesType::Enum(r) = standard {
                 if r.defined_only.unwrap_or(false) && target.shape == Shape::Singular {
                     if let SingularKind::Enum(idx) = target.kind {
@@ -565,12 +546,12 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
-            return self.predefined_rules(name, standard, rules, &mut built.checks, compiled);
+            return self.predefined_rules(name, standard, rules, &mut built.rules.checks, compiled);
         }
         let (name, rules): (&'static str, &dyn RulesMessage) = match standard {
             RulesType::Duration(r) => {
                 if message_name(target.kind) != Some(descriptors::DURATION) {
-                    return Err(CompileError(
+                    return Err(Error::Compilation(
                         "duration field validator on non-duration field".to_owned(),
                     ));
                 }
@@ -578,7 +559,7 @@ impl<'a> Builder<'a> {
             }
             RulesType::FieldMask(r) => {
                 if message_name(target.kind) != Some(descriptors::FIELD_MASK) {
-                    return Err(CompileError(
+                    return Err(Error::Compilation(
                         "field_mask field validator on non-field_mask field".to_owned(),
                     ));
                 }
@@ -586,7 +567,7 @@ impl<'a> Builder<'a> {
             }
             RulesType::Timestamp(r) => {
                 if message_name(target.kind) != Some(descriptors::TIMESTAMP) {
-                    return Err(CompileError(
+                    return Err(Error::Compilation(
                         "timestamp field validator on non-timestamp field".to_owned(),
                     ));
                 }
@@ -605,11 +586,11 @@ impl<'a> Builder<'a> {
             }
             RulesType::Any(r) => {
                 if message_name(target.kind) != Some(descriptors::ANY) {
-                    return Err(CompileError(
+                    return Err(Error::Compilation(
                         "any field validator on non-any field".to_owned(),
                     ));
                 }
-                built.any = Some(AnyCheck {
+                built.rules.any = Some(AnyCheck {
                     r#in: r.r#in.clone(),
                     not_in: r.not_in.clone(),
                 });
@@ -617,7 +598,7 @@ impl<'a> Builder<'a> {
             }
             _ => return Ok(()),
         };
-        self.predefined_rules(name, standard, rules, &mut built.checks, compiled)
+        self.predefined_rules(name, standard, rules, &mut built.rules.checks, compiled)
     }
 
     /// The rules of a repeated field's elements. Each element is validated
@@ -627,16 +608,16 @@ impl<'a> Builder<'a> {
         &mut self,
         target: Target,
         items: Option<&FieldRules>,
-    ) -> Result<Option<ItemEvaluator>, CompileError> {
+    ) -> Result<Option<ItemEvaluator>, Error> {
         match target.shape {
             Shape::List => {}
             Shape::Map { .. } => {
-                return Err(CompileError(
+                return Err(Error::Compilation(
                     "repeated field validator on map field".to_owned(),
                 ));
             }
             Shape::Singular => {
-                return Err(CompileError(
+                return Err(Error::Compilation(
                     "repeated field validator on non-repeated field".to_owned(),
                 ));
             }
@@ -659,9 +640,9 @@ impl<'a> Builder<'a> {
         target: Target,
         keys: Option<&FieldRules>,
         values: Option<&FieldRules>,
-    ) -> Result<(Option<ItemEvaluator>, Option<ItemEvaluator>), CompileError> {
+    ) -> Result<(Option<ItemEvaluator>, Option<ItemEvaluator>), Error> {
         let Shape::Map { key } = target.shape else {
-            return Err(CompileError(
+            return Err(Error::Compilation(
                 "map field validator on non-map field".to_owned(),
             ));
         };
@@ -695,14 +676,7 @@ impl<'a> Builder<'a> {
             ItemKind::Values => [schema.map_values.clone(), schema.map.clone()],
         };
         ItemEvaluator {
-            #[cfg(feature = "cel")]
-            scalar: built.scalar,
-            ignore_empty: built.ignore_empty,
-            any: built.any,
-            checks: built.checks,
-            wrapper: built.wrapper,
-            #[cfg(feature = "cel")]
-            programs: built.programs,
+            rules: built.rules,
             rule_prefix,
         }
     }
@@ -719,7 +693,7 @@ impl<'a> Builder<'a> {
         let pool = &*self.descriptors.pool;
         let wrapper = pool.message(idx);
         let value = wrapper.field(1)?;
-        Some(Field::from_descriptor(pool, wrapper, value))
+        Some(Field::from_descriptor(pool, value))
     }
 
     /// The field must have the rules' type, or be the wrapper message of that
@@ -729,7 +703,7 @@ impl<'a> Builder<'a> {
         target: &Target,
         expected: Type,
         wrapper: &str,
-    ) -> Result<(), CompileError> {
+    ) -> Result<(), Error> {
         if target.ty == expected {
             return Ok(());
         }
@@ -740,7 +714,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        Err(CompileError(format!(
+        Err(Error::Compilation(format!(
             "field type does not match rule type: {} != {}",
             descriptors::type_name(target.ty),
             descriptors::type_name(expected)
@@ -756,17 +730,18 @@ impl<'a> Builder<'a> {
         rules: &dyn RulesMessage,
         checks: &mut Vec<Check>,
         compiled: &mut Compiled,
-    ) -> Result<(), CompileError> {
+    ) -> Result<(), Error> {
         let pool = &self.descriptors.pool;
         let full_name = rules.full_name();
         let bytes = rules.to_bytes();
         let idx = pool
             .message_index(full_name)
             .unwrap_or_else(|| panic!("{full_name} is in the embedded descriptor set"));
-        let dynamic = DynamicMessage::decode(Arc::clone(pool), idx, &bytes)
-            .map_err(|error| CompileError(format!("could not decode {full_name}: {error}")))?;
+        let dynamic = DynamicMessage::decode(Arc::clone(pool), idx, &bytes).map_err(|error| {
+            Error::Compilation(format!("could not decode {full_name}: {error}"))
+        })?;
         if !dynamic.unknown_fields().is_empty() {
-            return Err(CompileError(format!("unknown rules in {full_name}")));
+            return Err(Error::Compilation(format!("unknown rules in {full_name}")));
         }
         let type_element = self.descriptors.schema.type_element(pool, type_field);
         let message = pool.message(idx);
@@ -810,7 +785,7 @@ impl<'a> Builder<'a> {
     }
 
     #[cfg(feature = "cel")]
-    fn compile(&mut self, compiled: Compiled) -> Result<Option<ProgramSet>, CompileError> {
+    fn compile(&mut self, compiled: Compiled) -> Result<Option<ProgramSet>, Error> {
         if compiled.expressions.is_empty() {
             return Ok(None);
         }
@@ -829,12 +804,7 @@ impl<'a> Builder<'a> {
         let program = self
             .env
             .compile(rules, &expressions)
-            .map_err(|error| match error {
-                cel::Error::Compilation(message)
-                | cel::Error::Argument(message)
-                | cel::Error::Runtime(message)
-                | cel::Error::Unexpected(message) => CompileError(message),
-            })?;
+            .map_err(|error| Error::Compilation(error.message().to_owned()))?;
         Ok(Some(ProgramSet {
             program,
             rules: compiled.metas,
@@ -860,12 +830,12 @@ fn message_oneofs<'m>(
     pool: &DescriptorPool,
     message: &'m MessageDescriptor,
     rules: &'m MessageRules,
-) -> Result<MessageLevel<'m>, CompileError> {
+) -> Result<MessageLevel<'m>, Error> {
     let mut oneofs = Vec::new();
     let mut members = HashSet::new();
     for oneof in &rules.oneof {
         if oneof.fields.is_empty() {
-            return Err(CompileError(format!(
+            return Err(Error::Compilation(format!(
                 "at least one field must be specified in oneof rule for the message {}",
                 message.full_name()
             )));
@@ -874,18 +844,18 @@ fn message_oneofs<'m>(
         let mut fields = Vec::with_capacity(oneof.fields.len());
         for name in &oneof.fields {
             if !seen.insert(name.as_str()) {
-                return Err(CompileError(format!(
+                return Err(Error::Compilation(format!(
                     "duplicate \"{name}\" in oneof rule for the message {}",
                     message.full_name()
                 )));
             }
             let Some(field) = message.field_by_name(name) else {
-                return Err(CompileError(format!(
+                return Err(Error::Compilation(format!(
                     "field \"{name}\" not found in message {}",
                     message.full_name()
                 )));
             };
-            fields.push(Field::from_descriptor(pool, message, field));
+            fields.push(Field::from_descriptor(pool, field));
         }
         oneofs.push(MessageOneof {
             fields,

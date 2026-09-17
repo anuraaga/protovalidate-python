@@ -23,8 +23,7 @@ use buffa_descriptor::generated::descriptor::FileDescriptorSet;
 #[cfg(feature = "cel")]
 use crate::cel;
 use crate::descriptors::{self, Descriptors};
-use crate::error::Internal;
-use crate::protobuf::{Payload, Runtime};
+use crate::protobuf::Runtime;
 use crate::rules::MessageEvaluator;
 use crate::rules::build::Builder;
 use crate::rules::eval::Walker;
@@ -126,11 +125,12 @@ impl Validator {
     /// Validates a message read in place through a [`Runtime`].
     ///
     /// `type_name` is the fully-qualified message type, without a leading
-    /// dot; its descriptor must already be registered. `payload` is the
-    /// message's serialized form, produced only if a CEL rule binds the
-    /// message itself, a repeated field or a map to `this`. With `fail_fast`
-    /// validation stops at the first violation, rather than accumulating
-    /// them all.
+    /// dot; its descriptor must already be registered. The message is
+    /// serialized, through
+    /// [`Message::encode`](crate::protobuf::Message::encode), only if a CEL
+    /// rule binds the message itself, a repeated field or a map to `this`.
+    /// With `fail_fast` validation stops at the first violation, rather than
+    /// accumulating them all.
     ///
     /// # Errors
     ///
@@ -138,16 +138,16 @@ impl Validator {
     /// carrying the violations as a serialized `buf.validate.Violations`.
     /// The other variants mean validation itself failed: an unknown type or
     /// unparsable payload ([`Error::Argument`]), rules that do not compile
-    /// ([`Error::Compilation`]), or a rule failing to evaluate
-    /// ([`Error::Evaluation`]).
+    /// ([`Error::Compilation`]), a rule failing to evaluate
+    /// ([`Error::Evaluation`]), or the runtime failing to read the message
+    /// ([`Error::Read`]).
     pub fn validate_message<R: Runtime>(
         &self,
         type_name: &str,
         message: &R::Message<'_>,
-        payload: Payload<'_>,
         fail_fast: bool,
     ) -> Result<(), Error> {
-        let violations = self.run::<R>(type_name, message, payload, fail_fast)?;
+        let violations = self.run::<R>(type_name, message, fail_fast)?;
         if violations.is_empty() {
             return Ok(());
         }
@@ -160,9 +160,8 @@ impl Validator {
         &self,
         type_name: &str,
         message: &R::Message<'_>,
-        payload: Payload<'_>,
         fail_fast: bool,
-    ) -> Result<Vec<ViolationPb>, Internal> {
+    ) -> Result<Vec<ViolationPb>, Error> {
         let index = self.message_index(type_name)?;
         let evaluators = self.evaluators(index)?;
         #[cfg(feature = "cel")]
@@ -171,14 +170,14 @@ impl Validator {
         let walker = Walker::<R>::new(&self.descriptors, &env, &evaluators, fail_fast);
         #[cfg(not(feature = "cel"))]
         let walker = Walker::<R>::new(&self.descriptors, &evaluators, fail_fast);
-        Ok(walker.validate(message, type_name, payload, &evaluators[&index])?)
+        walker.validate(message, type_name, &evaluators[&index])
     }
 
-    fn message_index(&self, type_name: &str) -> Result<MessageIndex, Internal> {
+    fn message_index(&self, type_name: &str) -> Result<MessageIndex, Error> {
         self.descriptors
             .pool
             .message_index(type_name)
-            .ok_or_else(|| Internal::Argument(format!("unknown message type: {type_name}")))
+            .ok_or_else(|| Error::Argument(format!("unknown message type: {type_name}")))
     }
 
     /// The cache, with the rules of `index` and every type reachable from
@@ -187,7 +186,7 @@ impl Validator {
     /// Rules compile lazily, on the first validation of a type, the whole
     /// reachable closure at once. Failures are not cached and are reported
     /// again on every call.
-    fn evaluators(&self, index: MessageIndex) -> Result<RwLockReadGuard<'_, Cache>, Internal> {
+    fn evaluators(&self, index: MessageIndex) -> Result<RwLockReadGuard<'_, Cache>, Error> {
         let cache = self.read_cache();
         if cache.contains_key(&index) {
             return Ok(cache);

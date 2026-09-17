@@ -22,31 +22,16 @@ use std::slice;
 use crate::ffi::{
     CEL_ERR_ARGUMENT, CEL_ERR_COMPILATION, CEL_ERR_RUNTIME, CEL_ERR_UNEXPECTED, CEL_OK,
     CEL_THIS_FIELD, CEL_THIS_MESSAGE, CEL_THIS_SCALAR, CEL_VALUE_BOOL, CEL_VALUE_BYTES,
-    CEL_VALUE_DOUBLE, CEL_VALUE_INT, CEL_VALUE_LIST, CEL_VALUE_OTHER, CEL_VALUE_STRING,
-    CEL_VALUE_UINT, CelEngine, CelFrame, CelList, CelProgram, CelRule, CelValue,
-    cel_engine_add_file, cel_engine_free, cel_engine_new, cel_engine_register, cel_frame_free,
-    cel_frame_new, cel_free, cel_list_get, cel_list_len, cel_program_eval, cel_program_free,
-    cel_program_new, cel_string_new,
+    CEL_VALUE_DOUBLE, CEL_VALUE_INT, CEL_VALUE_LIST, CEL_VALUE_STRING, CEL_VALUE_UINT, CelEngine,
+    CelFrame, CelList, CelProgram, CelRule, CelValue, cel_engine_add_file, cel_engine_free,
+    cel_engine_new, cel_engine_register, cel_frame_free, cel_frame_new, cel_free, cel_list_get,
+    cel_list_len, cel_program_eval, cel_program_free, cel_program_new, cel_string_new,
 };
 use crate::{Arg, Element, Error, Expression, Kind, NativeFn, Scalar, This, Value};
 
-/// A `cel_value` with nothing set.
-fn other_value() -> CelValue {
-    CelValue {
-        kind: CEL_VALUE_OTHER,
-        bool_value: 0,
-        int_value: 0,
-        uint_value: 0,
-        double_value: 0.0,
-        data: ptr::null(),
-        len: 0,
-        list: ptr::null(),
-    }
-}
-
 /// The shim hands lengths to protobuf as `int`, so a buffer at or above 2 GiB
 /// would narrow to a negative one. Protobuf cannot represent a message that
-/// large either.
+/// large so it is safe to reject.
 fn check_len(what: &str, bytes: &[u8]) -> Result<(), Error> {
     if i32::try_from(bytes.len()).is_ok() {
         Ok(())
@@ -85,7 +70,7 @@ unsafe fn status_error(code: c_int, error: *mut c_char) -> Error {
 
 impl Scalar<'_> {
     fn to_ffi(self) -> CelValue {
-        let mut value = other_value();
+        let mut value = CelValue::default();
         match self {
             Self::Bool(b) => {
                 value.kind = CEL_VALUE_BOOL;
@@ -143,7 +128,7 @@ unsafe fn ffi_bytes<'a>(value: &CelValue) -> &'a [u8] {
 
 /// A list element, read through the shim. `index` is in range.
 unsafe fn element<'a>(list: *const CelList, index: usize) -> Element<'a> {
-    let mut value = other_value();
+    let mut value = CelValue::default();
     // SAFETY: `list` is the live list of the current call, `index` is below
     // its length, and `value` is a live out-param.
     unsafe { cel_list_get(list, index, &raw mut value) };
@@ -444,7 +429,7 @@ impl Program {
             This::Message(frame) => (CEL_THIS_MESSAGE, None, frame.0.cast_const(), 0),
             This::Field(frame, number) => (CEL_THIS_FIELD, None, frame.0.cast_const(), number),
         };
-        let mut out = other_value();
+        let mut out = CelValue::default();
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: `self.0` is a live program and `index` is one of its
         // expressions; the scalar and its borrowed string storage outlive the

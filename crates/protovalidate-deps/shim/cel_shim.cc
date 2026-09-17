@@ -117,8 +117,8 @@ celrt::CelValue Error(google::protobuf::Arena* arena, absl::string_view message)
       arena, absl::StatusCode::kInvalidArgument, std::string(message)));
 }
 
-// protovalidate's `getField(message, name)`: a field read by name. The one
-// function kept in C++, since it reads a cel-cpp message value.
+// protovalidate's `getField(message, name)`. Strictly an operator on protobuf-cpp so
+// we implement it in C++ instead of Rust. All other functions are implemented in Rust.
 celrt::CelValue GetField(google::protobuf::Arena* arena, celrt::CelValue message,
                          celrt::CelValue name) {
   if (!message.IsMessage()) return Error(arena, "expected a message value for first argument");

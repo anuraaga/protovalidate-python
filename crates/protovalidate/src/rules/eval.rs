@@ -22,8 +22,9 @@
 //! The message is read through [`crate::protobuf`], so the walk is generic
 //! over the runtime holding it. CEL sees messages through a [`LazyFrame`]:
 //! the root is handed to the CEL runtime only if some custom rule needs a
-//! message, list or map bound to `this`, and sub-messages are then reached
-//! inside that one parse rather than re-encoded.
+//! message, list or map bound to `this`. A field of the root is reached
+//! inside that one parse; a message the walk descends into is encoded on
+//! its own, again only if a rule asks.
 
 #[cfg(feature = "cel")]
 use std::cell::OnceCell;
@@ -37,51 +38,32 @@ use buffa_descriptor::{DescriptorPool, MessageIndex};
 use super::standard::Check;
 use super::{
     AnyCheck, FieldEvaluator, ItemEvaluator, MessageEvaluator, MessageOneof, OneofRequired, Shape,
+    ValueRules,
 };
 #[cfg(feature = "cel")]
 use super::{ProgramSet, ScalarKind};
+use crate::Error;
 #[cfg(feature = "cel")]
 use crate::cel::{self, Env, Scalar, This, Value};
 use crate::descriptors::{self, Descriptors, Schema};
-use crate::protobuf::{Field, Key, List as _, Map as _, Message as _, Payload, Runtime, Val};
+use crate::protobuf::{Field, Key, List as _, Map as _, Message as _, ReadError, Runtime, Val};
 use crate::validate::__buffa::oneof::field_path_element::Subscript;
 use crate::validate::{FieldPath, FieldPathElement, Violation};
 
-/// Validation did not run to completion.
-#[derive(Debug)]
-pub(crate) enum EvalError {
-    /// A rule failed while being evaluated.
-    Runtime(String),
-    /// The payload could not be handed to CEL.
-    #[cfg(feature = "cel")]
-    Argument(String),
-    Unexpected(String),
-}
-
-#[cfg(feature = "cel")]
-impl From<cel::Error> for EvalError {
-    fn from(error: cel::Error) -> Self {
-        match error {
-            cel::Error::Runtime(message) => Self::Runtime(message),
-            cel::Error::Argument(message) => Self::Argument(message),
-            cel::Error::Compilation(message) | cel::Error::Unexpected(message) => {
-                Self::Unexpected(message)
-            }
-        }
-    }
-}
+/// Serializes a message, when CEL asks for it.
+type Encode<'a> = &'a dyn Fn() -> Result<Vec<u8>, ReadError>;
 
 /// A message as CEL sees it, parsed on first use.
 ///
-/// A frame holds one message serialized -- the root as the caller's payload,
-/// a sub-message as its runtime encodes it when a rule binds it to `this` --
-/// and parses it the first time a program asks. Frames nest on the stack the
-/// way the walk does, so one outlives every program run against it.
+/// A frame knows how to serialize one message -- the root, or a sub-message
+/// as its runtime encodes it -- and parses it the first time a program asks.
+/// Frames nest on the stack the way the walk does, so one outlives every
+/// program run against it.
 #[cfg(feature = "cel")]
 pub(crate) struct LazyFrame<'a> {
     env: &'a Env,
     type_name: &'a str,
-    payload: Payload<'a>,
+    encode: Encode<'a>,
     parsed: OnceCell<cel::Frame>,
 }
 
@@ -92,39 +74,39 @@ pub(crate) struct LazyFrame<'a>(PhantomData<&'a ()>);
 
 #[cfg(not(feature = "cel"))]
 impl<'a> LazyFrame<'a> {
-    fn root(_type_name: &'a str, _payload: Payload<'a>) -> Self {
+    fn root(_type_name: &'a str, _encode: Encode<'a>) -> Self {
         Self(PhantomData)
     }
 
-    fn child(_parent: &LazyFrame<'a>, _type_name: &'a str, _payload: Payload<'a>) -> Self {
+    fn child(_parent: &LazyFrame<'a>, _type_name: &'a str, _encode: Encode<'a>) -> Self {
         Self(PhantomData)
     }
 }
 
 #[cfg(feature = "cel")]
 impl<'a> LazyFrame<'a> {
-    fn new(env: &'a Env, type_name: &'a str, payload: Payload<'a>) -> Self {
+    fn new(env: &'a Env, type_name: &'a str, encode: Encode<'a>) -> Self {
         Self {
             env,
             type_name,
-            payload,
+            encode,
             parsed: OnceCell::new(),
         }
     }
 
-    fn root(env: &'a Env, type_name: &'a str, payload: Payload<'a>) -> Self {
-        Self::new(env, type_name, payload)
+    fn root(env: &'a Env, type_name: &'a str, encode: Encode<'a>) -> Self {
+        Self::new(env, type_name, encode)
     }
 
     /// A sub-message of `parent`'s, from its own encoding.
-    fn child(parent: &LazyFrame<'a>, type_name: &'a str, payload: Payload<'a>) -> Self {
-        Self::new(parent.env, type_name, payload)
+    fn child(parent: &LazyFrame<'a>, type_name: &'a str, encode: Encode<'a>) -> Self {
+        Self::new(parent.env, type_name, encode)
     }
 
     /// The parsed message.
-    fn parsed(&self) -> Result<&cel::Frame, EvalError> {
+    fn parsed(&self) -> Result<&cel::Frame, Error> {
         if self.parsed.get().is_none() {
-            let frame = self.env.frame(self.type_name, &self.payload.bytes())?;
+            let frame = self.env.frame(self.type_name, &(self.encode)()?)?;
             let _ = self.parsed.set(frame);
         }
         Ok(self.parsed.get().expect("frame was just set"))
@@ -138,10 +120,10 @@ fn field_number(number: u32) -> i32 {
 
 /// The type of the messages a field holds, which a frame of one of them is
 /// parsed as.
-fn message_type(field: &Field) -> Result<&str, EvalError> {
+fn message_type(field: &Field) -> Result<&str, Error> {
     field
         .message_type()
-        .ok_or_else(|| EvalError::Unexpected(format!("{} does not hold messages", field.name())))
+        .ok_or_else(|| Error::Unexpected(format!("{} does not hold messages", field.name())))
 }
 
 /// Whether a repeated element or map value is the zero of its type, as
@@ -157,6 +139,34 @@ fn is_empty_item<R: Runtime>(value: &Val<'_, R>) -> bool {
         Val::Bytes(b) => b.is_empty(),
         Val::Message(_) | Val::List(_) | Val::Map(_) => false,
     }
+}
+
+/// Whether a field that does not track presence is set: not its type's
+/// default. A double goes by its bits, so a negative zero, which
+/// serializes, is set. `None` is a field the message does not have at all.
+fn is_set<R: Runtime>(value: Option<&Val<'_, R>>) -> Result<bool, Error> {
+    Ok(match value {
+        None => false,
+        Some(Val::Bool(b)) => *b,
+        Some(Val::Int(i)) => *i != 0,
+        Some(Val::Uint(u)) => *u != 0,
+        Some(Val::Double(f)) => f.to_bits() != 0,
+        Some(Val::Enum(e)) => *e != 0,
+        Some(Val::String(s)) => !s.is_empty(),
+        Some(Val::Bytes(b)) => !b.is_empty(),
+        Some(Val::Message(_)) => true,
+        Some(Val::List(list)) => list.len()? != 0,
+        Some(Val::Map(map)) => map.len()? != 0,
+    })
+}
+
+/// Whether a field is set: the runtime says for one that tracks presence,
+/// its value for the rest.
+fn has<R: Runtime>(message: &R::Message<'_>, field: &Field) -> Result<bool, Error> {
+    if field.has_presence() {
+        return Ok(message.has(field)?);
+    }
+    is_set(message.get(field)?.as_ref())
 }
 
 impl Key<'_> {
@@ -300,18 +310,18 @@ impl<'a, R: Runtime> Walker<'a, R> {
     }
 
     /// Validates `message`, of type `type_name`, returning the violations.
-    /// `payload` is its serialized form, for CEL, produced only if needed.
+    /// The message is serialized, for CEL, only if a rule needs it.
     pub(crate) fn validate(
         mut self,
         message: &R::Message<'_>,
         type_name: &str,
-        payload: Payload<'_>,
         evaluator: &MessageEvaluator,
-    ) -> Result<Vec<Violation>, EvalError> {
+    ) -> Result<Vec<Violation>, Error> {
+        let encode = || message.encode();
         #[cfg(feature = "cel")]
-        let frame = LazyFrame::root(self.env, type_name, payload);
+        let frame = LazyFrame::root(self.env, type_name, &encode);
         #[cfg(not(feature = "cel"))]
-        let frame = LazyFrame::root(type_name, payload);
+        let frame = LazyFrame::root(type_name, &encode);
         self.message(message, &frame, evaluator)?;
         for violation in &mut self.violations {
             if let Some(field) = violation.field.as_option_mut() {
@@ -363,10 +373,10 @@ impl<'a, R: Runtime> Walker<'a, R> {
         checks: &[Check],
         wrapper: Option<&Field>,
         value: Option<&Val<'_, R>>,
-    ) -> Result<(), EvalError> {
+    ) -> Result<(), Error> {
         if let Some(wrapper) = wrapper {
             let unboxed = match value {
-                Some(Val::Message(message)) => message.get(wrapper),
+                Some(Val::Message(message)) => message.get(wrapper)?,
                 _ => None,
             };
             self.run_checks(checks, unboxed.as_ref())
@@ -375,13 +385,9 @@ impl<'a, R: Runtime> Walker<'a, R> {
         }
     }
 
-    fn run_checks(
-        &mut self,
-        checks: &[Check],
-        value: Option<&Val<'_, R>>,
-    ) -> Result<(), EvalError> {
+    fn run_checks(&mut self, checks: &[Check], value: Option<&Val<'_, R>>) -> Result<(), Error> {
         for check in checks {
-            if check.test.fails(value).map_err(EvalError::Runtime)? {
+            if check.test.fails(value)? {
                 self.violations.push(violation(
                     &check.id,
                     &check.message,
@@ -396,12 +402,12 @@ impl<'a, R: Runtime> Walker<'a, R> {
         Ok(())
     }
 
-    /// Runs a program set and records its failures as violations.
+    /// Runs each expression against `this`, recording its failures as
+    /// violations. One passes by producing `true` or an empty string;
+    /// `false` fails with the rule's own message, and a non-empty string
+    /// fails with that string as the message.
     #[cfg(feature = "cel")]
-    /// Runs each expression against `this`. One passes by producing `true`
-    /// or an empty string; `false` fails with the rule's own message, and a
-    /// non-empty string fails with that string as the message.
-    fn run(&mut self, programs: &ProgramSet, this: This<'_>) -> Result<(), EvalError> {
+    fn run(&mut self, programs: &ProgramSet, this: This<'_>) -> Result<(), Error> {
         for (index, meta) in programs.rules.iter().enumerate() {
             let message = match programs.program.eval(index, this)? {
                 Value::Bool(true) => continue,
@@ -412,7 +418,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
                 Value::String(text) if text.is_empty() => continue,
                 Value::String(text) => text,
                 Value::Other => {
-                    return Err(EvalError::Runtime("invalid result type".to_owned()));
+                    return Err(Error::Evaluation("invalid result type".to_owned()));
                 }
             };
             let rule: Vec<&FieldPathElement> = meta.rule_path.iter().collect();
@@ -430,7 +436,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
         message: &R::Message<'_>,
         frame: &LazyFrame<'_>,
         evaluator: &MessageEvaluator,
-    ) -> Result<(), EvalError> {
+    ) -> Result<(), Error> {
         #[cfg(feature = "cel")]
         if let Some(programs) = &evaluator.cel {
             let this = This::Message(frame.parsed()?);
@@ -440,7 +446,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
             }
         }
         for oneof in &evaluator.message_oneofs {
-            self.message_oneof(message, oneof);
+            self.message_oneof(message, oneof)?;
             if self.should_return() {
                 return Ok(());
             }
@@ -452,7 +458,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
             }
         }
         for oneof in &evaluator.oneofs {
-            self.oneof(message, oneof);
+            self.oneof(message, oneof)?;
             if self.should_return() {
                 return Ok(());
             }
@@ -460,12 +466,17 @@ impl<'a, R: Runtime> Walker<'a, R> {
         self.nested(message, frame, evaluator)
     }
 
-    fn message_oneof(&mut self, message: &R::Message<'_>, oneof: &MessageOneof) {
-        let set = oneof
-            .fields
-            .iter()
-            .filter(|field| message.has(field))
-            .count();
+    fn message_oneof(
+        &mut self,
+        message: &R::Message<'_>,
+        oneof: &MessageOneof,
+    ) -> Result<(), Error> {
+        let mut set = 0;
+        for field in &oneof.fields {
+            if has::<R>(message, field)? {
+                set += 1;
+            }
+        }
         if set > 1 {
             self.violations.push(violation(
                 "message.oneof",
@@ -482,18 +493,22 @@ impl<'a, R: Runtime> Walker<'a, R> {
                 &[],
             ));
         }
+        Ok(())
     }
 
-    fn oneof(&mut self, message: &R::Message<'_>, oneof: &OneofRequired) {
-        let set = oneof.members.iter().any(|field| message.has(field));
-        if !set {
-            self.violations.push(violation(
-                "required",
-                "exactly one field is required in oneof",
-                Some(&oneof.element),
-                &[],
-            ));
+    fn oneof(&mut self, message: &R::Message<'_>, oneof: &OneofRequired) -> Result<(), Error> {
+        for member in &oneof.members {
+            if has::<R>(message, member)? {
+                return Ok(());
+            }
         }
+        self.violations.push(violation(
+            "required",
+            "exactly one field is required in oneof",
+            Some(&oneof.element),
+            &[],
+        ));
+        Ok(())
     }
 
     fn required(&mut self, field: &FieldEvaluator) {
@@ -505,8 +520,13 @@ impl<'a, R: Runtime> Walker<'a, R> {
         ));
     }
 
-    fn any(&mut self, field: Option<&FieldPathElement>, any: &R::Message<'_>, check: &AnyCheck) {
-        let type_url = any.get(&descriptors::wkt::ANY_TYPE_URL);
+    fn any(
+        &mut self,
+        field: Option<&FieldPathElement>,
+        any: &R::Message<'_>,
+        check: &AnyCheck,
+    ) -> Result<(), Error> {
+        let type_url = any.get(&descriptors::wkt::ANY_TYPE_URL)?;
         let type_url = match &type_url {
             Some(Val::String(url)) => url.as_ref(),
             _ => "",
@@ -527,6 +547,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
                 &[&self.schema.any_not_in, &self.schema.any],
             ));
         }
+        Ok(())
     }
 
     /// The rules of one field: presence, the checks and CEL programs, then
@@ -536,17 +557,17 @@ impl<'a, R: Runtime> Walker<'a, R> {
         message: &R::Message<'_>,
         frame: &LazyFrame<'_>,
         field: &FieldEvaluator,
-    ) -> Result<(), EvalError> {
-        let value = message.get(&field.field);
+    ) -> Result<(), Error> {
+        let value = message.get(&field.field)?;
         match field.shape {
             Shape::List | Shape::Map { .. } => {
                 let len = match &value {
-                    Some(Val::List(list)) => list.len(),
-                    Some(Val::Map(map)) => map.len(),
+                    Some(Val::List(list)) => list.len()?,
+                    Some(Val::Map(map)) => map.len()?,
                     _ => 0,
                 };
                 if len == 0 {
-                    if field.ignore_empty {
+                    if field.rules.ignore_empty {
                         return Ok(());
                     }
                     if field.required {
@@ -556,28 +577,37 @@ impl<'a, R: Runtime> Walker<'a, R> {
                 }
             }
             Shape::Singular => {
-                if !message.has(&field.field) {
+                let set = if field.field.has_presence() {
+                    message.has(&field.field)?
+                } else {
+                    is_set(value.as_ref())?
+                };
+                if !set {
                     if field.required {
                         self.required(field);
                         return Ok(());
                     }
-                    if field.ignore_empty {
+                    if field.rules.ignore_empty {
                         return Ok(());
                     }
                 }
-                if let (Some(check), Some(Val::Message(any))) = (&field.any, &value) {
-                    self.any(Some(&field.element), any, check);
+                if let (Some(check), Some(Val::Message(any))) = (&field.rules.any, &value) {
+                    self.any(Some(&field.element), any, check)?;
                 }
             }
         }
 
         let from = self.violations.len();
-        self.checks(&field.checks, field.wrapper.as_ref(), value.as_ref())?;
+        self.checks(
+            &field.rules.checks,
+            field.rules.wrapper.as_ref(),
+            value.as_ref(),
+        )?;
         #[cfg(feature = "cel")]
-        if let Some(programs) = &field.programs {
+        if let Some(programs) = &field.rules.programs {
             if !self.should_return() {
                 // CEL only sees the message if a custom rule needs it.
-                let this = match (field.shape, field.scalar) {
+                let this = match (field.shape, field.rules.scalar) {
                     (Shape::Singular, Some(kind)) => This::Scalar(scalar_of(value.as_ref(), kind)),
                     _ => This::Field(frame.parsed()?, field_number(field.field.number())),
                 };
@@ -621,51 +651,62 @@ impl<'a, R: Runtime> Walker<'a, R> {
         Ok(())
     }
 
-    // `frame` is only for CEL.
+    /// The rules of one element or map value: the checks, then the custom
+    /// CEL with `this` bound to the value -- a scalar directly, a message
+    /// through a frame of its own.
+    // `frame` and `field` are only for CEL.
     #[cfg_attr(not(feature = "cel"), expect(unused_variables))]
+    #[inline]
+    fn item(
+        &mut self,
+        rules: &ValueRules,
+        frame: &LazyFrame<'_>,
+        field: &Field,
+        value: &Val<'_, R>,
+    ) -> Result<(), Error> {
+        self.checks(&rules.checks, rules.wrapper.as_ref(), Some(value))?;
+        #[cfg(feature = "cel")]
+        if let Some(programs) = &rules.programs {
+            if !self.should_return() {
+                match (rules.scalar, value) {
+                    (Some(kind), _) => {
+                        self.run(programs, This::Scalar(scalar_of(Some(value), kind)))?;
+                    }
+                    (None, Val::Message(sub)) => {
+                        let encode = || sub.encode();
+                        let child = LazyFrame::child(frame, message_type(field)?, &encode);
+                        self.run(programs, This::Message(child.parsed()?))?;
+                    }
+                    (None, _) => {
+                        return Err(Error::Unexpected(format!(
+                            "{} holds no message to bind this to",
+                            field.name()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn items(
         &mut self,
         frame: &LazyFrame<'_>,
         field: &FieldEvaluator,
         items: &ItemEvaluator,
         list: &R::List<'_>,
-    ) -> Result<(), EvalError> {
-        for index in 0..list.len() {
-            let Some(item) = list.get(index) else {
+    ) -> Result<(), Error> {
+        for index in 0..list.len()? {
+            let Some(item) = list.get(index)? else {
                 continue;
             };
-            if items.ignore_empty && is_empty_item(&item) {
+            if items.rules.ignore_empty && is_empty_item(&item) {
                 continue;
             }
             let from = self.violations.len();
-            self.checks(&items.checks, items.wrapper.as_ref(), Some(&item))?;
-            #[cfg(feature = "cel")]
-            if let Some(programs) = &items.programs {
-                if !self.should_return() {
-                    match (items.scalar, &item) {
-                        (Some(kind), _) => {
-                            self.run(programs, This::Scalar(scalar_of(Some(&item), kind)))?;
-                        }
-                        (None, Val::Message(sub)) => {
-                            let encode = || sub.encode();
-                            let child = LazyFrame::child(
-                                frame,
-                                message_type(&field.field)?,
-                                Payload::Encode(&encode),
-                            );
-                            self.run(programs, This::Message(child.parsed()?))?;
-                        }
-                        (None, _) => {
-                            return Err(EvalError::Unexpected(format!(
-                                "{} holds no message to bind this to",
-                                field.field.name()
-                            )));
-                        }
-                    }
-                }
-            }
-            if let (Some(check), Val::Message(any)) = (&items.any, &item) {
-                self.any(None, any, check);
+            self.item(&items.rules, frame, &field.field, &item)?;
+            if let (Some(check), Val::Message(any)) = (&items.rules.any, &item) {
+                self.any(None, any, check)?;
             }
             if self.violations.len() > from {
                 let element = with_subscript(field.element.clone(), Subscript::Index(index as u64));
@@ -684,7 +725,7 @@ impl<'a, R: Runtime> Walker<'a, R> {
         frame: &LazyFrame<'_>,
         field: &FieldEvaluator,
         map: &R::Map<'_>,
-    ) -> Result<(), EvalError> {
+    ) -> Result<(), Error> {
         let mut result = Ok(());
         map.for_each(
             &mut |key, value| match self.map_entry(frame, field, &key, &value) {
@@ -695,26 +736,24 @@ impl<'a, R: Runtime> Walker<'a, R> {
                     ControlFlow::Break(())
                 }
             },
-        );
+        )?;
         result
     }
 
     /// One map entry; `Ok(false)` when fail-fast stops the walk over the map.
-    // `frame` is only for CEL.
-    #[cfg_attr(not(feature = "cel"), expect(unused_variables))]
     fn map_entry(
         &mut self,
         frame: &LazyFrame<'_>,
         field: &FieldEvaluator,
         key: &Key<'_>,
         value: &Val<'_, R>,
-    ) -> Result<bool, EvalError> {
+    ) -> Result<bool, Error> {
         let from = self.violations.len();
         if let Some(keys) = &field.keys {
-            if !(keys.ignore_empty && key.is_empty()) {
-                self.checks(&keys.checks, None, Some(&key.to_val()))?;
+            if !(keys.rules.ignore_empty && key.is_empty()) {
+                self.checks(&keys.rules.checks, None, Some(&key.to_val()))?;
                 #[cfg(feature = "cel")]
-                if let Some(programs) = &keys.programs {
+                if let Some(programs) = &keys.rules.programs {
                     if !self.should_return() {
                         self.run(programs, This::Scalar(key.scalar()))?;
                     }
@@ -726,34 +765,9 @@ impl<'a, R: Runtime> Walker<'a, R> {
             }
         }
         if let Some(values) = &field.values {
-            if !(values.ignore_empty && is_empty_item(value)) {
+            if !(values.rules.ignore_empty && is_empty_item(value)) {
                 let value_from = self.violations.len();
-                self.checks(&values.checks, values.wrapper.as_ref(), Some(value))?;
-                #[cfg(feature = "cel")]
-                if let Some(programs) = &values.programs {
-                    if !self.should_return() {
-                        match (values.scalar, value) {
-                            (Some(kind), _) => {
-                                self.run(programs, This::Scalar(scalar_of(Some(value), kind)))?;
-                            }
-                            (None, Val::Message(sub)) => {
-                                let encode = || sub.encode();
-                                let child = LazyFrame::child(
-                                    frame,
-                                    message_type(&field.field)?,
-                                    Payload::Encode(&encode),
-                                );
-                                self.run(programs, This::Message(child.parsed()?))?;
-                            }
-                            (None, _) => {
-                                return Err(EvalError::Unexpected(format!(
-                                    "{} holds no message to bind this to",
-                                    field.field.name()
-                                )));
-                            }
-                        }
-                    }
-                }
+                self.item(&values.rules, frame, &field.field, value)?;
                 if self.violations.len() > value_from {
                     self.append_rule(value_from, &values.rule_prefix);
                 }
@@ -776,16 +790,16 @@ impl<'a, R: Runtime> Walker<'a, R> {
         message: &R::Message<'_>,
         frame: &LazyFrame<'_>,
         evaluator: &MessageEvaluator,
-    ) -> Result<(), EvalError> {
+    ) -> Result<(), Error> {
         for nested in &evaluator.nested {
-            if !message.has(&nested.field) {
+            if nested.shape == Shape::Singular && !message.has(&nested.field)? {
                 continue;
             }
-            let Some(value) = message.get(&nested.field) else {
+            let Some(value) = message.get(&nested.field)? else {
                 continue;
             };
             let Some(sub_evaluator) = self.evaluators.get(&nested.message) else {
-                return Err(EvalError::Unexpected(format!(
+                return Err(Error::Unexpected(format!(
                     "rules not loaded for message: {}",
                     self.pool.message(nested.message).full_name()
                 )));
@@ -793,33 +807,18 @@ impl<'a, R: Runtime> Walker<'a, R> {
             let type_name = message_type(&nested.field)?;
             match (nested.shape, &value) {
                 (Shape::Singular, Val::Message(sub)) => {
-                    let encode = || sub.encode();
-                    let child = LazyFrame::child(frame, type_name, Payload::Encode(&encode));
-                    let from = self.violations.len();
-                    self.message(sub, &child, sub_evaluator)?;
-                    if self.violations.len() > from {
-                        self.append_field(from, &nested.element);
-                    }
-                    if self.should_return() {
-                        return Ok(());
-                    }
+                    self.nested_message(sub, frame, type_name, sub_evaluator, || {
+                        nested.element.clone()
+                    })?;
                 }
                 (Shape::List, Val::List(list)) => {
-                    for index in 0..list.len() {
-                        let Some(Val::Message(sub)) = list.get(index) else {
+                    for index in 0..list.len()? {
+                        let Some(Val::Message(sub)) = list.get(index)? else {
                             continue;
                         };
-                        let encode = || sub.encode();
-                        let child = LazyFrame::child(frame, type_name, Payload::Encode(&encode));
-                        let from = self.violations.len();
-                        self.message(&sub, &child, sub_evaluator)?;
-                        if self.violations.len() > from {
-                            let element = with_subscript(
-                                nested.element.clone(),
-                                Subscript::Index(index as u64),
-                            );
-                            self.append_field(from, &element);
-                        }
+                        self.nested_message(&sub, frame, type_name, sub_evaluator, || {
+                            with_subscript(nested.element.clone(), Subscript::Index(index as u64))
+                        })?;
                         if self.should_return() {
                             return Ok(());
                         }
@@ -831,30 +830,49 @@ impl<'a, R: Runtime> Walker<'a, R> {
                         let Val::Message(sub) = &item else {
                             return ControlFlow::Continue(());
                         };
-                        let encode = || sub.encode();
-                        let child = LazyFrame::child(frame, type_name, Payload::Encode(&encode));
-                        let from = self.violations.len();
-                        if let Err(error) = self.message(sub, &child, sub_evaluator) {
+                        if let Err(error) =
+                            self.nested_message(sub, frame, type_name, sub_evaluator, || {
+                                with_subscript(nested.element.clone(), key.subscript())
+                            })
+                        {
                             result = Err(error);
                             return ControlFlow::Break(());
-                        }
-                        if self.violations.len() > from {
-                            let element = with_subscript(nested.element.clone(), key.subscript());
-                            self.append_field(from, &element);
                         }
                         if self.should_return() {
                             ControlFlow::Break(())
                         } else {
                             ControlFlow::Continue(())
                         }
-                    });
+                    })?;
                     result?;
-                    if self.should_return() {
-                        return Ok(());
-                    }
                 }
                 _ => {}
             }
+            if self.should_return() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates a message the walk descends into, appending the path
+    /// element it was reached by -- built only then -- to the paths of the
+    /// violations it adds.
+    #[inline]
+    fn nested_message(
+        &mut self,
+        sub: &R::Message<'_>,
+        frame: &LazyFrame<'_>,
+        type_name: &str,
+        evaluator: &MessageEvaluator,
+        element: impl FnOnce() -> FieldPathElement,
+    ) -> Result<(), Error> {
+        let encode = || sub.encode();
+        let child = LazyFrame::child(frame, type_name, &encode);
+        let from = self.violations.len();
+        self.message(sub, &child, evaluator)?;
+        if self.violations.len() > from {
+            self.append_field(from, &element());
         }
         Ok(())
     }

@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The C ABI over cel-cpp that the `protovalidate-deps` crate calls.
-//
-// This is a marshalling layer, nothing more: it parses, compiles and
-// evaluates through cel-cpp and protobuf and reports what they say. Every
-// precondition is the caller's -- pointers are valid for the call, lengths
-// fit in an int, indices are in range, an engine is never used from two
-// threads while it is being mutated -- and nothing here checks them.
+// The unsafe C ABI over cel-cpp that the `protovalidate-deps` crate calls.
+// As much as possible, logic including validation is kept to the Rust layer
+// instead of here.
 
 #ifndef PROTOVALIDATE_SHIM_CEL_SHIM_H_
 #define PROTOVALIDATE_SHIM_CEL_SHIM_H_

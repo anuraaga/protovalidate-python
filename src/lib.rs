@@ -47,6 +47,12 @@ fn to_py_err(error: Error) -> PyErr {
         Error::Compilation(message) => CompilationError::new_err(message),
         Error::Evaluation(message) => EvaluationError::new_err(message),
         Error::Argument(message) => PyValueError::new_err(message),
+        // The Python error raised while the message was being read, as it
+        // was raised.
+        Error::Read(error) => match error.into_inner().downcast::<PyErr>() {
+            Ok(error) => *error,
+            Err(error) => PyException::new_err(error.to_string()),
+        },
         // Neither a compilation nor an evaluation failure; a plain Exception
         // keeps it out of both buckets rather than mislabelling it.
         Error::Unexpected(message) => PyException::new_err(message),
@@ -258,8 +264,7 @@ impl Validator {
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let engine = self.engine.read_py_attached(py).unwrap();
         let ctx = Ctx::new(py, adapter.runtime, &self.types, &self.constants);
-        let result = ctx.validate(&engine, type_name, message, fail_fast)?;
-        match result {
+        match ctx.validate(&engine, type_name, message, fail_fast) {
             Ok(()) => Ok(None),
             Err(Error::Validation(error)) => Ok(Some(PyBytes::new(py, error.violations()))),
             Err(error) => Err(to_py_err(error)),

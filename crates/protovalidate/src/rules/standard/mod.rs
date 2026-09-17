@@ -31,6 +31,7 @@ use std::time::SystemTime;
 
 use regex::Regex;
 
+use crate::Error;
 use crate::descriptors::wkt;
 use crate::protobuf::{List as _, Map as _, Message as _, Runtime, Val};
 use crate::validate::FieldPathElement;
@@ -294,7 +295,7 @@ impl BytesTest {
     /// `Err` when the value cannot be checked: bytes that are not UTF-8
     /// cannot be matched against a pattern, as CEL's `string()` fails on
     /// them.
-    fn fails(&self, b: &[u8]) -> Result<bool, String> {
+    fn fails(&self, b: &[u8]) -> Result<bool, Error> {
         Ok(match self {
             Self::Const(c) => b != c.as_slice(),
             Self::Len(n) => b.len() as u64 != *n,
@@ -302,7 +303,11 @@ impl BytesTest {
             Self::MaxLen(n) => b.len() as u64 > *n,
             Self::Pattern(regex) => match std::str::from_utf8(b) {
                 Ok(s) => !regex.is_match(s),
-                Err(_) => return Err("value must be valid UTF-8 to apply regexp".to_owned()),
+                Err(_) => {
+                    return Err(Error::Evaluation(
+                        "value must be valid UTF-8 to apply regexp".to_owned(),
+                    ));
+                }
             },
             Self::Prefix(p) => !b.starts_with(p),
             Self::Suffix(p) => !b.ends_with(p),
@@ -429,49 +434,57 @@ pub(crate) fn has_duplicates<'a>(keys: impl IntoIterator<Item = Option<UniqueKey
     keys.into_iter().flatten().any(|key| !seen.insert(key))
 }
 
-fn list_has_duplicates<R: Runtime>(list: &R::List<'_>) -> bool {
-    let items: Vec<Val<'_, R>> = (0..list.len()).filter_map(|i| list.get(i)).collect();
-    has_duplicates(items.iter().map(unique_key))
+fn list_has_duplicates<R: Runtime>(list: &R::List<'_>) -> Result<bool, Error> {
+    let len = list.len()?;
+    let mut items: Vec<Val<'_, R>> = Vec::with_capacity(len);
+    for index in 0..len {
+        if let Some(item) = list.get(index)? {
+            items.push(item);
+        }
+    }
+    Ok(has_duplicates(items.iter().map(unique_key)))
 }
 
 /// The seconds and nanos of a `Duration` or `Timestamp` message, as one
 /// count of nanoseconds; zero for a message that is not there.
-fn nanos_of<R: Runtime>(value: Option<&Val<'_, R>>) -> i128 {
+fn nanos_of<R: Runtime>(value: Option<&Val<'_, R>>) -> Result<i128, Error> {
     let Some(Val::Message(message)) = value else {
-        return 0;
+        return Ok(0);
     };
-    let seconds = match message.get(&wkt::SECONDS) {
+    let seconds = match message.get(&wkt::SECONDS)? {
         Some(Val::Int(seconds)) => seconds,
         _ => 0,
     };
-    let nanos = match message.get(&wkt::NANOS) {
+    let nanos = match message.get(&wkt::NANOS)? {
         Some(Val::Int(nanos)) => nanos,
         _ => 0,
     };
-    i128::from(seconds) * 1_000_000_000 + i128::from(nanos)
+    Ok(i128::from(seconds) * 1_000_000_000 + i128::from(nanos))
 }
 
 /// The `paths` of a `FieldMask` message.
-fn paths_of<R: Runtime>(value: Option<&Val<'_, R>>) -> Vec<String> {
+fn paths_of<R: Runtime>(value: Option<&Val<'_, R>>) -> Result<Vec<String>, Error> {
     let Some(Val::Message(message)) = value else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Some(Val::List(list)) = message.get(&wkt::FIELD_MASK_PATHS) else {
-        return Vec::new();
+    let Some(Val::List(list)) = message.get(&wkt::FIELD_MASK_PATHS)? else {
+        return Ok(Vec::new());
     };
-    (0..list.len())
-        .filter_map(|i| match list.get(i) {
-            Some(Val::String(s)) => Some(s.into_owned()),
-            _ => None,
-        })
-        .collect()
+    let len = list.len()?;
+    let mut paths = Vec::with_capacity(len);
+    for index in 0..len {
+        if let Some(Val::String(path)) = list.get(index)? {
+            paths.push(path.into_owned());
+        }
+    }
+    Ok(paths)
 }
 
 impl Test {
     /// Whether `value` breaks the rule, or why it could not be checked.
     /// `None` is a field the message does not have at all, which reads as
     /// the type's default.
-    pub(crate) fn fails<R: Runtime>(&self, value: Option<&Val<'_, R>>) -> Result<bool, String> {
+    pub(crate) fn fails<R: Runtime>(&self, value: Option<&Val<'_, R>>) -> Result<bool, Error> {
         Ok(match self {
             Self::Int(cmp) => cmp.fails(&match value {
                 Some(Val::Int(i)) => *i,
@@ -501,14 +514,14 @@ impl Test {
                     return Ok(matches!(test, ListTest::MinItems(n) if *n > 0));
                 };
                 match test {
-                    ListTest::MinItems(n) => (list.len() as u64) < *n,
-                    ListTest::MaxItems(n) => list.len() as u64 > *n,
-                    ListTest::Unique => list_has_duplicates::<R>(list),
+                    ListTest::MinItems(n) => (list.len()? as u64) < *n,
+                    ListTest::MaxItems(n) => list.len()? as u64 > *n,
+                    ListTest::Unique => list_has_duplicates::<R>(list)?,
                 }
             }
             Self::Map(test) => {
                 let len = match value {
-                    Some(Val::Map(map)) => map.len() as u64,
+                    Some(Val::Map(map)) => map.len()? as u64,
                     _ => 0,
                 };
                 match test {
@@ -516,10 +529,10 @@ impl Test {
                     MapTest::MaxPairs(n) => len > *n,
                 }
             }
-            Self::Duration(cmp) => cmp.fails(&Duration(nanos_of(value))),
-            Self::Timestamp(cmp) => cmp.fails(&Timestamp(nanos_of(value))),
-            Self::Now(test) => test.fails(Timestamp(nanos_of(value))),
-            Self::FieldMask(test) => test.fails(&paths_of(value)),
+            Self::Duration(cmp) => cmp.fails(&Duration(nanos_of(value)?)),
+            Self::Timestamp(cmp) => cmp.fails(&Timestamp(nanos_of(value)?)),
+            Self::Now(test) => test.fails(Timestamp(nanos_of(value)?)),
+            Self::FieldMask(test) => test.fails(&paths_of(value)?),
         })
     }
 }

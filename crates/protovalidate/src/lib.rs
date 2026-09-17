@@ -36,14 +36,14 @@
 //! let mut validator = Validator::new();
 //! validator.add_file_descriptor_bytes(&file_descriptor_proto)?;
 //!
-//! match validator.validate_message::<MyRuntime>(type_name, &message, payload, false) {
+//! match validator.validate_message::<MyRuntime>(type_name, &message, false) {
 //!     Ok(()) => { /* valid */ }
 //!     Err(Error::Validation(e)) => {
 //!         // The message broke its rules; e.violations() is a serialized
 //!         // buf.validate.Violations describing each failure.
 //!     }
-//!     // Validation itself failed: unknown type, unparsable payload,
-//!     // rules that do not compile or evaluate.
+//!     // Validation itself failed: unknown type, rules that do not compile
+//!     // or evaluate, or the runtime could not read the message.
 //!     Err(e) => return Err(e.into()),
 //! }
 //! ```

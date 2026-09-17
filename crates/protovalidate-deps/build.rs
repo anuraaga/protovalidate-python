@@ -264,8 +264,6 @@ fn main() {
     );
     celcpp_lib.antlr4_defines();
 
-    // The shim that drives cel-cpp. protovalidate's functions are registered
-    // from Rust; only `getField`, which reads message fields, is C++.
     rerun_if_changed(&shim);
     let mut shim_lib = CxxLib::with_files(
         "celshim",

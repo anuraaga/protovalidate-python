@@ -27,3 +27,18 @@ mod library;
 
 pub(crate) use cpp::{Env, new_env};
 pub(crate) use protovalidate_deps::{Error, Expression, Frame, Program, Scalar, This, Value};
+
+/// The backend's failures as the validator reports them once rules run: an
+/// expression failing is an evaluation error, a payload the backend cannot
+/// parse an argument error, and anything else is unexpected. A rule that
+/// does not compile is reported by the rules builder, as a compilation
+/// error.
+impl From<Error> for crate::Error {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Runtime(message) => Self::Evaluation(message),
+            Error::Argument(message) => Self::Argument(message),
+            Error::Compilation(message) | Error::Unexpected(message) => Self::Unexpected(message),
+        }
+    }
+}

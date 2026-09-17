@@ -15,7 +15,7 @@
 //! The string rules.
 
 use super::{Native, regex};
-use crate::rules::CompileError;
+use crate::Error;
 use crate::rules::standard::format::List;
 use crate::rules::standard::{StrTest, Test, WellKnown};
 use crate::validate::__buffa::oneof;
@@ -50,11 +50,7 @@ fn well_known_enabled(rule: &oneof::string_rules::WellKnown, number: u32) -> boo
     }
 }
 
-pub(super) fn checks(
-    prefix: &str,
-    r: &StringRules,
-    number: u32,
-) -> Result<Vec<Native>, CompileError> {
+pub(super) fn checks(prefix: &str, r: &StringRules, number: u32) -> Result<Vec<Native>, Error> {
     let str_check = |suffix: &str, message: String, test: StrTest| {
         Ok(vec![Native::new(prefix, suffix, message, Test::Str(test))])
     };

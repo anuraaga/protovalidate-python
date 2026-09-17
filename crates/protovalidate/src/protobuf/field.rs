@@ -15,9 +15,7 @@
 //! What the validator tells a runtime about a field it asks for.
 
 use buffa::editions::FieldPresence;
-use buffa_descriptor::{
-    DescriptorPool, FieldDescriptor, FieldKind, MessageDescriptor, ScalarType, SingularKind,
-};
+use buffa_descriptor::{DescriptorPool, FieldDescriptor, FieldKind, ScalarType, SingularKind};
 
 use crate::descriptors;
 
@@ -33,15 +31,10 @@ pub struct Field {
     kind: Kind,
     message_type: Option<String>,
     has_presence: bool,
-    oneof: Option<String>,
 }
 
 impl Field {
-    pub(crate) fn from_descriptor(
-        pool: &DescriptorPool,
-        message: &MessageDescriptor,
-        field: &FieldDescriptor,
-    ) -> Self {
+    pub(crate) fn from_descriptor(pool: &DescriptorPool, field: &FieldDescriptor) -> Self {
         let kind = match field.kind() {
             FieldKind::Singular(value) => Kind::Singular(singular(value)),
             FieldKind::List(element) => Kind::List(singular(element)),
@@ -50,11 +43,6 @@ impl Field {
                 value: singular(value),
             },
         };
-        let oneof = field
-            .oneof_index()
-            .and_then(|index| message.oneofs().get(usize::from(index)))
-            .filter(|oneof| !oneof.is_synthetic())
-            .map(|oneof| oneof.name().to_owned());
         Self {
             number: field.number(),
             name: field.name().to_owned(),
@@ -63,7 +51,6 @@ impl Field {
                 .map(|index| pool.message(index).full_name().to_owned()),
             has_presence: matches!(kind, Kind::Singular(_))
                 && field.presence() != FieldPresence::Implicit,
-            oneof,
         }
     }
 
@@ -76,7 +63,6 @@ impl Field {
             kind,
             message_type: None,
             has_presence: false,
-            oneof: None,
         }
     }
 
@@ -106,19 +92,13 @@ impl Field {
         self.message_type.as_deref()
     }
 
-    /// Whether the field tracks presence, so that
-    /// [`Message::has`](super::Message::has) means set rather than
-    /// non-default. Never for a list or map.
+    /// Whether the field tracks presence: a singular field that is
+    /// `optional`, a oneof member, or a message. Only such a field is asked
+    /// [`Message::has`](super::Message::has); the rest, lists and maps among
+    /// them, count as set when they are not their type's default.
     #[must_use]
     pub fn has_presence(&self) -> bool {
         self.has_presence
-    }
-
-    /// The name of the oneof the field is a member of. A proto3 `optional`
-    /// field's synthetic oneof does not count.
-    #[must_use]
-    pub fn oneof(&self) -> Option<&str> {
-        self.oneof.as_deref()
     }
 }
 
