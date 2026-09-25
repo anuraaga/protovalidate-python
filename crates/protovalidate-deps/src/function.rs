@@ -38,15 +38,14 @@ pub enum Arg<'a> {
     Int(i64),
     Uint(u64),
     Double(f64),
-    /// CEL strings are UTF-8; one that is not is read lossily.
+    /// CEL strings are UTF-8.
     String(Cow<'a, str>),
     Bytes(&'a [u8]),
     /// The list's elements, read up front.
     List(Vec<Element<'a>>),
 }
 
-/// A list element. [`Other`](Self::Other) is one that is not a scalar -- a
-/// message, say.
+/// A list element. [`Other`](Self::Other) is one that is not a scalar, e.g., a message.
 #[derive(Debug)]
 pub enum Element<'a> {
     Bool(bool),
@@ -61,6 +60,5 @@ pub enum Element<'a> {
 /// A function's implementation: a predicate over its arguments, or the
 /// message of the error the expression sees instead of a value.
 ///
-/// protovalidate's functions are all predicates, and the ABI carries only
-/// that; widen both when one is not.
+/// protovalidate's functions are all predicates.
 pub type NativeFn = fn(&[Arg<'_>]) -> Result<bool, String>;
