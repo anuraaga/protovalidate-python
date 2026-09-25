@@ -878,7 +878,7 @@ mod tests {
     use super::Builder;
     use crate::cel::{ScalarValue, This, Value};
     use crate::descriptors::{self, Descriptors};
-    use crate::protobuf::testing::{Never, Untyped};
+    use crate::protobuf::testing::Untyped;
     use crate::rules::ValidatorCache;
     use crate::rules::standard::Checks;
     use crate::validate::__buffa::oneof::field_rules::Type as RulesType;
@@ -964,7 +964,7 @@ mod tests {
             .message_index("test.Message")
             .expect("test.Message is in the pool");
         let mut out = ValidatorCache::<Untyped>::default();
-        Builder::new(&descriptors, &mut env, &Never)
+        Builder::new(&descriptors, &mut env, &Untyped)
             .build_closure(index, &ValidatorCache::default(), &mut out)
             .expect("every type resolves");
 

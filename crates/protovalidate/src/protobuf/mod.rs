@@ -169,7 +169,8 @@ pub(crate) mod testing {
 
     use super::{Field, List, Map, Message, Reader, Runtime, Val};
 
-    /// A runtime whose message types carry nothing.
+    /// A runtime whose message types carry nothing, which is also its own
+    /// reader.
     pub(crate) struct Untyped;
 
     impl Runtime for Untyped {
@@ -180,16 +181,13 @@ pub(crate) mod testing {
         type Map<'a> = Unread;
     }
 
-    /// Resolves every type to nothing, and never gives out a message.
-    pub(crate) struct Never;
-
-    impl Reader<Untyped> for Never {
+    impl Reader<Untyped> for Untyped {
         fn resolve(&self, _full_name: &str) -> Result<(), Infallible> {
             Ok(())
         }
 
         fn message<'a>(&'a self, _message_type: &'a ()) -> Result<Unread, Infallible> {
-            unreachable!("the test does not read a message")
+            Ok(Unread)
         }
     }
 

@@ -201,3 +201,17 @@ impl<R: Runtime> Validator<R> {
         self.cache.read().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Validator;
+    use crate::protobuf::testing::Untyped;
+
+    #[test]
+    fn message_without_rules_is_not_read() {
+        let validator = Validator::<Untyped>::new();
+        validator
+            .validate_message("buf.validate.FieldPathElement", &Untyped, false)
+            .expect("a message without rules is valid");
+    }
+}
