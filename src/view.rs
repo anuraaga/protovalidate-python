@@ -18,16 +18,16 @@
 //! protobuf-py and google.protobuf message objects, so a message is
 //! validated in place.
 
-use std::cell::OnceCell;
-use std::collections::HashMap;
+use std::cell::{OnceCell, RefCell};
 use std::ops::ControlFlow;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use protovalidate::protobuf::{Field, Kind, List, Map, Message, Runtime, Scalar, Singular, Val};
-use protovalidate::{Error, Validator};
+use protovalidate::protobuf::{
+    Field, Kind, List, Map, Message, Reader, Runtime, Scalar, Singular, Val,
+};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::sync::RwLockExt;
-use pyo3::types::{PyBytes, PyString, PyType};
+use pyo3::types::{PyBytes, PyString};
 
 use crate::constants::Constants;
 use crate::runtime::{FieldInfo, ProtoRuntime};
@@ -40,20 +40,21 @@ pub(crate) struct PyRuntime;
 
 impl Runtime for PyRuntime {
     type Error = ReadError;
+    type MessageType = Arc<TypeInfo>;
     type Message<'a> = MessageView<'a>;
     type List<'a> = ListView<'a>;
     type Map<'a> = MapView<'a>;
 }
 
-/// Where a message class keeps its fields, built once per class.
+/// Where the messages of one type keep their fields.
 pub(crate) struct TypeInfo {
     /// Sorted by field number.
     fields: Vec<FieldInfo>,
 }
 
 impl TypeInfo {
-    fn build(ctx: &Ctx<'_>, class: &Bound<'_, PyType>) -> PyResult<Self> {
-        let mut fields = ctx.runtime.fields(ctx.py, class, ctx.constants)?;
+    fn build(ctx: &Ctx<'_>, descriptor: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mut fields = ctx.runtime.fields(ctx.py, descriptor, ctx.constants)?;
         fields.sort_by_key(|field| field.number);
         Ok(Self { fields })
     }
@@ -67,70 +68,94 @@ impl TypeInfo {
     }
 }
 
-/// The type information of every message class read so far, by the class's
-/// address.
-#[derive(Default)]
-pub(crate) struct TypeCache(RwLock<HashMap<usize, CachedType>>);
-
-/// A class's type information, with the class kept alive so its address
-/// is not reused.
-struct CachedType {
-    _class: Py<PyType>,
-    info: Arc<TypeInfo>,
+/// Where a runtime finds a message type by name.
+pub(crate) enum TypeSource<'py> {
+    /// protobuf-py: a registry of the files registered with the engine.
+    Registry(&'py Bound<'py, PyAny>),
+    /// google.protobuf: the descriptor of the message being validated,
+    /// whose pool holds every type reachable from it.
+    Descriptor(&'py Bound<'py, PyAny>),
 }
 
-/// Everything a view needs besides its object, for the duration of one
-/// validation.
+/// A view's field values, by position in its type's fields.
+type Values = Box<[OnceCell<Option<Py<PyAny>>>]>;
+
+/// One validation: the message to validate, and everything a view needs
+/// besides its object.
 pub(crate) struct Ctx<'py> {
     py: Python<'py>,
     runtime: ProtoRuntime,
-    types: &'py TypeCache,
     constants: &'py Constants,
+    message: &'py Bound<'py, PyAny>,
+    source: TypeSource<'py>,
+    /// Value buffers of views already dropped, reused by the views that
+    /// follow.
+    free_values: RefCell<Vec<Values>>,
+    /// Likewise, the element buffers of list views already dropped.
+    free_items: RefCell<Vec<Vec<Py<PyAny>>>>,
 }
 
 impl<'py> Ctx<'py> {
     pub(crate) fn new(
         py: Python<'py>,
         runtime: ProtoRuntime,
-        types: &'py TypeCache,
         constants: &'py Constants,
+        message: &'py Bound<'py, PyAny>,
+        source: TypeSource<'py>,
     ) -> Self {
         Self {
             py,
             runtime,
-            types,
             constants,
+            message,
+            source,
+            free_values: RefCell::new(Vec::new()),
+            free_items: RefCell::new(Vec::new()),
         }
     }
 
-    /// Validates `message`, of type `type_name`, in place. A Python error
-    /// raised while reading the message comes back as [`Error::Read`].
-    pub(crate) fn validate(
-        &self,
-        validator: &Validator,
-        type_name: &str,
-        message: &Bound<'py, PyAny>,
-        fail_fast: bool,
-    ) -> Result<(), Error<ReadError>> {
-        let root = MessageView::new(self, message.clone())
-            .map_err(|error| Error::Read(Box::new(error)))?;
-        validator.validate_message::<PyRuntime>(type_name, &root, fail_fast)
+    /// An empty value buffer of at least `len` slots.
+    fn take_values(&self, len: usize) -> Values {
+        if len == 0 {
+            return Values::default();
+        }
+        let mut free = self.free_values.borrow_mut();
+        match free.iter().rposition(|values| values.len() >= len) {
+            Some(found) => free.swap_remove(found),
+            None => std::iter::repeat_with(OnceCell::new).take(len).collect(),
+        }
+    }
+}
+
+impl Reader<PyRuntime> for Ctx<'_> {
+    fn resolve(&self, full_name: &str) -> Result<Arc<TypeInfo>, ReadError> {
+        let descriptor = match self.source {
+            TypeSource::Registry(registry) => {
+                let descriptor = registry.call_method1(&self.constants.message, (full_name,))?;
+                if descriptor.is_none() {
+                    return Err(Box::new(PyValueError::new_err(format!(
+                        "message type {full_name} is not in the registry"
+                    ))));
+                }
+                descriptor
+            }
+            TypeSource::Descriptor(descriptor) => descriptor
+                .getattr(&self.constants.file)?
+                .getattr(&self.constants.pool)?
+                .call_method1(&self.constants.find_message_type_by_name, (full_name,))?,
+        };
+        Ok(Arc::new(TypeInfo::build(self, &descriptor)?))
     }
 
-    /// The type information of `object`'s class, built on first use.
-    fn type_info(&self, object: &Bound<'py, PyAny>) -> PyResult<Arc<TypeInfo>> {
-        let class = object.get_type();
-        let key = class.as_ptr().addr();
-        if let Some(cached) = self.types.0.read_py_attached(self.py).unwrap().get(&key) {
-            return Ok(Arc::clone(&cached.info));
-        }
-        let info = Arc::new(TypeInfo::build(self, &class)?);
-        let mut types = self.types.0.write_py_attached(self.py).unwrap();
-        let cached = types.entry(key).or_insert(CachedType {
-            _class: class.unbind(),
-            info,
-        });
-        Ok(Arc::clone(&cached.info))
+    fn message<'a>(
+        &'a self,
+        message_type: &'a Arc<TypeInfo>,
+    ) -> Result<MessageView<'a>, ReadError> {
+        Ok(MessageView::new(
+            self,
+            self.message.clone(),
+            Some(message_type),
+        ))
     }
 }
 
@@ -139,38 +164,51 @@ pub(crate) struct MessageView<'a> {
     ctx: &'a Ctx<'a>,
     /// `None` for a protobuf-py message field that is not set, which reads
     /// as a message with nothing set.
-    info: Option<Arc<TypeInfo>>,
+    info: Option<&'a TypeInfo>,
     object: Bound<'a, PyAny>,
     /// Field values already fetched, by position in `info.fields`, so a
     /// value is read once and borrowed from for as long as the view lives.
-    slots: Box<[OnceCell<Option<Bound<'a, PyAny>>>]>,
+    /// Returned to the context, emptied, when the view is dropped.
+    values: Values,
 }
 
 impl<'a> MessageView<'a> {
-    fn new(ctx: &'a Ctx<'a>, object: Bound<'a, PyAny>) -> PyResult<Self> {
-        let info = if object.is_none() {
-            None
-        } else {
-            Some(ctx.type_info(&object)?)
-        };
-        let slots = info.as_ref().map_or(0, |info| info.fields.len());
-        Ok(Self {
+    /// A view of `object`, of type `info`.
+    fn new(ctx: &'a Ctx<'a>, object: Bound<'a, PyAny>, info: Option<&'a TypeInfo>) -> Self {
+        let info = if object.is_none() { None } else { info };
+        let values = info.map_or(0, |info| info.fields.len());
+        Self {
             ctx,
             info,
             object,
-            slots: std::iter::repeat_with(OnceCell::new).take(slots).collect(),
-        })
+            values: ctx.take_values(values),
+        }
     }
 
     /// The field's value, `None` when it is not set and the runtime has no
     /// default object for it.
     fn value(&self, slot: usize, field: &FieldInfo) -> PyResult<Option<&Bound<'a, PyAny>>> {
-        let cell = &self.slots[slot];
+        let cell = &self.values[slot];
         if cell.get().is_none() {
             let fetched = field.fetch(&self.object, self.ctx.constants)?;
-            let _ = cell.set(fetched);
+            let _ = cell.set(fetched.map(Bound::unbind));
         }
-        Ok(cell.get().and_then(Option::as_ref))
+        Ok(cell
+            .get()
+            .and_then(Option::as_ref)
+            .map(|value| value.bind(self.ctx.py)))
+    }
+}
+
+impl Drop for MessageView<'_> {
+    fn drop(&mut self) {
+        for cell in &mut self.values {
+            cell.take();
+        }
+        let values = std::mem::take(&mut self.values);
+        if !values.is_empty() {
+            self.ctx.free_values.borrow_mut().push(values);
+        }
     }
 }
 
@@ -190,8 +228,8 @@ impl Message<PyRuntime> for MessageView<'_> {
     }
 
     #[inline]
-    fn has(&self, field: &Field) -> Result<bool, ReadError> {
-        let Some(info) = &self.info else {
+    fn has(&self, field: &Field<PyRuntime>) -> Result<bool, ReadError> {
+        let Some(info) = self.info else {
             return Ok(false);
         };
         let Some((slot, stored)) = info.find(field.number()) else {
@@ -207,10 +245,14 @@ impl Message<PyRuntime> for MessageView<'_> {
     }
 
     #[inline]
-    fn get(&self, field: &Field) -> Result<Option<Val<'_, PyRuntime>>, ReadError> {
-        let Some(info) = &self.info else {
+    fn get<'f>(
+        &'f self,
+        field: &'f Field<PyRuntime>,
+    ) -> Result<Option<Val<'f, PyRuntime>>, ReadError> {
+        let message_type = field.message_type().map(Arc::as_ref);
+        let Some(info) = self.info else {
             // Nothing is set: every field reads as its default.
-            return Ok(Some(convert(self.ctx, field.kind(), None)?));
+            return Ok(Some(convert(self.ctx, field.kind(), None, message_type)?));
         };
         let Some((slot, stored)) = info.find(field.number()) else {
             return Ok(None);
@@ -219,6 +261,7 @@ impl Message<PyRuntime> for MessageView<'_> {
             self.ctx,
             field.kind(),
             self.value(slot, stored)?,
+            message_type,
         )?))
     }
 }
@@ -229,13 +272,15 @@ fn convert<'a>(
     ctx: &'a Ctx<'a>,
     kind: Kind,
     value: Option<&'a Bound<'a, PyAny>>,
+    message_type: Option<&'a TypeInfo>,
 ) -> PyResult<Val<'a, PyRuntime>> {
     Ok(match kind {
-        Kind::Singular(kind) => singular(ctx, kind, value)?,
+        Kind::Singular(kind) => singular(ctx, kind, value, message_type)?,
         Kind::List(element) => Val::List(ListView {
             ctx,
             element,
             object: value,
+            message_type,
             items: OnceCell::new(),
         }),
         Kind::Map {
@@ -246,6 +291,7 @@ fn convert<'a>(
             key,
             element,
             object: value,
+            message_type,
         }),
     })
 }
@@ -254,14 +300,20 @@ fn singular<'a>(
     ctx: &'a Ctx<'a>,
     kind: Singular,
     value: Option<&'a Bound<'a, PyAny>>,
+    message_type: Option<&'a TypeInfo>,
 ) -> PyResult<Val<'a, PyRuntime>> {
     Ok(match kind {
-        Singular::Message => Val::Message(MessageView::new(
-            ctx,
-            value
+        Singular::Message => {
+            if value.is_some() && message_type.is_none() {
+                return Err(PyTypeError::new_err(
+                    "a message field was read without its message type",
+                ));
+            }
+            let object = value
                 .cloned()
-                .unwrap_or_else(|| ctx.py.None().into_bound(ctx.py)),
-        )?),
+                .unwrap_or_else(|| ctx.py.None().into_bound(ctx.py));
+            Val::Message(MessageView::new(ctx, object, message_type))
+        }
         Singular::Enum => Val::Enum(match value {
             Some(value) => value.extract::<i32>()?,
             None => 0,
@@ -313,21 +365,36 @@ pub(crate) struct ListView<'a> {
     element: Singular,
     /// `None` for an unset field, which is empty.
     object: Option<&'a Bound<'a, PyAny>>,
+    /// The type of the elements, if they are messages.
+    message_type: Option<&'a TypeInfo>,
     /// The elements, fetched all at once on first access and held here for
     /// values to borrow from.
-    items: OnceCell<Vec<Bound<'a, PyAny>>>,
+    items: OnceCell<Vec<Py<PyAny>>>,
 }
 
-impl<'a> ListView<'a> {
-    fn items(&self) -> PyResult<&[Bound<'a, PyAny>]> {
+impl ListView<'_> {
+    fn items(&self) -> PyResult<&[Py<PyAny>]> {
         if let Some(items) = self.items.get() {
             return Ok(items);
         }
-        let items = match self.object {
-            None => Vec::new(),
-            Some(object) => self.ctx.runtime.list_items(object)?,
-        };
+        let mut items = Vec::new();
+        if let Some(object) = self.object {
+            items = self.ctx.free_items.borrow_mut().pop().unwrap_or_default();
+            self.ctx.runtime.list_items(object, &mut items)?;
+        }
         Ok(self.items.get_or_init(|| items))
+    }
+}
+
+impl Drop for ListView<'_> {
+    fn drop(&mut self) {
+        let Some(mut items) = self.items.take() else {
+            return;
+        };
+        items.clear();
+        if items.capacity() > 0 {
+            self.ctx.free_items.borrow_mut().push(items);
+        }
     }
 }
 
@@ -346,7 +413,13 @@ impl List<PyRuntime> for ListView<'_> {
         let Some(item) = self.items()?.get(index) else {
             return Ok(None);
         };
-        Ok(Some(singular(self.ctx, self.element, Some(item))?))
+        let item = item.bind(self.ctx.py);
+        Ok(Some(singular(
+            self.ctx,
+            self.element,
+            Some(item),
+            self.message_type,
+        )?))
     }
 }
 
@@ -357,6 +430,8 @@ pub(crate) struct MapView<'a> {
     element: Singular,
     /// `None` for an unset field, which is empty.
     object: Option<&'a Bound<'a, PyAny>>,
+    /// The type of the values, if they are messages.
+    message_type: Option<&'a TypeInfo>,
 }
 
 impl Map<PyRuntime> for MapView<'_> {
@@ -380,7 +455,7 @@ impl Map<PyRuntime> for MapView<'_> {
             let (k, v) = entry?;
             let flow = f(
                 scalar_value(self.key, &k)?,
-                singular(self.ctx, self.element, Some(&v))?,
+                singular(self.ctx, self.element, Some(&v), self.message_type)?,
             );
             if flow.is_break() {
                 return Ok(());

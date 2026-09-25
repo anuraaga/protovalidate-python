@@ -45,7 +45,8 @@ impl std::error::Error for DescriptorError {}
 pub enum Error<E> {
     /// The message broke one or more of its rules.
     Validation(ValidationError),
-    /// The runtime could not read the message.
+    /// The runtime could not read the message, or resolve one of its
+    /// message types.
     Read(E),
     /// Validation rules could not be compiled.
     Compilation(String),

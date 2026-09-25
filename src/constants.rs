@@ -31,6 +31,8 @@ pub(crate) struct Types {
     pub(crate) field_options: Py<PyType>,
     /// The class `protobuf.wkt.MessageOptions`.
     pub(crate) message_options: Py<PyType>,
+    /// The class `protobuf.Registry`.
+    pub(crate) registry: Py<PyType>,
 }
 
 /// Extension objects used to read rules out of descriptor options.
@@ -44,12 +46,16 @@ pub(crate) struct Extensions {
 pub(crate) struct ConstantsInner {
     /// The string `DESCRIPTOR`.
     pub(crate) descriptor_upper: Py<PyString>,
+    /// The string `FindMessageTypeByName`.
+    pub(crate) find_message_type_by_name: Py<PyString>,
     /// The string `GetOptions`.
     pub(crate) get_options: Py<PyString>,
     /// The string `HasField`.
     pub(crate) has_field: Py<PyString>,
     /// The string `SerializeToString`.
     pub(crate) serialize_to_string: Py<PyString>,
+    /// The string `add`.
+    pub(crate) add: Py<PyString>,
     /// The string `dependencies`.
     pub(crate) dependencies: Py<PyString>,
     /// The string `desc`.
@@ -92,6 +98,8 @@ pub(crate) struct ConstantsInner {
     pub(crate) oneof: Py<PyString>,
     /// The string `options`.
     pub(crate) options: Py<PyString>,
+    /// The string `pool`.
+    pub(crate) pool: Py<PyString>,
     /// The string `_present`.
     pub(crate) present: Py<PyString>,
     /// The string `proto`.
@@ -132,9 +140,11 @@ impl Constants {
         Self {
             inner: Arc::new(ConstantsInner {
                 descriptor_upper: PyString::intern(py, "DESCRIPTOR").unbind(),
+                find_message_type_by_name: PyString::intern(py, "FindMessageTypeByName").unbind(),
                 get_options: PyString::intern(py, "GetOptions").unbind(),
                 has_field: PyString::intern(py, "HasField").unbind(),
                 serialize_to_string: PyString::intern(py, "SerializeToString").unbind(),
+                add: PyString::intern(py, "add").unbind(),
                 dependencies: PyString::intern(py, "dependencies").unbind(),
                 desc: PyString::intern(py, "desc").unbind(),
                 elements: PyString::intern(py, "elements").unbind(),
@@ -156,6 +166,7 @@ impl Constants {
                 number: PyString::intern(py, "number").unbind(),
                 oneof: PyString::intern(py, "oneof").unbind(),
                 options: PyString::intern(py, "options").unbind(),
+                pool: PyString::intern(py, "pool").unbind(),
                 present: PyString::intern(py, "_present").unbind(),
                 proto: PyString::intern(py, "proto").unbind(),
                 rule: PyString::intern(py, "rule").unbind(),
@@ -180,6 +191,7 @@ pub(crate) struct Imports {
 impl Imports {
     pub(crate) fn resolve(py: Python<'_>) -> PyResult<Self> {
         let validate = py.import("protovalidate._gen.buf.validate.validate_pb")?;
+        let protobuf = py.import("protobuf")?;
         let wkt = py.import("protobuf.wkt")?;
         Ok(Self {
             types: Types {
@@ -194,6 +206,10 @@ impl Imports {
                 field_options: wkt.getattr("FieldOptions")?.cast_into::<PyType>()?.unbind(),
                 message_options: wkt
                     .getattr("MessageOptions")?
+                    .cast_into::<PyType>()?
+                    .unbind(),
+                registry: protobuf
+                    .getattr("Registry")?
                     .cast_into::<PyType>()?
                     .unbind(),
             },

@@ -33,10 +33,10 @@
 //! ```ignore
 //! use protovalidate::{Error, Validator};
 //!
-//! let mut validator = Validator::new();
+//! let mut validator = Validator::<MyRuntime>::new();
 //! validator.add_file_descriptor_bytes(&file_descriptor_proto)?;
 //!
-//! match validator.validate_message::<MyRuntime>(type_name, &message, false) {
+//! match validator.validate_message(type_name, &message, false) {
 //!     Ok(()) => { /* valid */ }
 //!     Err(Error::Validation(e)) => {
 //!         // The message failed to evaluate against rules in the schema.

@@ -278,6 +278,7 @@ dependencies = [
  "buffa",
  "buffa-descriptor",
  "buffa-types",
+ "foldhash",
  "iri-string",
  "jiff",
  "percent-encoding",

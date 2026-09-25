@@ -43,12 +43,35 @@ pub use field::{Field, Kind, Scalar, Singular};
 pub trait Runtime: Sized {
     /// What a read fails with.
     type Error;
+    /// What the runtime needs to read messages of one type, such as where
+    /// their class stores each field.
+    type MessageType: Clone;
     /// A message.
     type Message<'a>: Message<Self>;
     /// A repeated field's elements.
     type List<'a>: List<Self>;
     /// A map field's entries.
     type Map<'a>: Map<Self>;
+}
+
+/// One validation's access to a runtime: the message to validate, along
+/// with whatever the runtime needs to read it and to resolve its message
+/// types.
+pub trait Reader<R: Runtime> {
+    /// The runtime's description of the message type called `full_name`,
+    /// a fully-qualified name without a leading dot.
+    ///
+    /// # Errors
+    ///
+    /// The runtime does not know the type.
+    fn resolve(&self, full_name: &str) -> Result<R::MessageType, R::Error>;
+
+    /// The message to validate, whose type `message_type` describes.
+    ///
+    /// # Errors
+    ///
+    /// The runtime could not read the message as that type.
+    fn message<'a>(&'a self, message_type: &'a R::MessageType) -> Result<R::Message<'a>, R::Error>;
 }
 
 /// A field's value, borrowed from the message that holds it.
@@ -75,16 +98,17 @@ pub trait Message<R: Runtime> {
     /// # Errors
     ///
     /// The runtime could not tell.
-    fn has(&self, field: &Field) -> Result<bool, R::Error>;
+    fn has(&self, field: &Field<R>) -> Result<bool, R::Error>;
 
     /// The field's value, or its type's default when it is not set. `None`
     /// when the message has no such field, as when its runtime knows an
-    /// older schema than the validator.
+    /// older schema than the validator. The value may borrow from `field`,
+    /// as a nested message borrows its type.
     ///
     /// # Errors
     ///
     /// The runtime could not read the field.
-    fn get(&self, field: &Field) -> Result<Option<Val<'_, R>>, R::Error>;
+    fn get<'f>(&'f self, field: &'f Field<R>) -> Result<Option<Val<'f, R>>, R::Error>;
 
     /// The serialized message, which the CEL runtime parses when a rule
     /// binds the message, or one of its repeated or map fields, to `this`.
@@ -134,4 +158,81 @@ pub trait Map<R: Runtime> {
     fn for_each<F>(&self, f: F) -> Result<(), R::Error>
     where
         F: FnMut(Val<'_, R>, Val<'_, R>) -> ControlFlow<()>;
+}
+
+/// A runtime that reads nothing, for tests of what happens before a
+/// message is read.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::convert::Infallible;
+    use std::ops::ControlFlow;
+
+    use super::{Field, List, Map, Message, Reader, Runtime, Val};
+
+    /// A runtime whose message types carry nothing.
+    pub(crate) struct Untyped;
+
+    impl Runtime for Untyped {
+        type Error = Infallible;
+        type MessageType = ();
+        type Message<'a> = Unread;
+        type List<'a> = Unread;
+        type Map<'a> = Unread;
+    }
+
+    /// Resolves every type to nothing, and never gives out a message.
+    pub(crate) struct Never;
+
+    impl Reader<Untyped> for Never {
+        fn resolve(&self, _full_name: &str) -> Result<(), Infallible> {
+            Ok(())
+        }
+
+        fn message<'a>(&'a self, _message_type: &'a ()) -> Result<Unread, Infallible> {
+            unreachable!("the test does not read a message")
+        }
+    }
+
+    /// A message, list or map that is never read.
+    pub(crate) struct Unread;
+
+    impl Message<Untyped> for Unread {
+        fn has(&self, _field: &Field<Untyped>) -> Result<bool, Infallible> {
+            unreachable!("the test does not read a message")
+        }
+
+        fn get<'f>(
+            &'f self,
+            _field: &'f Field<Untyped>,
+        ) -> Result<Option<Val<'f, Untyped>>, Infallible> {
+            unreachable!("the test does not read a message")
+        }
+
+        fn encode(&self) -> Result<Vec<u8>, Infallible> {
+            unreachable!("the test does not read a message")
+        }
+    }
+
+    impl List<Untyped> for Unread {
+        fn len(&self) -> Result<usize, Infallible> {
+            unreachable!("the test does not read a list")
+        }
+
+        fn get(&self, _index: usize) -> Result<Option<Val<'_, Untyped>>, Infallible> {
+            unreachable!("the test does not read a list")
+        }
+    }
+
+    impl Map<Untyped> for Unread {
+        fn len(&self) -> Result<usize, Infallible> {
+            unreachable!("the test does not read a map")
+        }
+
+        fn for_each<F>(&self, _f: F) -> Result<(), Infallible>
+        where
+            F: FnMut(Val<'_, Untyped>, Val<'_, Untyped>) -> ControlFlow<()>,
+        {
+            unreachable!("the test does not read a map")
+        }
+    }
 }

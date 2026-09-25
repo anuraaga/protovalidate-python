@@ -27,6 +27,7 @@ protovalidate-deps = { workspace = true, optional = true }
 buffa.workspace = true
 buffa-descriptor.workspace = true
 buffa-types.workspace = true
+foldhash.workspace = true
 iri-string.workspace = true
 jiff.workspace = true
 percent-encoding.workspace = true

@@ -15,28 +15,69 @@
 //! What the validator tells a runtime about a field it asks for.
 
 use std::borrow::Cow;
+use std::fmt;
 
 use buffa::editions::FieldPresence;
-use buffa_descriptor::{DescriptorPool, FieldDescriptor, FieldKind, ScalarType, SingularKind};
+use buffa_descriptor::{FieldDescriptor, FieldKind, ScalarType, SingularKind};
 
-use crate::descriptors;
+use super::Runtime;
 
 /// A field of the message being validated, as the validator describes it
 /// when asking a [`Message`](super::Message) for it.
 ///
 /// The description is resolved from the descriptors registered with the
 /// validator, and provided to a runtime.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Field {
+pub struct Field<R: Runtime> {
     number: u32,
     name: Cow<'static, str>,
     kind: Kind,
-    message_type: Option<String>,
+    message_type: Option<R::MessageType>,
     has_presence: bool,
 }
 
-impl Field {
-    pub(crate) fn from_descriptor(pool: &DescriptorPool, field: &FieldDescriptor) -> Self {
+impl<R: Runtime> Clone for Field<R> {
+    fn clone(&self) -> Self {
+        Self {
+            number: self.number,
+            name: self.name.clone(),
+            kind: self.kind,
+            message_type: self.message_type.clone(),
+            has_presence: self.has_presence,
+        }
+    }
+}
+
+impl<R: Runtime> fmt::Debug for Field<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Field")
+            .field("number", &self.number)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("has_presence", &self.has_presence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Runtime> PartialEq for Field<R>
+where
+    R::MessageType: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.number == other.number
+            && self.name == other.name
+            && self.kind == other.kind
+            && self.message_type == other.message_type
+            && self.has_presence == other.has_presence
+    }
+}
+
+impl<R: Runtime> Eq for Field<R> where R::MessageType: Eq {}
+
+impl<R: Runtime> Field<R> {
+    pub(crate) fn from_descriptor(
+        field: &FieldDescriptor,
+        message_type: Option<R::MessageType>,
+    ) -> Self {
         let kind = match field.kind() {
             FieldKind::Singular(value) => Kind::Singular(singular(value)),
             FieldKind::List(element) => Kind::List(singular(element)),
@@ -49,8 +90,7 @@ impl Field {
             number: field.number(),
             name: Cow::Owned(field.name().to_owned()),
             kind,
-            message_type: descriptors::message_type(field)
-                .map(|index| pool.message(index).full_name().to_owned()),
+            message_type,
             has_presence: matches!(kind, Kind::Singular(_))
                 && field.presence() != FieldPresence::Implicit,
         }
@@ -86,11 +126,12 @@ impl Field {
         self.kind
     }
 
-    /// The fully-qualified name of the message type the field holds,
-    /// whether as a singular value, repeated elements or map values.
+    /// The runtime's description of the message type the field holds,
+    /// whether as a singular value, repeated elements or map values, or
+    /// `None` for a field that holds no messages.
     #[must_use]
-    pub fn message_type(&self) -> Option<&str> {
-        self.message_type.as_deref()
+    pub fn message_type(&self) -> Option<&R::MessageType> {
+        self.message_type.as_ref()
     }
 
     /// Whether the field tracks presence, as a singular field that is

@@ -24,12 +24,13 @@ pub(crate) mod build;
 pub(crate) mod eval;
 pub(crate) mod standard;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use buffa_descriptor::MessageIndex;
 
 use crate::cel;
-use crate::protobuf::Field;
+use crate::protobuf::{Field, Runtime};
 use crate::validate::FieldPathElement;
 use standard::Checks;
 
@@ -54,82 +55,98 @@ pub(crate) struct CelPrograms {
 }
 
 /// A message type's validator, or why its rules did not compile.
-pub(crate) type Built = Result<Arc<MessageValidator>, String>;
+pub(crate) type Built<R> = Result<Arc<MessageValidator<R>>, String>;
+
+/// The compiled rules of every message type validated so far.
+pub(crate) type ValidatorCache<R> = HashMap<MessageIndex, Built<R>, foldhash::fast::RandomState>;
 
 /// The rules of one message type. A message-typed field's messages are
 /// evaluated inside that field, after its own rules.
-pub(crate) struct MessageValidator {
+pub(crate) struct MessageValidator<R: Runtime> {
+    /// The runtime's description of the type.
+    pub message_type: R::MessageType,
     pub cel: Option<CelPrograms>,
-    pub message_oneofs: Vec<MessageOneof>,
-    pub oneofs: Vec<OneofRequired>,
+    pub message_oneofs: Vec<MessageOneof<R>>,
+    pub oneofs: Vec<OneofRequired<R>>,
     /// The fields with rules, or why a field's rules did not compile.
-    pub fields: Vec<Result<FieldValidator, String>>,
+    pub fields: Vec<Result<FieldValidator<R>, String>>,
 }
 
 /// A `(buf.validate.message).oneof` rule.
-pub(crate) struct MessageOneof {
-    pub fields: Vec<Field>,
+pub(crate) struct MessageOneof<R: Runtime> {
+    pub fields: Vec<Field<R>>,
     /// The member names joined with `, `, as the violation message prints them.
     pub names: String,
     pub required: bool,
 }
 
 /// A `(buf.validate.oneof).required` rule.
-pub(crate) struct OneofRequired {
+pub(crate) struct OneofRequired<R: Runtime> {
     pub element: FieldPathElement,
-    pub members: Vec<Field>,
+    pub members: Vec<Field<R>>,
 }
 
 /// The rules of one field.
-pub(crate) struct FieldValidator {
-    pub field: Field,
+pub(crate) struct FieldValidator<R: Runtime> {
+    pub field: Field<R>,
     pub element: FieldPathElement,
     pub required: bool,
     /// Whether to skip the rules when the field is not set.
     pub ignore_empty: bool,
     /// The rules of the field's own value. For a container, that is the
     /// whole list or map.
-    pub value: ValueValidator,
-    pub kind: FieldKind,
+    pub value: ValueValidator<R>,
+    pub kind: FieldKind<R>,
 }
 
 /// How a field holds its values, and the validators of the values inside a
 /// container.
-pub(crate) enum FieldKind {
+pub(crate) enum FieldKind<R: Runtime> {
     Singular,
     List {
-        items: Option<Box<ItemValidator>>,
+        items: Option<Box<ItemValidator<R>>>,
     },
     Map {
         /// The field's path element with the key and value types filled in.
         /// Per-entry violations add the key as its subscript.
         element: FieldPathElement,
-        keys: Option<Box<ItemValidator>>,
-        values: Option<Box<ItemValidator>>,
+        keys: Option<Box<ItemValidator<R>>>,
+        values: Option<Box<ItemValidator<R>>>,
     },
 }
 
 /// The rules of the elements of a repeated field, or the keys or values of
 /// a map.
-pub(crate) struct ItemValidator {
+pub(crate) struct ItemValidator<R: Runtime> {
     /// Whether to skip an item that is its type's zero value.
     pub ignore_empty: bool,
-    pub value: ValueValidator,
+    pub value: ValueValidator<R>,
 }
 
 /// The rules of one value.
-#[derive(Default)]
-pub(crate) struct ValueValidator {
+pub(crate) struct ValueValidator<R: Runtime> {
     /// The `(buf.validate.field).cel` and `.cel_expression` rules.
     pub custom: Option<CelPrograms>,
     /// The native rule checks.
     pub checks: Checks,
     /// The field to validate for wrapper types.
-    pub wrapper: Option<Field>,
+    pub wrapper: Option<Field<R>>,
     /// The predefined CEL of the standard rules for which we do not have
     /// native rule implementations.
     pub predefined: Option<CelPrograms>,
     /// The message type of the value, whose own rules are evaluated after
     /// these.
     pub nested: Option<MessageIndex>,
+}
+
+impl<R: Runtime> Default for ValueValidator<R> {
+    fn default() -> Self {
+        Self {
+            custom: None,
+            checks: Checks::default(),
+            wrapper: None,
+            predefined: None,
+            nested: None,
+        }
+    }
 }

@@ -479,9 +479,52 @@ impl UniqueKey<'_> {
     }
 }
 
+/// How many keys [`has_duplicates`] compares pairwise before it switches
+/// to hashing.
+const PAIRWISE_KEYS: usize = 16;
+
 /// Whether any key occurs twice. Elements without a key never count as
 /// duplicates.
 pub(crate) fn has_duplicates<'a>(keys: impl IntoIterator<Item = Option<UniqueKey<'a>>>) -> bool {
-    let mut seen = HashSet::new();
-    keys.into_iter().flatten().any(|key| !seen.insert(key))
+    let mut keys = keys.into_iter().flatten();
+    let mut first: [Option<UniqueKey<'a>>; PAIRWISE_KEYS] = [const { None }; PAIRWISE_KEYS];
+    for (len, key) in keys.by_ref().enumerate() {
+        if first[..len].iter().any(|seen| seen.as_ref() == Some(&key)) {
+            return true;
+        }
+        if len == PAIRWISE_KEYS {
+            let mut seen: HashSet<_, foldhash::fast::RandomState> =
+                first.iter_mut().filter_map(Option::take).collect();
+            seen.insert(key);
+            return keys.any(|key| !seen.insert(key));
+        }
+        first[len] = Some(key);
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PAIRWISE_KEYS, UniqueKey, has_duplicates};
+
+    fn ints(values: impl IntoIterator<Item = i64>) -> Vec<Option<UniqueKey<'static>>> {
+        values
+            .into_iter()
+            .map(|value| Some(UniqueKey::Int(value)))
+            .collect()
+    }
+
+    #[test]
+    fn duplicates_compared_pairwise() {
+        assert!(!has_duplicates(ints(0..3)));
+        assert!(has_duplicates(ints([1, 2, 1])));
+        assert!(!has_duplicates([None, None, Some(UniqueKey::Str("a"))]));
+    }
+
+    #[test]
+    fn duplicates_hashed() {
+        let len = i64::try_from(PAIRWISE_KEYS).unwrap() + 4;
+        assert!(!has_duplicates(ints(0..len)));
+        assert!(has_duplicates(ints((0..len).chain([len - 1]))));
+    }
 }

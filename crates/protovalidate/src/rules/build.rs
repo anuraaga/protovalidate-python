@@ -26,27 +26,30 @@ use buffa::editions::FieldPresence;
 use buffa_descriptor::generated::descriptor::field_descriptor_proto::Type;
 use buffa_descriptor::reflect::{DynamicMessage, ReflectMessage as _, ValueRef};
 use buffa_descriptor::{
-    DescriptorPool, EnumIndex, FieldDescriptor, FieldKind as DescriptorKind, MessageDescriptor,
-    MessageIndex, SingularKind,
+    EnumIndex, FieldDescriptor, FieldKind as DescriptorKind, MessageDescriptor, MessageIndex,
+    SingularKind,
 };
 
 use super::standard::build::Placement;
 use super::standard::{self, Checks};
 use super::{
-    Built, CelPrograms, CelRule, FieldKind, FieldValidator, ItemValidator, MessageOneof,
-    MessageValidator, OneofRequired, ValueValidator,
+    CelPrograms, CelRule, FieldKind, FieldValidator, ItemValidator, MessageOneof, MessageValidator,
+    OneofRequired, ValidatorCache, ValueValidator,
 };
 use crate::cel::{Env, Expression};
 use crate::descriptors::{self, Descriptors};
-use crate::protobuf::Field;
+use crate::protobuf::{Field, Reader, Runtime};
 use crate::validate::__buffa::oneof::field_path_element::Subscript;
 use crate::validate::__buffa::oneof::field_rules::Type as RulesType;
 use crate::validate::{FieldPathElement, FieldRules, Ignore, MessageRules, Rule};
 
 /// Compiles the rules of message types.
-pub(crate) struct Builder<'a> {
+pub(crate) struct Builder<'a, R: Runtime> {
     descriptors: &'a Descriptors,
     env: &'a mut Env,
+    reader: &'a dyn Reader<R>,
+    /// The message types the rules being built refer to.
+    types: HashMap<MessageIndex, R::MessageType>,
 }
 
 /// The value a set of rules applies to.
@@ -202,7 +205,7 @@ fn entry_element(field: &FieldDescriptor) -> FieldPathElement {
 
 /// The message type of a field's values, whether the field holds them
 /// directly or in its items.
-fn nested_type(field: &FieldValidator) -> Option<MessageIndex> {
+fn nested_type<R: Runtime>(field: &FieldValidator<R>) -> Option<MessageIndex> {
     let items = match &field.kind {
         FieldKind::List { items } => items.as_deref(),
         FieldKind::Map { values, .. } => values.as_deref(),
@@ -276,35 +279,71 @@ fn scalar_rules(rules: &RulesType) -> Option<(&'static str, Type, Option<&'stati
     })
 }
 
-impl<'a> Builder<'a> {
-    pub(crate) fn new(descriptors: &'a Descriptors, env: &'a mut Env) -> Self {
-        Self { descriptors, env }
+impl<'a, R: Runtime> Builder<'a, R> {
+    pub(crate) fn new(
+        descriptors: &'a Descriptors,
+        env: &'a mut Env,
+        reader: &'a dyn Reader<R>,
+    ) -> Self {
+        Self {
+            descriptors,
+            env,
+            reader,
+            types: HashMap::new(),
+        }
     }
 
     /// Compiles `root` and every message type reachable from it into
     /// `out`, skipping the types already in `known`.
+    ///
+    /// # Errors
+    ///
+    /// The reader did not know one of the message types, in which case
+    /// nothing is added to `out`.
     pub(crate) fn build_closure(
         &mut self,
         root: MessageIndex,
-        known: &HashMap<MessageIndex, Built>,
-        out: &mut HashMap<MessageIndex, Built>,
-    ) {
-        // The reference is copied out of `self`, so the loop below can still
-        // take `&mut self`.
+        known: &ValidatorCache<R>,
+        out: &mut ValidatorCache<R>,
+    ) -> Result<(), R::Error> {
+        // The reference is copied out of `self`, so the loops below can
+        // still take `&mut self`.
         let descriptors: &'a Descriptors = self.descriptors;
         let pool = &descriptors.pool;
-        let mut built: HashMap<MessageIndex, Result<MessageValidator, String>> = HashMap::new();
+        let mut to_build = HashSet::new();
         let mut pending = vec![root];
         while let Some(idx) = pending.pop() {
-            if known.contains_key(&idx) || built.contains_key(&idx) {
+            if known.contains_key(&idx) || !to_build.insert(idx) {
                 continue;
             }
-            built.insert(idx, self.build_message(pool.message(idx)));
             for field in pool.message(idx).fields() {
                 if let Some(nested) = descriptors::message_type(field) {
                     pending.push(nested);
                 }
             }
+        }
+
+        for &idx in &to_build {
+            let referenced = pool
+                .message(idx)
+                .fields()
+                .iter()
+                .filter_map(descriptors::message_type);
+            for idx in std::iter::once(idx).chain(referenced) {
+                if self.types.contains_key(&idx) {
+                    continue;
+                }
+                let message_type = match known.get(&idx) {
+                    Some(Ok(validator)) => validator.message_type.clone(),
+                    _ => self.reader.resolve(pool.message(idx).full_name())?,
+                };
+                self.types.insert(idx, message_type);
+            }
+        }
+
+        let mut built: HashMap<MessageIndex, Result<MessageValidator<R>, String>> = HashMap::new();
+        for idx in to_build {
+            built.insert(idx, self.build_message(idx));
         }
 
         // A field whose message type did not compile does not compile either.
@@ -347,16 +386,34 @@ impl<'a> Builder<'a> {
                 .into_iter()
                 .map(|(idx, validator)| (idx, validator.map(Arc::new))),
         );
+        Ok(())
     }
 
-    fn build_message(&mut self, message: &MessageDescriptor) -> Result<MessageValidator, String> {
+    /// The field that `field` describes, with its message type.
+    fn field(&self, field: &FieldDescriptor) -> Field<R> {
+        let message_type = descriptors::message_type(field).map(|idx| {
+            self.types
+                .get(&idx)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the message type {} was not resolved before the rules referring to it were built",
+                        self.descriptors.pool.message(idx).full_name()
+                    )
+                })
+                .clone()
+        });
+        Field::from_descriptor(field, message_type)
+    }
+
+    fn build_message(&mut self, idx: MessageIndex) -> Result<MessageValidator<R>, String> {
         let pool = &*self.descriptors.pool;
+        let message = pool.message(idx);
         let rules = descriptors::message_rules(message);
         let MessageLevel {
             oneofs: message_oneofs,
             members,
         } = match &rules {
-            Some(rules) => message_oneofs(pool, message, rules)?,
+            Some(rules) => self.message_oneofs(message, rules)?,
             None => MessageLevel::default(),
         };
         let cel = match &rules {
@@ -388,15 +445,16 @@ impl<'a> Builder<'a> {
         }
 
         Ok(MessageValidator {
+            message_type: self.types[&idx].clone(),
             cel,
             message_oneofs,
-            oneofs: Self::required_oneofs(pool, message),
+            oneofs: self.required_oneofs(message),
             fields,
         })
     }
 
     /// The oneof declarations marked `required`.
-    fn required_oneofs(pool: &DescriptorPool, message: &MessageDescriptor) -> Vec<OneofRequired> {
+    fn required_oneofs(&self, message: &MessageDescriptor) -> Vec<OneofRequired<R>> {
         message
             .oneofs()
             .iter()
@@ -409,10 +467,52 @@ impl<'a> Builder<'a> {
                     .field_indices()
                     .iter()
                     .filter_map(|&index| message.fields().get(usize::from(index)))
-                    .map(|field| Field::from_descriptor(pool, field))
+                    .map(|field| self.field(field))
                     .collect(),
             })
             .collect()
+    }
+
+    /// The `(buf.validate.message).oneof` rules, and the fields they name.
+    fn message_oneofs<'m>(
+        &self,
+        message: &'m MessageDescriptor,
+        rules: &'m MessageRules,
+    ) -> Result<MessageLevel<'m, R>, String> {
+        let mut oneofs = Vec::new();
+        let mut members = HashSet::new();
+        for oneof in &rules.oneof {
+            if oneof.fields.is_empty() {
+                return Err(format!(
+                    "at least one field must be specified in oneof rule for the message {}",
+                    message.full_name()
+                ));
+            }
+            let mut seen = HashSet::new();
+            let mut fields = Vec::with_capacity(oneof.fields.len());
+            for name in &oneof.fields {
+                if !seen.insert(name.as_str()) {
+                    return Err(format!(
+                        "duplicate \"{name}\" in oneof rule for the message {}",
+                        message.full_name()
+                    ));
+                }
+                let Some(field) = message.field_by_name(name) else {
+                    return Err(format!(
+                        "field \"{name}\" not found in message {}",
+                        message.full_name()
+                    ));
+                };
+                fields.push(self.field(field));
+            }
+            oneofs.push(MessageOneof {
+                fields,
+                names: oneof.fields.join(", "),
+                required: oneof.required.unwrap_or(false),
+            });
+            members.extend(oneof.fields.iter().map(String::as_str));
+        }
+        Ok(MessageLevel { oneofs, members })
     }
 
     /// The validator of a field, or `None` when its rules say to always
@@ -421,7 +521,7 @@ impl<'a> Builder<'a> {
         &mut self,
         field: &FieldDescriptor,
         rules: &FieldRules,
-    ) -> Result<Option<FieldValidator>, String> {
+    ) -> Result<Option<FieldValidator<R>>, String> {
         if rules.ignore == Some(Ignore::IGNORE_ALWAYS) {
             return Ok(None);
         }
@@ -429,7 +529,7 @@ impl<'a> Builder<'a> {
         let value = self.build_value(target, rules, &[])?;
         let kind = self.build_kind(field, target, rules)?;
         Ok(Some(FieldValidator {
-            field: Field::from_descriptor(&self.descriptors.pool, field),
+            field: self.field(field),
             element: descriptors::path_element(field),
             required: rules.required.unwrap_or(false),
             ignore_empty: target.ignore_empty(rules),
@@ -444,7 +544,7 @@ impl<'a> Builder<'a> {
         field: &FieldDescriptor,
         target: Target,
         rules: &FieldRules,
-    ) -> Result<FieldKind, String> {
+    ) -> Result<FieldKind<R>, String> {
         let schema = &self.descriptors.schema;
         match target.kind {
             DescriptorKind::Singular(_) => Ok(FieldKind::Singular),
@@ -484,7 +584,7 @@ impl<'a> Builder<'a> {
         target: Target,
         rules: Option<&FieldRules>,
         prefix: &[FieldPathElement],
-    ) -> Result<Option<Box<ItemValidator>>, String> {
+    ) -> Result<Option<Box<ItemValidator<R>>>, String> {
         let Some(rules) = rules else {
             return Ok(target.nested().map(|nested| {
                 Box::new(ItemValidator {
@@ -511,7 +611,7 @@ impl<'a> Builder<'a> {
         target: Target,
         rules: &FieldRules,
         prefix: &[FieldPathElement],
-    ) -> Result<ValueValidator, String> {
+    ) -> Result<ValueValidator<R>, String> {
         let schema = &self.descriptors.schema;
         let custom = custom_rules(
             &rules.cel_expression,
@@ -543,16 +643,15 @@ impl<'a> Builder<'a> {
         target: Target,
         standard: &RulesType,
         prefix: &[FieldPathElement],
-        value: &mut ValueValidator,
+        value: &mut ValueValidator<R>,
         predefined: &mut CelExpressions,
     ) -> Result<(), String> {
         if let Some((name, expected, wrapper)) = scalar_rules(standard) {
             self.check_scalar_type(&target, expected, wrapper)?;
-            let pool = &*self.descriptors.pool;
             value.wrapper = self
                 .message(&target)
                 .and_then(|wrapper| wrapper.field(1))
-                .map(|field| Field::from_descriptor(pool, field));
+                .map(|field| self.field(field));
             let enum_ = match target.kind {
                 DescriptorKind::Singular(SingularKind::Enum(idx)) => Some(idx),
                 _ => None,
@@ -753,59 +852,23 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// The `(buf.validate.message).oneof` rules, and the fields they name.
-fn message_oneofs<'m>(
-    pool: &DescriptorPool,
-    message: &'m MessageDescriptor,
-    rules: &'m MessageRules,
-) -> Result<MessageLevel<'m>, String> {
-    let mut oneofs = Vec::new();
-    let mut members = HashSet::new();
-    for oneof in &rules.oneof {
-        if oneof.fields.is_empty() {
-            return Err(format!(
-                "at least one field must be specified in oneof rule for the message {}",
-                message.full_name()
-            ));
-        }
-        let mut seen = HashSet::new();
-        let mut fields = Vec::with_capacity(oneof.fields.len());
-        for name in &oneof.fields {
-            if !seen.insert(name.as_str()) {
-                return Err(format!(
-                    "duplicate \"{name}\" in oneof rule for the message {}",
-                    message.full_name()
-                ));
-            }
-            let Some(field) = message.field_by_name(name) else {
-                return Err(format!(
-                    "field \"{name}\" not found in message {}",
-                    message.full_name()
-                ));
-            };
-            fields.push(Field::from_descriptor(pool, field));
-        }
-        oneofs.push(MessageOneof {
-            fields,
-            names: oneof.fields.join(", "),
-            required: oneof.required.unwrap_or(false),
-        });
-        members.extend(oneof.fields.iter().map(String::as_str));
-    }
-    Ok(MessageLevel { oneofs, members })
+/// A message's oneof rules, and the fields they name.
+struct MessageLevel<'m, R: Runtime> {
+    oneofs: Vec<MessageOneof<R>>,
+    members: HashSet<&'m str>,
 }
 
-/// A message's oneof rules, and the fields they name.
-#[derive(Default)]
-struct MessageLevel<'m> {
-    oneofs: Vec<MessageOneof>,
-    members: HashSet<&'m str>,
+impl<R: Runtime> Default for MessageLevel<'_, R> {
+    fn default() -> Self {
+        Self {
+            oneofs: Vec::new(),
+            members: HashSet::new(),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "cel"))]
 mod tests {
-    use std::collections::HashMap;
-
     use buffa::{ExtensionSet as _, UnknownField, UnknownFieldData};
     use buffa_descriptor::generated::descriptor::field_descriptor_proto::{Label, Type};
     use buffa_descriptor::generated::descriptor::{
@@ -815,6 +878,8 @@ mod tests {
     use super::Builder;
     use crate::cel::{ScalarValue, This, Value};
     use crate::descriptors::{self, Descriptors};
+    use crate::protobuf::testing::{Never, Untyped};
+    use crate::rules::ValidatorCache;
     use crate::rules::standard::Checks;
     use crate::validate::__buffa::oneof::field_rules::Type as RulesType;
     use crate::validate::{FIELD, FieldRules, PREDEFINED, PredefinedRules, Rule, StringRules};
@@ -898,8 +963,10 @@ mod tests {
             .pool
             .message_index("test.Message")
             .expect("test.Message is in the pool");
-        let mut out = HashMap::new();
-        Builder::new(&descriptors, &mut env).build_closure(index, &HashMap::new(), &mut out);
+        let mut out = ValidatorCache::<Untyped>::default();
+        Builder::new(&descriptors, &mut env, &Never)
+            .build_closure(index, &ValidatorCache::default(), &mut out)
+            .expect("every type resolves");
 
         let validator = out[&index].as_ref().expect("the message compiles");
         let field = validator.fields[0].as_ref().expect("the field compiles");

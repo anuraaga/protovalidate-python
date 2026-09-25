@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
@@ -22,15 +21,12 @@ use buffa_descriptor::generated::descriptor::{FileDescriptorProto, FileDescripto
 
 use crate::cel;
 use crate::descriptors::{self, Descriptors};
-use crate::protobuf::Runtime;
-use crate::rules::Built;
+use crate::protobuf::{Reader, Runtime};
+use crate::rules::ValidatorCache;
 use crate::rules::build::Builder;
 use crate::rules::eval::Walk;
 use crate::validate::{Violation as ViolationPb, Violations};
 use crate::{DescriptorError, Error, ValidationError};
-
-/// The compiled rules of every message type validated so far.
-type Cache = HashMap<MessageIndex, Built>;
 
 /// The violations as a serialized `buf.validate.Violations`.
 fn encode_violations(violations: Vec<ViolationPb>) -> Vec<u8> {
@@ -52,26 +48,27 @@ pub(crate) fn cel_env(set: &FileDescriptorSet) -> cel::Env {
     env
 }
 
-/// Validates Protobuf messages against the rules in their descriptors.
-pub struct Validator {
+/// Validates Protobuf messages, read through the runtime `R`, against the
+/// rules in their descriptors.
+pub struct Validator<R: Runtime> {
     descriptors: Descriptors,
     env: RwLock<cel::Env>,
-    cache: RwLock<Cache>,
+    cache: RwLock<ValidatorCache<R>>,
 }
 
-impl fmt::Debug for Validator {
+impl<R: Runtime> fmt::Debug for Validator<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Validator").finish_non_exhaustive()
     }
 }
 
-impl Default for Validator {
+impl<R: Runtime> Default for Validator<R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Validator {
+impl<R: Runtime> Validator<R> {
     /// Creates a validator.
     ///
     /// Use `add_*` methods to register file descriptors for the messages you will validate.
@@ -82,7 +79,7 @@ impl Validator {
         Self {
             descriptors: Descriptors::from_set(base),
             env: RwLock::new(env),
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(ValidatorCache::default()),
         }
     }
 
@@ -132,13 +129,13 @@ impl Validator {
     /// unparsable payload ([`Error::Argument`]), rules that do not compile
     /// ([`Error::Compilation`]), or a rule failing to evaluate
     /// ([`Error::Evaluation`]).
-    pub fn validate_message<R: Runtime>(
+    pub fn validate_message(
         &self,
         type_name: &str,
-        message: &R::Message<'_>,
+        reader: &dyn Reader<R>,
         fail_fast: bool,
     ) -> Result<(), Error<R::Error>> {
-        let violations = self.run::<R>(type_name, message, fail_fast)?;
+        let violations = self.run(type_name, reader, fail_fast)?;
         if violations.is_empty() {
             return Ok(());
         }
@@ -147,50 +144,60 @@ impl Validator {
         ))))
     }
 
-    fn run<R: Runtime>(
+    fn run(
         &self,
         type_name: &str,
-        message: &R::Message<'_>,
+        reader: &dyn Reader<R>,
         fail_fast: bool,
     ) -> Result<Vec<ViolationPb>, Error<R::Error>> {
         let index = self.message_index(type_name)?;
-        let validators = self.validators(index);
+        let validators = self.validators(index, reader)?;
         let env = self.env.read().unwrap_or_else(PoisonError::into_inner);
         let validator = validators[&index]
             .as_ref()
             .map_err(|error| Error::Compilation(error.clone()))?;
+        let message = reader
+            .message(&validator.message_type)
+            .map_err(Error::Read)?;
         let walk = Walk::<R>::new(&self.descriptors, &env, &validators, fail_fast);
-        walk.validate(validator, message, type_name)
+        walk.validate(validator, &message, type_name)
     }
 
-    fn message_index<E>(&self, type_name: &str) -> Result<MessageIndex, Error<E>> {
+    fn message_index(&self, type_name: &str) -> Result<MessageIndex, Error<R::Error>> {
         self.descriptors
             .pool
             .message_index(type_name)
             .ok_or_else(|| Error::Argument(format!("unknown message type: {type_name}")))
     }
 
-    /// The cache, including the rules of `index` and every type reachable from it.
-    fn validators(&self, index: MessageIndex) -> RwLockReadGuard<'_, Cache> {
+    /// The cache, including the rules of `index` and every type reachable
+    /// from it.
+    fn validators(
+        &self,
+        index: MessageIndex,
+        reader: &dyn Reader<R>,
+    ) -> Result<RwLockReadGuard<'_, ValidatorCache<R>>, Error<R::Error>> {
         let cache = self.read_cache();
         if cache.contains_key(&index) {
-            return cache;
+            return Ok(cache);
         }
-        let mut built = HashMap::new();
+        let mut built = ValidatorCache::default();
         {
             let mut env = self.env.write().unwrap_or_else(PoisonError::into_inner);
-            let mut builder = Builder::new(&self.descriptors, &mut env);
-            builder.build_closure(index, &cache, &mut built);
+            let mut builder = Builder::new(&self.descriptors, &mut env, reader);
+            builder
+                .build_closure(index, &cache, &mut built)
+                .map_err(Error::Read)?;
         }
         drop(cache);
         self.cache
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .extend(built);
-        self.read_cache()
+        Ok(self.read_cache())
     }
 
-    fn read_cache(&self) -> RwLockReadGuard<'_, Cache> {
+    fn read_cache(&self) -> RwLockReadGuard<'_, ValidatorCache<R>> {
         self.cache.read().unwrap_or_else(PoisonError::into_inner)
     }
 }

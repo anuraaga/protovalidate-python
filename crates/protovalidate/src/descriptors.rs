@@ -190,31 +190,38 @@ pub(crate) fn predefined_rules(field: &FieldDescriptor) -> Option<PredefinedRule
 
 /// The fields of well-known types the rules read through a runtime during validation.
 pub(crate) mod wkt {
-    use crate::protobuf::{Field, Kind, Scalar, Singular};
+    use crate::protobuf::{Field, Kind, Runtime, Scalar, Singular};
 
     /// `google.protobuf.Any.type_url`.
-    pub(crate) const ANY_TYPE_URL: Field = Field::well_known(
-        1,
-        "type_url",
-        Kind::Singular(Singular::Scalar(Scalar::String)),
-    );
+    pub(crate) const fn any_type_url<R: Runtime>() -> Field<R> {
+        Field::well_known(
+            1,
+            "type_url",
+            Kind::Singular(Singular::Scalar(Scalar::String)),
+        )
+    }
 
     // Small hack, since the field numbers are the same, and they could never
     // be changed, we use the same Fields for duration and timestamp.
 
     /// `seconds` of `google.protobuf.Duration` and `Timestamp`.
-    pub(crate) const SECONDS: Field = Field::well_known(
-        1,
-        "seconds",
-        Kind::Singular(Singular::Scalar(Scalar::Int64)),
-    );
+    pub(crate) const fn seconds<R: Runtime>() -> Field<R> {
+        Field::well_known(
+            1,
+            "seconds",
+            Kind::Singular(Singular::Scalar(Scalar::Int64)),
+        )
+    }
+
     /// `nanos` of `google.protobuf.Duration` and `Timestamp`.
-    pub(crate) const NANOS: Field =
-        Field::well_known(2, "nanos", Kind::Singular(Singular::Scalar(Scalar::Int32)));
+    pub(crate) const fn nanos<R: Runtime>() -> Field<R> {
+        Field::well_known(2, "nanos", Kind::Singular(Singular::Scalar(Scalar::Int32)))
+    }
 
     /// `google.protobuf.FieldMask.paths`.
-    pub(crate) const FIELD_MASK_PATHS: Field =
-        Field::well_known(1, "paths", Kind::List(Singular::Scalar(Scalar::String)));
+    pub(crate) const fn field_mask_paths<R: Runtime>() -> Field<R> {
+        Field::well_known(1, "paths", Kind::List(Singular::Scalar(Scalar::String)))
+    }
 }
 
 /// The fields of the `buf.validate` schema that rule paths name, resolved

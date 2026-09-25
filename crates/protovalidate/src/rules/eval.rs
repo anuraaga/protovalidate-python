@@ -21,7 +21,6 @@
 //! failing fast, propagates as an [`Abort`] through `?`.
 
 use std::cell::OnceCell;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 
@@ -32,8 +31,8 @@ use super::standard::{
     has_duplicates, total_nanos,
 };
 use super::{
-    Built, CelPrograms, FieldKind, FieldValidator, ItemValidator, MessageOneof, MessageValidator,
-    OneofRequired, ValueValidator,
+    CelPrograms, FieldKind, FieldValidator, ItemValidator, MessageOneof, MessageValidator,
+    OneofRequired, ValidatorCache, ValueValidator,
 };
 use crate::Error;
 use crate::cel::{self, Env, Frame, ScalarValue, This, Value};
@@ -81,17 +80,23 @@ impl<T, E> Read<T, E> for Result<T, E> {
     }
 }
 
+/// An element of the field path the walk is currently at.
+struct PathElement<'a> {
+    element: &'a FieldPathElement,
+    subscript: Option<Subscript>,
+}
+
 /// The violations found so far, and where the walk is.
-pub(crate) struct Violations {
+pub(crate) struct Violations<'a> {
     fail_fast: bool,
     /// The field path from the root to the value being validated.
-    path: Vec<FieldPathElement>,
+    path: Vec<PathElement<'a>>,
     /// Whether the value being validated is a map key.
     for_key: bool,
     list: Vec<Violation>,
 }
 
-impl Violations {
+impl Violations<'_> {
     fn new(fail_fast: bool) -> Self {
         Self {
             fail_fast,
@@ -109,15 +114,23 @@ impl Violations {
         message: &str,
         rule_path: &[FieldPathElement],
     ) -> Result<(), Abort<E>> {
-        let field_path = |elements: &[FieldPathElement]| {
+        let field_path = |elements: Vec<FieldPathElement>| {
             (!elements.is_empty()).then(|| FieldPath {
-                elements: elements.to_vec(),
+                elements,
                 ..Default::default()
             })
         };
+        let field = self
+            .path
+            .iter()
+            .map(|at| FieldPathElement {
+                subscript: at.subscript.clone(),
+                ..at.element.clone()
+            })
+            .collect();
         self.list.push(Violation {
-            field: field_path(&self.path).into(),
-            rule: field_path(rule_path).into(),
+            field: field_path(field).into(),
+            rule: field_path(rule_path.to_vec()).into(),
             rule_id: Some(id.to_owned()),
             message: Some(message.to_owned()),
             for_key: self.for_key.then_some(true),
@@ -133,8 +146,32 @@ impl Violations {
     /// Sets the subscript of the container field the walk is at to the
     /// item being validated.
     fn subscript(&mut self, subscript: Option<Subscript>) {
-        if let Some(element) = self.path.last_mut() {
-            element.subscript = subscript;
+        if let Some(at) = self.path.last_mut() {
+            at.subscript = subscript;
+        }
+    }
+
+    /// Sets the subscript of the container field the walk is at to the
+    /// item that was validated, in the violations recorded since
+    /// `recorded`.
+    fn subscript_since(&mut self, recorded: usize, subscript: impl FnOnce() -> Option<Subscript>) {
+        let (Some(depth), Some(violations)) = (
+            self.path.len().checked_sub(1),
+            self.list
+                .get_mut(recorded..)
+                .filter(|list| !list.is_empty()),
+        ) else {
+            return;
+        };
+        let subscript = subscript();
+        for violation in violations {
+            if let Some(element) = violation
+                .field
+                .as_option_mut()
+                .and_then(|field| field.elements.get_mut(depth))
+            {
+                element.subscript.clone_from(&subscript);
+            }
         }
     }
 }
@@ -144,8 +181,8 @@ pub(crate) struct Walk<'a, R: Runtime> {
     pool: &'a DescriptorPool,
     schema: &'a Schema,
     env: &'a Env,
-    validators: &'a HashMap<MessageIndex, Built>,
-    out: Violations,
+    validators: &'a ValidatorCache<R>,
+    out: Violations<'a>,
     runtime: PhantomData<R>,
 }
 
@@ -153,7 +190,7 @@ impl<'a, R: Runtime> Walk<'a, R> {
     pub(crate) fn new(
         descriptors: &'a Descriptors,
         env: &'a Env,
-        validators: &'a HashMap<MessageIndex, Built>,
+        validators: &'a ValidatorCache<R>,
         fail_fast: bool,
     ) -> Self {
         Self {
@@ -170,7 +207,7 @@ impl<'a, R: Runtime> Walk<'a, R> {
     /// The message is serialized, for CEL, only if a rule needs it.
     pub(crate) fn validate(
         mut self,
-        validator: &MessageValidator,
+        validator: &'a MessageValidator<R>,
         message: &R::Message<'_>,
         type_name: &str,
     ) -> Result<Vec<Violation>, Error<R::Error>> {
@@ -184,10 +221,13 @@ impl<'a, R: Runtime> Walk<'a, R> {
     /// Runs `f` with `element` appended to the field path.
     fn at<T>(
         &mut self,
-        element: &FieldPathElement,
+        element: &'a FieldPathElement,
         f: impl FnOnce(&mut Self) -> Result<T, Abort<R::Error>>,
     ) -> Result<T, Abort<R::Error>> {
-        self.out.path.push(element.clone());
+        self.out.path.push(PathElement {
+            element,
+            subscript: element.subscript.clone(),
+        });
         let result = f(self);
         self.out.path.pop();
         result
@@ -206,7 +246,7 @@ impl<'a, R: Runtime> Walk<'a, R> {
 
     /// The validator of a message type reachable from the root, or why
     /// its rules did not compile.
-    fn validator(&self, index: MessageIndex) -> Result<&'a MessageValidator, Abort<R::Error>> {
+    fn validator(&self, index: MessageIndex) -> Result<&'a MessageValidator<R>, Abort<R::Error>> {
         let validators = self.validators;
         match validators.get(&index) {
             Some(Ok(validator)) => Ok(validator),
@@ -255,7 +295,7 @@ impl<'a, 'm, R: Runtime> CelFrame<'a, 'm, R> {
 /// Where a value's CEL rules get `this` from.
 enum CelBind<'v, 'a, 'm, R: Runtime> {
     /// A field of the frame's message.
-    Field(&'v CelFrame<'a, 'm, R>, &'v Field),
+    Field(&'v CelFrame<'a, 'm, R>, &'v Field<R>),
     /// One element, key or map value, of this kind.
     Item(Singular),
 }
@@ -269,10 +309,10 @@ impl<R: Runtime> Clone for CelBind<'_, '_, '_, R> {
 
 impl<R: Runtime> Copy for CelBind<'_, '_, '_, R> {}
 
-impl MessageValidator {
-    fn validate<R: Runtime>(
-        &self,
-        walk: &mut Walk<'_, R>,
+impl<R: Runtime> MessageValidator<R> {
+    fn validate<'a>(
+        &'a self,
+        walk: &mut Walk<'a, R>,
         message: &R::Message<'_>,
         frame: &CelFrame<'_, '_, R>,
     ) -> Result<(), Abort<R::Error>> {
@@ -300,7 +340,7 @@ impl CelPrograms {
     /// violations. An expression passes by producing `true` or an empty
     /// string. `false` fails with the rule's own message, and a non-empty
     /// string fails with that string as the message.
-    fn run<E>(&self, this: This<'_>, out: &mut Violations) -> Result<(), Abort<E>> {
+    fn run<E>(&self, this: This<'_>, out: &mut Violations<'_>) -> Result<(), Abort<E>> {
         for (index, meta) in self.rules.iter().enumerate() {
             let message = match self.program.eval(index, this)? {
                 Value::Bool(true) => continue,
@@ -320,8 +360,8 @@ impl CelPrograms {
     }
 }
 
-impl MessageOneof {
-    fn check<R: Runtime>(
+impl<R: Runtime> MessageOneof<R> {
+    fn check(
         &self,
         walk: &mut Walk<'_, R>,
         message: &R::Message<'_>,
@@ -344,10 +384,10 @@ impl MessageOneof {
     }
 }
 
-impl OneofRequired {
-    fn check<R: Runtime>(
-        &self,
-        walk: &mut Walk<'_, R>,
+impl<R: Runtime> OneofRequired<R> {
+    fn check<'a>(
+        &'a self,
+        walk: &mut Walk<'a, R>,
         message: &R::Message<'_>,
     ) -> Result<(), Abort<R::Error>> {
         for member in &self.members {
@@ -362,11 +402,11 @@ impl OneofRequired {
     }
 }
 
-impl FieldValidator {
+impl<R: Runtime> FieldValidator<R> {
     /// Validates one field.
-    fn validate<R: Runtime>(
-        &self,
-        walk: &mut Walk<'_, R>,
+    fn validate<'a>(
+        &'a self,
+        walk: &mut Walk<'a, R>,
         message: &R::Message<'_>,
         frame: &CelFrame<'_, '_, R>,
     ) -> Result<(), Abort<R::Error>> {
@@ -423,10 +463,10 @@ impl FieldValidator {
     }
 }
 
-impl ItemValidator {
+impl<R: Runtime> ItemValidator<R> {
     /// Validates each element of a list, of kind `element`, subscripted by
     /// its index.
-    fn validate_list<R: Runtime>(
+    fn validate_list(
         &self,
         walk: &mut Walk<'_, R>,
         list: &R::List<'_>,
@@ -449,18 +489,18 @@ impl ItemValidator {
 }
 
 /// A map field's entries, and their validators.
-struct Entries<'a> {
+struct Entries<'a, R: Runtime> {
     key: Singular,
     value: Singular,
-    keys: Option<&'a ItemValidator>,
-    values: Option<&'a ItemValidator>,
+    keys: Option<&'a ItemValidator<R>>,
+    values: Option<&'a ItemValidator<R>>,
 }
 
 /// Validates each entry of a map, subscripted by its key.
 fn validate_map<R: Runtime>(
     walk: &mut Walk<'_, R>,
     map: &R::Map<'_>,
-    entries: &Entries<'_>,
+    entries: &Entries<'_, R>,
 ) -> Result<(), Abort<R::Error>> {
     let mut result = Ok(());
     let visited = map.for_each(
@@ -478,11 +518,22 @@ fn validate_map<R: Runtime>(
 
 fn validate_entry<R: Runtime>(
     walk: &mut Walk<'_, R>,
-    entries: &Entries<'_>,
+    entries: &Entries<'_, R>,
     key: &Val<'_, R>,
     value: &Val<'_, R>,
 ) -> Result<(), Abort<R::Error>> {
-    walk.out.subscript(key_subscript(key));
+    let recorded = walk.out.list.len();
+    let result = validate_entry_values(walk, entries, key, value);
+    walk.out.subscript_since(recorded, || key_subscript(key));
+    result
+}
+
+fn validate_entry_values<R: Runtime>(
+    walk: &mut Walk<'_, R>,
+    entries: &Entries<'_, R>,
+    key: &Val<'_, R>,
+    value: &Val<'_, R>,
+) -> Result<(), Abort<R::Error>> {
     if let Some(keys) = entries.keys {
         if !(keys.ignore_empty && is_empty_item::<R>(key)?) {
             walk.for_key(|walk| {
@@ -501,9 +552,9 @@ fn validate_entry<R: Runtime>(
     Ok(())
 }
 
-impl ValueValidator {
+impl<R: Runtime> ValueValidator<R> {
     /// Validates one value, then the message it holds.
-    fn validate<R: Runtime>(
+    fn validate(
         &self,
         walk: &mut Walk<'_, R>,
         value: Option<&Val<'_, R>>,
@@ -577,7 +628,7 @@ impl Checks {
         &self,
         walk: &mut Walk<'_, R>,
         value: Option<&Val<'_, R>>,
-        wrapper: Option<&Field>,
+        wrapper: Option<&Field<R>>,
     ) -> Result<(), Abort<R::Error>> {
         match (wrapper, value) {
             (Some(wrapper), Some(Val::Message(message))) => {
@@ -608,8 +659,9 @@ impl Checks {
             Self::Timestamp(checks) => run(checks, &Timestamp(nanos_of(value)?), out),
             Self::FieldMask(checks) => run(checks, paths_of(value)?.as_slice(), out),
             Self::Any(checks) => {
+                let field = wkt::any_type_url();
                 let type_url = match value {
-                    Some(Val::Message(any)) => any.get(&wkt::ANY_TYPE_URL).read()?,
+                    Some(Val::Message(any)) => any.get(&field).read()?,
                     None => None,
                     Some(other) => return Err(mismatch("an Any", other)),
                 };
@@ -667,7 +719,7 @@ impl Checks {
 }
 
 /// Runs checks of one type against the value they test.
-fn run<T, V, E>(checks: &[Check<T>], value: &V, out: &mut Violations) -> Result<(), Abort<E>>
+fn run<T, V, E>(checks: &[Check<T>], value: &V, out: &mut Violations<'_>) -> Result<(), Abort<E>>
 where
     T: Test<V>,
     V: ?Sized,
@@ -679,7 +731,7 @@ where
 /// for each one `fails` reports.
 fn run_with<T, E>(
     checks: &[Check<T>],
-    out: &mut Violations,
+    out: &mut Violations<'_>,
     mut fails: impl FnMut(&T) -> Result<bool, Abort<E>>,
 ) -> Result<(), Abort<E>> {
     for check in checks {
@@ -701,7 +753,7 @@ where
 }
 
 /// Whether a field is set.
-fn has<R: Runtime>(message: &R::Message<'_>, field: &Field) -> Result<bool, Abort<R::Error>> {
+fn has<R: Runtime>(message: &R::Message<'_>, field: &Field<R>) -> Result<bool, Abort<R::Error>> {
     if field.has_presence() {
         return message.has(field).read();
     }
@@ -881,11 +933,11 @@ fn nanos_of<R: Runtime>(value: Option<&Val<'_, R>>) -> Result<i128, Abort<R::Err
         Some(Val::Message(message)) => message,
         Some(other) => return Err(mismatch("a message", other)),
     };
-    let seconds = match message.get(&wkt::SECONDS).read()? {
+    let seconds = match message.get(&wkt::seconds()).read()? {
         Some(Val::Int(seconds)) => seconds,
         _ => 0,
     };
-    let nanos = match message.get(&wkt::NANOS).read()? {
+    let nanos = match message.get(&wkt::nanos()).read()? {
         Some(Val::Int(nanos)) => nanos,
         _ => 0,
     };
@@ -899,7 +951,8 @@ fn paths_of<R: Runtime>(value: Option<&Val<'_, R>>) -> Result<Vec<String>, Abort
         Some(Val::Message(message)) => message,
         Some(other) => return Err(mismatch("a message", other)),
     };
-    let Some(Val::List(list)) = message.get(&wkt::FIELD_MASK_PATHS).read()? else {
+    let field = wkt::field_mask_paths();
+    let Some(Val::List(list)) = message.get(&field).read()? else {
         return Ok(Vec::new());
     };
     let mut paths = Vec::new();

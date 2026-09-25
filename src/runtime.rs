@@ -19,7 +19,8 @@ use std::collections::HashSet;
 use protovalidate::protobuf::{Kind, Singular};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyType};
+use pyo3::types::iter::BoundDictIterator;
+use pyo3::types::{PyBytes, PyDict, PyIterator, PyList, PyString, PyType};
 
 use crate::constants::Constants;
 
@@ -187,9 +188,29 @@ impl FieldInfo {
     }
 }
 
+/// A callback that registers one descriptor file, given the file object
+/// and its serialized `FileDescriptorProto`.
+pub(crate) type AddFile<'a> =
+    dyn FnMut(&Bound<'_, PyAny>, &Bound<'_, PyBytes>) -> PyResult<()> + 'a;
+
 /// The entries of a map field, in the runtime's order.
-pub(crate) type MapEntries<'py> =
-    Box<dyn Iterator<Item = PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> + 'py>;
+pub(crate) enum MapEntries<'py> {
+    /// A protobuf-py `dict`.
+    Dict(BoundDictIterator<'py>),
+    /// The `items()` of a google.protobuf map container.
+    Items(Bound<'py, PyIterator>),
+}
+
+impl<'py> Iterator for MapEntries<'py> {
+    type Item = PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dict(entries) => entries.next().map(Ok),
+            Self::Items(entries) => entries.next().map(|entry| entry?.extract()),
+        }
+    }
+}
 
 impl ProtoRuntime {
     /// The serialized message.
@@ -208,13 +229,14 @@ impl ProtoRuntime {
             .map_err(Into::into)
     }
 
-    /// Adds a descriptor file and its imports to the engine, imports first.
+    /// Adds a descriptor file and its imports to the engine, imports
+    /// first, passing each file and its serialized descriptor to `add`.
     pub(crate) fn collect_files(
         self,
         file: &Bound<'_, PyAny>,
         constants: &Constants,
         registered: &mut HashSet<String>,
-        add: &mut dyn FnMut(&Bound<'_, PyBytes>) -> PyResult<()>,
+        add: &mut AddFile<'_>,
     ) -> PyResult<()> {
         let name_attr = file.getattr(&constants.name)?;
         let name = name_attr.cast::<PyString>()?.to_str()?;
@@ -233,7 +255,7 @@ impl ProtoRuntime {
             // `serialized_pb` is already a serialized FileDescriptorProto
             Self::Google => file.getattr(&constants.serialized_pb)?.cast_into()?,
         };
-        add(&bytes)?;
+        add(file, &bytes)?;
         registered.insert(name);
         Ok(())
     }
@@ -263,17 +285,14 @@ impl ProtoRuntime {
         }
     }
 
-    /// Where a message class stores each of its fields.
+    /// Where the messages that `descriptor` describes store each of their
+    /// fields.
     pub(crate) fn fields(
         self,
         py: Python<'_>,
-        class: &Bound<'_, PyType>,
+        descriptor: &Bound<'_, PyAny>,
         constants: &Constants,
     ) -> PyResult<Vec<FieldInfo>> {
-        let descriptor = match self {
-            Self::ProtobufPy => class.call_method0(&constants.desc)?,
-            Self::Google => class.getattr(&constants.descriptor_upper)?,
-        };
         let mut fields = Vec::new();
         for field in descriptor.getattr(&constants.fields)?.try_iter()? {
             fields.push(self.field_info(py, &field?, constants)?);
@@ -346,17 +365,23 @@ impl ProtoRuntime {
         }
     }
 
-    /// The elements of a repeated field: a `list` for protobuf-py, a
-    /// repeated container for google.protobuf, which hands out a new object
-    /// on every access.
-    pub(crate) fn list_items<'py>(
+    /// Appends the elements of a repeated field to `items`: a `list` for
+    /// protobuf-py, a repeated container for google.protobuf, which hands
+    /// out a new object on every access.
+    pub(crate) fn list_items(
         self,
-        object: &Bound<'py, PyAny>,
-    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        object: &Bound<'_, PyAny>,
+        items: &mut Vec<Py<PyAny>>,
+    ) -> PyResult<()> {
         match self {
-            Self::ProtobufPy => Ok(object.cast::<PyList>()?.iter().collect()),
-            Self::Google => object.try_iter()?.collect(),
+            Self::ProtobufPy => items.extend(object.cast::<PyList>()?.iter().map(Bound::unbind)),
+            Self::Google => {
+                for item in object.try_iter()? {
+                    items.push(item?.unbind());
+                }
+            }
         }
+        Ok(())
     }
 
     /// The entries of a map field: a `dict` for protobuf-py, a map container
@@ -367,13 +392,8 @@ impl ProtoRuntime {
         constants: &Constants,
     ) -> PyResult<MapEntries<'py>> {
         Ok(match self {
-            Self::ProtobufPy => Box::new(object.cast::<PyDict>()?.iter().map(Ok)),
-            Self::Google => Box::new(
-                object
-                    .call_method0(&constants.items)?
-                    .try_iter()?
-                    .map(|entry| entry?.extract()),
-            ),
+            Self::ProtobufPy => MapEntries::Dict(object.cast::<PyDict>()?.iter()),
+            Self::Google => MapEntries::Items(object.call_method0(&constants.items)?.try_iter()?),
         })
     }
 }
