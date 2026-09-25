@@ -36,7 +36,7 @@ use hints::{PbMessage, PbRegistry, ViolationList};
 use runtime::{ProtoAdapter, ProtoRuntime};
 use view::{Ctx, PyRuntime, TypeSource};
 
-/// The validator of one Python runtime's messages.
+/// The core validator for messages of one Python runtime.
 type Core = protovalidate::Validator<PyRuntime>;
 
 import_exception!(protovalidate._errors, ValidationError);
@@ -75,11 +75,12 @@ fn descriptor_err(error: &DescriptorError) -> PyErr {
 /// significantly improves performance.
 #[pyclass(module = "protovalidate._protovalidate", frozen)]
 struct Validator {
-    /// One engine per Python runtime: an engine's rules carry where each
-    /// message type keeps its fields, which differs between the runtimes.
+    /// One engine per Python runtime. Compiled rules record how to read
+    /// each message type's fields, and that differs between the two
+    /// runtimes, so they cannot share an engine.
     engines: [PyOnceLock<Engine>; 2],
-    /// The files of the constructor's registry that declare extensions,
-    /// registered with each engine as it is created.
+    /// The files from the constructor's `registry` argument that declare
+    /// extensions. They are registered with each engine when it is created.
     preregistered: Vec<Py<PyAny>>,
     /// Interned strings, shared by every call site.
     constants: Constants,
@@ -87,7 +88,7 @@ struct Validator {
     imports: Arc<Imports>,
 }
 
-/// The engine of one Python runtime.
+/// The core validator and registration state for one Python runtime.
 struct Engine {
     /// Adding descriptors needs exclusive access and happens only while
     /// warming up; a `RwLock` leaves the steady state unblocked.
@@ -95,9 +96,10 @@ struct Engine {
     /// Descriptor files already added to the pool, by name. Mutated together
     /// with the core, under both write locks; see `register`.
     registered: RwLock<HashSet<String>>,
-    /// For protobuf-py, a `Registry` of the registered files, from which
-    /// message types are resolved; a google.protobuf message's types are
-    /// resolved from its descriptor pool instead.
+    /// For protobuf-py, a `Registry` holding every registered file, used to
+    /// look up message types by name. `None` for google.protobuf, whose
+    /// types are looked up in the descriptor pool of the message being
+    /// validated.
     registry: Option<Py<PyAny>>,
 }
 
@@ -227,7 +229,7 @@ impl Validator {
         Ok((adapter.clone_ref(py), violations))
     }
 
-    /// The engine of `runtime`.
+    /// Returns the engine for `runtime`.
     fn engine(&self, py: Python<'_>, runtime: ProtoRuntime) -> PyResult<&Engine> {
         let slot = match runtime {
             ProtoRuntime::ProtobufPy => 0,
@@ -276,8 +278,8 @@ impl Validator {
 }
 
 impl Engine {
-    /// An engine for `runtime`, with the protobuf-py `DescFile`s in
-    /// `preregistered` already added to it.
+    /// Creates the engine for `runtime` and registers the protobuf-py
+    /// `DescFile`s in `preregistered` with it.
     fn new(
         py: Python<'_>,
         runtime: ProtoRuntime,
@@ -300,8 +302,8 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Registers a `runtime` descriptor file and its imports, skipping
-    /// known ones.
+    /// Registers `file`, a descriptor file of `runtime`, together with its
+    /// imports. Files already registered are skipped.
     fn register(
         &self,
         py: Python<'_>,
@@ -330,7 +332,7 @@ impl Engine {
     }
 }
 
-/// The files of a registry that declare extensions, as `DescFile`s.
+/// Returns the `DescFile`s in `registry` that declare extensions.
 ///
 /// Predefined-rule extensions may live in files nothing being validated
 /// imports, in which case the lazy walk over message imports would never reach

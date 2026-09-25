@@ -229,8 +229,8 @@ impl ProtoRuntime {
             .map_err(Into::into)
     }
 
-    /// Adds a descriptor file and its imports to the engine, imports
-    /// first, passing each file and its serialized descriptor to `add`.
+    /// Registers a descriptor file and, before it, its imports, by passing
+    /// each file and its serialized descriptor to `add`.
     pub(crate) fn collect_files(
         self,
         file: &Bound<'_, PyAny>,
@@ -285,8 +285,8 @@ impl ProtoRuntime {
         }
     }
 
-    /// Where the messages that `descriptor` describes store each of their
-    /// fields.
+    /// Returns how to read each field of the message type that
+    /// `descriptor` describes.
     pub(crate) fn fields(
         self,
         py: Python<'_>,
@@ -365,9 +365,9 @@ impl ProtoRuntime {
         }
     }
 
-    /// Appends the elements of a repeated field to `items`: a `list` for
-    /// protobuf-py, a repeated container for google.protobuf, which hands
-    /// out a new object on every access.
+    /// Appends the elements of a repeated field to `items`. The field is a
+    /// `list` for protobuf-py and a repeated container for
+    /// google.protobuf, which creates a new element object on every access.
     pub(crate) fn list_items(
         self,
         object: &Bound<'_, PyAny>,

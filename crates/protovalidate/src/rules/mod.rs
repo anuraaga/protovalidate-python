@@ -63,7 +63,7 @@ pub(crate) type ValidatorCache<R> = HashMap<MessageIndex, Built<R>, foldhash::fa
 /// The rules of one message type. A message-typed field's messages are
 /// evaluated inside that field, after its own rules.
 pub(crate) struct MessageValidator<R: Runtime> {
-    /// The runtime's description of the type.
+    /// The resolved type of this message.
     pub message_type: R::MessageType,
     pub cel: Option<CelPrograms>,
     pub message_oneofs: Vec<MessageOneof<R>>,

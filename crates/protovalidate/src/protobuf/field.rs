@@ -126,9 +126,9 @@ impl<R: Runtime> Field<R> {
         self.kind
     }
 
-    /// The runtime's description of the message type the field holds,
-    /// whether as a singular value, repeated elements or map values, or
-    /// `None` for a field that holds no messages.
+    /// The resolved type of the messages this field holds, whether as a
+    /// single value, as list elements or as map values. `None` if the field
+    /// does not hold messages.
     #[must_use]
     pub fn message_type(&self) -> Option<&R::MessageType> {
         self.message_type.as_ref()

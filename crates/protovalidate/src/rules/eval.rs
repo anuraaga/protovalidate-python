@@ -23,6 +23,7 @@
 use std::cell::OnceCell;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
+use std::sync::{PoisonError, RwLock};
 
 use buffa_descriptor::{DescriptorPool, MessageIndex};
 
@@ -80,7 +81,7 @@ impl<T, E> Read<T, E> for Result<T, E> {
     }
 }
 
-/// An element of the field path the walk is currently at.
+/// One element of the walk's current field path.
 struct PathElement<'a> {
     element: &'a FieldPathElement,
     subscript: Option<Subscript>,
@@ -151,9 +152,9 @@ impl Violations<'_> {
         }
     }
 
-    /// Sets the subscript of the container field the walk is at to the
-    /// item that was validated, in the violations recorded since
-    /// `recorded`.
+    /// Sets the subscript of the walk's current container field in every
+    /// violation recorded since index `recorded`. The subscript is only
+    /// computed if there is such a violation.
     fn subscript_since(&mut self, recorded: usize, subscript: impl FnOnce() -> Option<Subscript>) {
         let (Some(depth), Some(violations)) = (
             self.path.len().checked_sub(1),
@@ -180,7 +181,7 @@ impl Violations<'_> {
 pub(crate) struct Walk<'a, R: Runtime> {
     pool: &'a DescriptorPool,
     schema: &'a Schema,
-    env: &'a Env,
+    env: &'a RwLock<Env>,
     validators: &'a ValidatorCache<R>,
     out: Violations<'a>,
     runtime: PhantomData<R>,
@@ -189,7 +190,7 @@ pub(crate) struct Walk<'a, R: Runtime> {
 impl<'a, R: Runtime> Walk<'a, R> {
     pub(crate) fn new(
         descriptors: &'a Descriptors,
-        env: &'a Env,
+        env: &'a RwLock<Env>,
         validators: &'a ValidatorCache<R>,
         fail_fast: bool,
     ) -> Self {
@@ -265,14 +266,14 @@ impl<'a, R: Runtime> Walk<'a, R> {
 /// Frames nest on the stack the way the walk does, so one outlives every
 /// program run against it.
 pub(crate) struct CelFrame<'a, 'm, R: Runtime> {
-    env: &'a Env,
+    env: &'a RwLock<Env>,
     type_name: &'a str,
     message: &'a R::Message<'m>,
     parsed: OnceCell<Frame>,
 }
 
 impl<'a, 'm, R: Runtime> CelFrame<'a, 'm, R> {
-    fn new(env: &'a Env, type_name: &'a str, message: &'a R::Message<'m>) -> Self {
+    fn new(env: &'a RwLock<Env>, type_name: &'a str, message: &'a R::Message<'m>) -> Self {
         Self {
             env,
             type_name,
@@ -287,7 +288,11 @@ impl<'a, 'm, R: Runtime> CelFrame<'a, 'm, R> {
             return Ok(frame);
         }
         let bytes = self.message.encode().read()?;
-        let frame = self.env.frame(self.type_name, &bytes)?;
+        let frame = self
+            .env
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .frame(self.type_name, &bytes)?;
         Ok(self.parsed.get_or_init(|| frame))
     }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::fmt;
-use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use buffa::Message as _;
 use buffa_descriptor::MessageIndex;
@@ -23,7 +23,7 @@ use crate::cel;
 use crate::descriptors::{self, Descriptors};
 use crate::protobuf::{Reader, Runtime};
 use crate::rules::ValidatorCache;
-use crate::rules::build::Builder;
+use crate::rules::build::{self, Builder};
 use crate::rules::eval::Walk;
 use crate::validate::{Violation as ViolationPb, Violations};
 use crate::{DescriptorError, Error, ValidationError};
@@ -48,12 +48,15 @@ pub(crate) fn cel_env(set: &FileDescriptorSet) -> cel::Env {
     env
 }
 
-/// Validates Protobuf messages, read through the runtime `R`, against the
-/// rules in their descriptors.
+/// Validates Protobuf messages against the rules in their descriptors.
+/// Messages are read through the runtime `R`.
 pub struct Validator<R: Runtime> {
     descriptors: Descriptors,
+    /// Locked only for calls into CEL, notably it is never locked around
+    /// Runtime invocations which may switch threads and reenter.
     env: RwLock<cel::Env>,
-    cache: RwLock<ValidatorCache<R>>,
+    /// Replaced as a whole whenever rules are built.
+    cache: RwLock<Arc<ValidatorCache<R>>>,
 }
 
 impl<R: Runtime> fmt::Debug for Validator<R> {
@@ -79,7 +82,7 @@ impl<R: Runtime> Validator<R> {
         Self {
             descriptors: Descriptors::from_set(base),
             env: RwLock::new(env),
-            cache: RwLock::new(ValidatorCache::default()),
+            cache: RwLock::new(Arc::new(ValidatorCache::default())),
         }
     }
 
@@ -152,14 +155,13 @@ impl<R: Runtime> Validator<R> {
     ) -> Result<Vec<ViolationPb>, Error<R::Error>> {
         let index = self.message_index(type_name)?;
         let validators = self.validators(index, reader)?;
-        let env = self.env.read().unwrap_or_else(PoisonError::into_inner);
         let validator = validators[&index]
             .as_ref()
             .map_err(|error| Error::Compilation(error.clone()))?;
         let message = reader
             .message(&validator.message_type)
             .map_err(Error::Read)?;
-        let walk = Walk::<R>::new(&self.descriptors, &env, &validators, fail_fast);
+        let walk = Walk::<R>::new(&self.descriptors, &self.env, &validators, fail_fast);
         walk.validate(validator, &message, type_name)
     }
 
@@ -170,35 +172,38 @@ impl<R: Runtime> Validator<R> {
             .ok_or_else(|| Error::Argument(format!("unknown message type: {type_name}")))
     }
 
-    /// The cache, including the rules of `index` and every type reachable
-    /// from it.
+    /// Returns the cache, first building the rules of `index` and of every
+    /// type reachable from it if they are missing.
     fn validators(
         &self,
         index: MessageIndex,
         reader: &dyn Reader<R>,
-    ) -> Result<RwLockReadGuard<'_, ValidatorCache<R>>, Error<R::Error>> {
-        let cache = self.read_cache();
-        if cache.contains_key(&index) {
-            return Ok(cache);
+    ) -> Result<Arc<ValidatorCache<R>>, Error<R::Error>> {
+        let known = self.snapshot();
+        if known.contains_key(&index) {
+            return Ok(known);
         }
+        let types =
+            build::resolve(&self.descriptors, index, &known, reader).map_err(Error::Read)?;
+        // The rules are built against the snapshot rather than under the
+        // cache lock, so other validations are not held up while they
+        // compile. Two threads that build the same type at once both merge
+        // their result, and the later one wins.
         let mut built = ValidatorCache::default();
         {
             let mut env = self.env.write().unwrap_or_else(PoisonError::into_inner);
-            let mut builder = Builder::new(&self.descriptors, &mut env, reader);
-            builder
-                .build_closure(index, &cache, &mut built)
-                .map_err(Error::Read)?;
+            Builder::new(&self.descriptors, &mut env, types)
+                .build_closure(index, &known, &mut built);
         }
-        drop(cache);
-        self.cache
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(built);
-        Ok(self.read_cache())
+        let mut cache = self.cache.write().unwrap_or_else(PoisonError::into_inner);
+        let mut validators = ValidatorCache::clone(&cache);
+        validators.extend(built);
+        *cache = Arc::new(validators);
+        Ok(Arc::clone(&cache))
     }
 
-    fn read_cache(&self) -> RwLockReadGuard<'_, ValidatorCache<R>> {
-        self.cache.read().unwrap_or_else(PoisonError::into_inner)
+    fn snapshot(&self) -> Arc<ValidatorCache<R>> {
+        Arc::clone(&self.cache.read().unwrap_or_else(PoisonError::into_inner))
     }
 }
 

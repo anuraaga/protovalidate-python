@@ -47,9 +47,66 @@ use crate::validate::{FieldPathElement, FieldRules, Ignore, MessageRules, Rule};
 pub(crate) struct Builder<'a, R: Runtime> {
     descriptors: &'a Descriptors,
     env: &'a mut Env,
-    reader: &'a dyn Reader<R>,
-    /// The message types the rules being built refer to.
+    /// The resolved type of every message these rules refer to.
     types: HashMap<MessageIndex, R::MessageType>,
+}
+
+/// Returns every message type reachable from `root`, including `root`
+/// itself, that has no rules in `known` yet.
+fn closure<R: Runtime>(
+    descriptors: &Descriptors,
+    root: MessageIndex,
+    known: &ValidatorCache<R>,
+) -> HashSet<MessageIndex> {
+    let pool = &descriptors.pool;
+    let mut closure = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(idx) = pending.pop() {
+        if known.contains_key(&idx) || !closure.insert(idx) {
+            continue;
+        }
+        for field in pool.message(idx).fields() {
+            if let Some(nested) = descriptors::message_type(field) {
+                pending.push(nested);
+            }
+        }
+    }
+    closure
+}
+
+/// Resolves every message type that the rules of `root`, or of a type
+/// reachable from it, refer to. Types that `known` already has are copied
+/// from there; the rest are looked up through `reader`.
+///
+/// # Errors
+///
+/// The reader did not know one of the types.
+pub(crate) fn resolve<R: Runtime>(
+    descriptors: &Descriptors,
+    root: MessageIndex,
+    known: &ValidatorCache<R>,
+    reader: &dyn Reader<R>,
+) -> Result<HashMap<MessageIndex, R::MessageType>, R::Error> {
+    let pool = &descriptors.pool;
+    let mut types = HashMap::new();
+    for idx in closure(descriptors, root, known) {
+        let referenced = pool
+            .message(idx)
+            .fields()
+            .iter()
+            .filter_map(descriptors::message_type);
+        for idx in std::iter::once(idx).chain(referenced) {
+            if types.contains_key(&idx) {
+                continue;
+            }
+            let message_type = match known.get(&idx) {
+                Some(Ok(validator)) => validator.message_type.clone(),
+                _ => reader.resolve(pool.message(idx).full_name())?,
+            };
+            types.insert(idx, message_type);
+        }
+    }
+    Ok(types)
 }
 
 /// The value a set of rules applies to.
@@ -280,69 +337,34 @@ fn scalar_rules(rules: &RulesType) -> Option<(&'static str, Type, Option<&'stati
 }
 
 impl<'a, R: Runtime> Builder<'a, R> {
+    /// Creates a builder. `types` holds the resolved type of every message
+    /// the rules will refer to.
     pub(crate) fn new(
         descriptors: &'a Descriptors,
         env: &'a mut Env,
-        reader: &'a dyn Reader<R>,
+        types: HashMap<MessageIndex, R::MessageType>,
     ) -> Self {
         Self {
             descriptors,
             env,
-            reader,
-            types: HashMap::new(),
+            types,
         }
     }
 
-    /// Compiles `root` and every message type reachable from it into
-    /// `out`, skipping the types already in `known`.
-    ///
-    /// # Errors
-    ///
-    /// The reader did not know one of the message types, in which case
-    /// nothing is added to `out`.
+    /// Compiles the rules of `root` and of every message type reachable
+    /// from it, adding them to `out`. Types already in `known` are skipped.
     pub(crate) fn build_closure(
         &mut self,
         root: MessageIndex,
         known: &ValidatorCache<R>,
         out: &mut ValidatorCache<R>,
-    ) -> Result<(), R::Error> {
-        // The reference is copied out of `self`, so the loops below can
+    ) {
+        // The reference is copied out of `self`, so the loop below can
         // still take `&mut self`.
         let descriptors: &'a Descriptors = self.descriptors;
         let pool = &descriptors.pool;
-        let mut to_build = HashSet::new();
-        let mut pending = vec![root];
-        while let Some(idx) = pending.pop() {
-            if known.contains_key(&idx) || !to_build.insert(idx) {
-                continue;
-            }
-            for field in pool.message(idx).fields() {
-                if let Some(nested) = descriptors::message_type(field) {
-                    pending.push(nested);
-                }
-            }
-        }
-
-        for &idx in &to_build {
-            let referenced = pool
-                .message(idx)
-                .fields()
-                .iter()
-                .filter_map(descriptors::message_type);
-            for idx in std::iter::once(idx).chain(referenced) {
-                if self.types.contains_key(&idx) {
-                    continue;
-                }
-                let message_type = match known.get(&idx) {
-                    Some(Ok(validator)) => validator.message_type.clone(),
-                    _ => self.reader.resolve(pool.message(idx).full_name())?,
-                };
-                self.types.insert(idx, message_type);
-            }
-        }
-
         let mut built: HashMap<MessageIndex, Result<MessageValidator<R>, String>> = HashMap::new();
-        for idx in to_build {
+        for idx in closure(descriptors, root, known) {
             built.insert(idx, self.build_message(idx));
         }
 
@@ -386,10 +408,10 @@ impl<'a, R: Runtime> Builder<'a, R> {
                 .into_iter()
                 .map(|(idx, validator)| (idx, validator.map(Arc::new))),
         );
-        Ok(())
     }
 
-    /// The field that `field` describes, with its message type.
+    /// Describes `field` for the runtime, including the resolved type of
+    /// the messages it holds.
     fn field(&self, field: &FieldDescriptor) -> Field<R> {
         let message_type = descriptors::message_type(field).map(|idx| {
             self.types
@@ -963,10 +985,11 @@ mod tests {
             .pool
             .message_index("test.Message")
             .expect("test.Message is in the pool");
-        let mut out = ValidatorCache::<Untyped>::default();
-        Builder::new(&descriptors, &mut env, &Untyped)
-            .build_closure(index, &ValidatorCache::default(), &mut out)
-            .expect("every type resolves");
+        let known = ValidatorCache::<Untyped>::default();
+        let mut out = ValidatorCache::default();
+        let types =
+            super::resolve(&descriptors, index, &known, &Untyped).expect("every type resolves");
+        Builder::new(&descriptors, &mut env, types).build_closure(index, &known, &mut out);
 
         let validator = out[&index].as_ref().expect("the message compiles");
         let field = validator.fields[0].as_ref().expect("the field compiles");

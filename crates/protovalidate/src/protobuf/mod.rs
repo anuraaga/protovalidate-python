@@ -43,8 +43,8 @@ pub use field::{Field, Kind, Scalar, Singular};
 pub trait Runtime: Sized {
     /// What a read fails with.
     type Error;
-    /// What the runtime needs to read messages of one type, such as where
-    /// their class stores each field.
+    /// Whatever the runtime needs in order to read a message of one type,
+    /// such as which attribute holds each field.
     type MessageType: Clone;
     /// A message.
     type Message<'a>: Message<Self>;
@@ -54,19 +54,19 @@ pub trait Runtime: Sized {
     type Map<'a>: Map<Self>;
 }
 
-/// One validation's access to a runtime: the message to validate, along
-/// with whatever the runtime needs to read it and to resolve its message
-/// types.
+/// The runtime's side of one validation. It provides the message to
+/// validate and looks up message types by name.
 pub trait Reader<R: Runtime> {
-    /// The runtime's description of the message type called `full_name`,
-    /// a fully-qualified name without a leading dot.
+    /// Looks up the message type named `full_name`, which is fully
+    /// qualified and has no leading dot.
     ///
     /// # Errors
     ///
     /// The runtime does not know the type.
     fn resolve(&self, full_name: &str) -> Result<R::MessageType, R::Error>;
 
-    /// The message to validate, whose type `message_type` describes.
+    /// Returns the message to validate. `message_type` is the resolved type
+    /// of that message.
     ///
     /// # Errors
     ///
@@ -102,8 +102,9 @@ pub trait Message<R: Runtime> {
 
     /// The field's value, or its type's default when it is not set. `None`
     /// when the message has no such field, as when its runtime knows an
-    /// older schema than the validator. The value may borrow from `field`,
-    /// as a nested message borrows its type.
+    /// older schema than the validator. The returned value may borrow from
+    /// `field`: a nested message keeps a reference to the message type
+    /// stored there.
     ///
     /// # Errors
     ///
@@ -160,8 +161,7 @@ pub trait Map<R: Runtime> {
         F: FnMut(Val<'_, R>, Val<'_, R>) -> ControlFlow<()>;
 }
 
-/// A runtime that reads nothing, for tests of what happens before a
-/// message is read.
+/// A runtime for tests that never read a message.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::convert::Infallible;
@@ -169,8 +169,8 @@ pub(crate) mod testing {
 
     use super::{Field, List, Map, Message, Reader, Runtime, Val};
 
-    /// A runtime whose message types carry nothing, which is also its own
-    /// reader.
+    /// A runtime whose message types carry no information. It serves as
+    /// its own reader.
     pub(crate) struct Untyped;
 
     impl Runtime for Untyped {
@@ -191,7 +191,7 @@ pub(crate) mod testing {
         }
     }
 
-    /// A message, list or map that is never read.
+    /// A message, list or map that the test never reads.
     pub(crate) struct Unread;
 
     impl Message<Untyped> for Unread {

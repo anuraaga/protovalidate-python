@@ -46,7 +46,8 @@ impl Runtime for PyRuntime {
     type Map<'a> = MapView<'a>;
 }
 
-/// Where the messages of one type keep their fields.
+/// Describes how to read each field of one message type from its Python
+/// objects.
 pub(crate) struct TypeInfo {
     /// Sorted by field number.
     fields: Vec<FieldInfo>,
@@ -68,30 +69,29 @@ impl TypeInfo {
     }
 }
 
-/// Where a runtime finds a message type by name.
+/// Where message types are looked up by name.
 pub(crate) enum TypeSource<'py> {
-    /// protobuf-py: a registry of the files registered with the engine.
+    /// For protobuf-py, a `Registry` containing every registered file.
     Registry(&'py Bound<'py, PyAny>),
-    /// google.protobuf: the descriptor of the message being validated,
-    /// whose pool holds every type reachable from it.
+    /// For google.protobuf, the descriptor of the message being validated.
+    /// Its pool contains every type reachable from that message.
     Descriptor(&'py Bound<'py, PyAny>),
 }
 
-/// A view's field values, by position in its type's fields.
+/// The field values a view has fetched, indexed like its type's field list.
 type Values = Box<[OnceCell<Option<Py<PyAny>>>]>;
 
-/// One validation: the message to validate, and everything a view needs
-/// besides its object.
+/// The state of one validation: the message being validated, and what
+/// every view needs besides its own object.
 pub(crate) struct Ctx<'py> {
     py: Python<'py>,
     runtime: ProtoRuntime,
     constants: &'py Constants,
     message: &'py Bound<'py, PyAny>,
     source: TypeSource<'py>,
-    /// Value buffers of views already dropped, reused by the views that
-    /// follow.
+    /// Value buffers returned by dropped views, for later views to reuse.
     free_values: RefCell<Vec<Values>>,
-    /// Likewise, the element buffers of list views already dropped.
+    /// Element buffers returned by dropped list views, likewise.
     free_items: RefCell<Vec<Vec<Py<PyAny>>>>,
 }
 
@@ -114,7 +114,8 @@ impl<'py> Ctx<'py> {
         }
     }
 
-    /// An empty value buffer of at least `len` slots.
+    /// Returns an empty value buffer with at least `len` slots, reusing a
+    /// returned one when possible.
     fn take_values(&self, len: usize) -> Values {
         if len == 0 {
             return Values::default();
@@ -168,12 +169,13 @@ pub(crate) struct MessageView<'a> {
     object: Bound<'a, PyAny>,
     /// Field values already fetched, by position in `info.fields`, so a
     /// value is read once and borrowed from for as long as the view lives.
-    /// Returned to the context, emptied, when the view is dropped.
+    /// When the view is dropped, the buffer is emptied and returned to the
+    /// context.
     values: Values,
 }
 
 impl<'a> MessageView<'a> {
-    /// A view of `object`, of type `info`.
+    /// Creates a view of `object`. `info` describes its type.
     fn new(ctx: &'a Ctx<'a>, object: Bound<'a, PyAny>, info: Option<&'a TypeInfo>) -> Self {
         let info = if object.is_none() { None } else { info };
         let values = info.map_or(0, |info| info.fields.len());
@@ -365,7 +367,7 @@ pub(crate) struct ListView<'a> {
     element: Singular,
     /// `None` for an unset field, which is empty.
     object: Option<&'a Bound<'a, PyAny>>,
-    /// The type of the elements, if they are messages.
+    /// The elements' type, if they are messages.
     message_type: Option<&'a TypeInfo>,
     /// The elements, fetched all at once on first access and held here for
     /// values to borrow from.
@@ -430,7 +432,7 @@ pub(crate) struct MapView<'a> {
     element: Singular,
     /// `None` for an unset field, which is empty.
     object: Option<&'a Bound<'a, PyAny>>,
-    /// The type of the values, if they are messages.
+    /// The values' type, if they are messages.
     message_type: Option<&'a TypeInfo>,
 }
 
