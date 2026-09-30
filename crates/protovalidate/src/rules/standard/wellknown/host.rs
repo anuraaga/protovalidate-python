@@ -16,7 +16,7 @@
 
 use std::sync::LazyLock;
 
-use regex::Regex;
+use crate::rules::standard::Regex;
 
 use super::ip::{is_ipv4, is_ipv6};
 

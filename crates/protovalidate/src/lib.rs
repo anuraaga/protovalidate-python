@@ -18,9 +18,11 @@
 //! extensions. This crate evaluates them against messages, supporting the
 //! full rule set including custom CEL expressions. The standard rules are
 //! evaluated in Rust; custom CEL expressions are compiled and evaluated
-//! by [cel-cpp]. The `cel` feature, on by default, brings cel-cpp in.
-//! A schema without custom rules can disable it, removing the need to
-//! compile any C++.
+//! by [cel-cpp]. The `cel` feature, on by default, brings cel-cpp in,
+//! and with it RE2 as the engine for `pattern` rules, the same one CEL's
+//! `matches()` uses. A schema without custom rules can disable it,
+//! removing the need to compile any C++; patterns then go through the
+//! `regex` crate instead.
 //!
 //! # Usage
 //!

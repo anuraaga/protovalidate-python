@@ -33,10 +33,9 @@ use std::mem;
 
 use buffa_descriptor::EnumIndex;
 use buffa_types::google::protobuf::{Duration as DurationPb, Timestamp as TimestampPb};
-use regex::Regex;
 
 use super::format::{Double, Duration, List, Timestamp, total_nanos};
-use super::{Check, Checks, Cmp, DoubleTest, MaybeNan, NowTest, TimestampTest};
+use super::{Check, Checks, Cmp, DoubleTest, MaybeNan, NowTest, Regex, TimestampTest};
 use crate::validate::__buffa::oneof;
 use crate::validate::__buffa::oneof::field_rules::Type as RulesType;
 use crate::validate::FieldPathElement;

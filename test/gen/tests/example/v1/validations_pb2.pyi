@@ -270,3 +270,21 @@ class DoubleInfiniteRange(_message.Message):
     VAL_FIELD_NUMBER: _ClassVar[int]
     val: float
     def __init__(self, val: _Optional[float] = ...) -> None: ...
+
+class PatternAsciiDigits(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: str
+    def __init__(self, val: _Optional[str] = ...) -> None: ...
+
+class PatternQuotedLiteral(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: str
+    def __init__(self, val: _Optional[str] = ...) -> None: ...
+
+class PatternRepeatTooLarge(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: str
+    def __init__(self, val: _Optional[str] = ...) -> None: ...

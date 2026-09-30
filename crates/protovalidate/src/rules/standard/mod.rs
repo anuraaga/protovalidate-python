@@ -27,16 +27,17 @@
 
 pub(crate) mod build;
 mod format;
+mod regex;
 pub(crate) mod wellknown;
 
 use std::collections::HashSet;
 use std::time::SystemTime;
 
 use buffa_descriptor::EnumIndex;
-use regex::Regex;
 
 use crate::validate::FieldPathElement;
 pub(crate) use format::{Double, Duration, Timestamp, total_nanos};
+pub(crate) use regex::Regex;
 
 /// One standard rule against one value.
 pub(crate) struct Check<T> {

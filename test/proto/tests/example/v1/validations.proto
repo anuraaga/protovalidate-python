@@ -230,3 +230,17 @@ message DoubleInfiniteRange {
     lt: inf
   }];
 }
+
+// Patterns are RE2: `\d` is ASCII only, `\Q...\E` quotes literal text,
+// and repeat counts are capped at 1000.
+message PatternAsciiDigits {
+  string val = 1 [(buf.validate.field).string.pattern = "^\\d+$"];
+}
+
+message PatternQuotedLiteral {
+  string val = 1 [(buf.validate.field).string.pattern = "^\\Qa.c\\E$"];
+}
+
+message PatternRepeatTooLarge {
+  string val = 1 [(buf.validate.field).string.pattern = "a{1001}"];
+}

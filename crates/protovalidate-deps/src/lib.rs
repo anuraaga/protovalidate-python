@@ -18,7 +18,8 @@
 //! An [`Engine`] holds a descriptor pool and compiles expressions into
 //! [`Program`]s; a [`Frame`] is a parsed message that programs evaluate
 //! against. Both keep the engine they came from alive. Functions written
-//! in Rust are added to an engine with [`Engine::register`].
+//! in Rust are added to an engine with [`Engine::register`]. A [`Regex`]
+//! is a pattern compiled by RE2, the engine behind CEL's `matches()`.
 //!
 //! This is an internal support crate: its API follows the shim's needs and
 //! changes with it.
@@ -28,11 +29,13 @@
 mod engine;
 mod ffi;
 mod function;
+mod regex;
 
 use std::fmt;
 
 pub use engine::{Engine, Frame, Program};
 pub use function::{Arg, Element, Kind, NativeFn};
+pub use regex::Regex;
 
 /// A scalar, as an expression's `this`.
 #[derive(Clone, Copy, Debug)]

@@ -58,7 +58,7 @@ unsafe fn take_error(error: *mut c_char) -> String {
 
 /// The outcome of a shim call that reports a status code, and on any code
 /// but `CEL_OK` stores an error string the caller owns in `error`.
-unsafe fn finish(code: c_int, error: *mut c_char) -> Result<(), Error> {
+pub(crate) unsafe fn finish(code: c_int, error: *mut c_char) -> Result<(), Error> {
     if code == CEL_OK {
         return Ok(());
     }

@@ -396,3 +396,23 @@ def test_infinity_in_messages(validator: ValidatorProtocol) -> None:
         "must be greater than -Infinity and less than Infinity"
     ]
     check_valid(validator, validations_pb.DoubleInfiniteRange(val=1.0))
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_pattern_is_re2(validator: ValidatorProtocol) -> None:
+    """Patterns follow RE2, the dialect the other implementations and CEL's `matches()` use."""
+    check_valid(validator, validations_pb.PatternAsciiDigits(val="123"))
+    violations = validator.collect_violations(
+        validations_pb.PatternAsciiDigits(val="\u0661\u0662\u0663")
+    )
+    assert [v.proto.rule_id for v in violations] == ["string.pattern"]
+
+    check_valid(validator, validations_pb.PatternQuotedLiteral(val="a.c"))
+    violations = validator.collect_violations(
+        validations_pb.PatternQuotedLiteral(val="abc")
+    )
+    assert [v.proto.rule_id for v in violations] == ["string.pattern"]
+
+    with pytest.raises(protovalidate.CompilationError) as exc_info:
+        validator.validate(validations_pb.PatternRepeatTooLarge(val="a"))
+    assert str(exc_info.value).startswith("invalid regex pattern `a{1001}`: ")

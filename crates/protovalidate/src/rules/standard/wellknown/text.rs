@@ -17,7 +17,7 @@
 
 use std::sync::LazyLock;
 
-use regex::Regex;
+use crate::rules::standard::Regex;
 
 macro_rules! pattern {
     ($name:ident, $pattern:literal) => {
