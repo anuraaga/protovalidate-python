@@ -15,15 +15,15 @@
 //! The regular expression engine behind `pattern` rules and the well-known
 //! string formats. With the `cel` feature it is RE2, through cel-cpp, so a
 //! native `pattern` rule and a `matches()` call in a custom rule accept the
-//! same syntax and agree on every input. Without it, the `regex` crate
-//! stands in, whose dialect differs in places: `\d`, `\w` and `\s` are
-//! Unicode-aware, `\Q...\E` is not supported, and repeat counts are not
-//! capped at 1000.
+//! same syntax and agree on every input. Without it, `regex-lite` stands
+//! in. Like RE2 its `\d`, `\w`, `\s` and `\b` are ASCII, but it differs
+//! in places: `(?i)` folds ASCII only, `\p{...}` classes and `\Q...\E`
+//! are not supported, and repeat counts are not capped at 1000.
 
 #[cfg(feature = "cel")]
 type Inner = protovalidate_deps::Regex;
 #[cfg(not(feature = "cel"))]
-type Inner = regex::Regex;
+type Inner = regex_lite::Regex;
 
 /// A compiled pattern.
 #[derive(Debug)]
