@@ -36,7 +36,7 @@ use buffa_descriptor::EnumIndex;
 use regex::Regex;
 
 use crate::validate::FieldPathElement;
-pub(crate) use format::{Duration, Timestamp, total_nanos};
+pub(crate) use format::{Double, Duration, Timestamp, total_nanos};
 
 /// One standard rule against one value.
 pub(crate) struct Check<T> {
@@ -137,9 +137,9 @@ impl MaybeNan for i64 {}
 impl MaybeNan for u64 {}
 impl MaybeNan for Duration {}
 impl MaybeNan for Timestamp {}
-impl MaybeNan for f64 {
+impl MaybeNan for Double {
     fn is_nan(&self) -> bool {
-        f64::is_nan(*self)
+        f64::is_nan(self.0)
     }
 }
 
@@ -172,14 +172,14 @@ impl<T: PartialOrd + MaybeNan> Test<T> for Cmp<T> {
 
 /// The float and double rules.
 pub(crate) enum DoubleTest {
-    Cmp(Cmp<f64>),
+    Cmp(Cmp<Double>),
     Finite,
 }
 
 impl Test<f64> for DoubleTest {
     fn fails(&self, value: &f64) -> Result<bool, String> {
         match self {
-            Self::Cmp(cmp) => cmp.fails(value),
+            Self::Cmp(cmp) => cmp.fails(&Double(*value)),
             Self::Finite => Ok(!value.is_finite()),
         }
     }

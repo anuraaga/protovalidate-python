@@ -21,7 +21,7 @@ mod view;
 mod violation;
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::import_exception;
@@ -262,7 +262,10 @@ impl Validator {
         message: &Bound<'py, PyAny>,
         fail_fast: bool,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let core = engine.core.read_py_attached(py).unwrap();
+        let core = engine
+            .core
+            .read_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
         let registry = engine.registry.as_ref().map(|registry| registry.bind(py));
         let source = match registry {
             Some(registry) => TypeSource::Registry(registry),
@@ -313,13 +316,24 @@ impl Engine {
     ) -> PyResult<()> {
         let name_attr = file.getattr(&constants.name)?;
         let name = name_attr.cast::<PyString>()?.to_str()?;
-        if self.registered.read_py_attached(py).unwrap().contains(name) {
+        if self
+            .registered
+            .read_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(name)
+        {
             return Ok(());
         }
         // Registration is rare (once per file), so holding the write locks
         // across the collection walk costs little.
-        let mut registered = self.registered.write_py_attached(py).unwrap();
-        let mut core = self.core.write_py_attached(py).unwrap();
+        let mut registered = self
+            .registered
+            .write_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut core = self
+            .core
+            .write_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
         let registry = self.registry.as_ref().map(|registry| registry.bind(py));
         runtime.collect_files(file, constants, &mut registered, &mut |file, bytes| {
             core.add_file_descriptor_bytes(bytes.as_bytes())

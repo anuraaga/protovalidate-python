@@ -336,6 +336,34 @@ fn scalar_rules(rules: &RulesType) -> Option<(&'static str, Type, Option<&'stati
     })
 }
 
+/// The name of the `FieldRules` field holding the rules, for messages.
+fn rules_name(rules: &RulesType) -> &'static str {
+    match rules {
+        RulesType::Float(_) => "float",
+        RulesType::Double(_) => "double",
+        RulesType::Int32(_) => "int32",
+        RulesType::Int64(_) => "int64",
+        RulesType::Uint32(_) => "uint32",
+        RulesType::Uint64(_) => "uint64",
+        RulesType::Sint32(_) => "sint32",
+        RulesType::Sint64(_) => "sint64",
+        RulesType::Fixed32(_) => "fixed32",
+        RulesType::Fixed64(_) => "fixed64",
+        RulesType::Sfixed32(_) => "sfixed32",
+        RulesType::Sfixed64(_) => "sfixed64",
+        RulesType::Bool(_) => "bool",
+        RulesType::String(_) => "string",
+        RulesType::Bytes(_) => "bytes",
+        RulesType::Enum(_) => "enum",
+        RulesType::Repeated(_) => "repeated",
+        RulesType::Map(_) => "map",
+        RulesType::Any(_) => "any",
+        RulesType::Duration(_) => "duration",
+        RulesType::FieldMask(_) => "field_mask",
+        RulesType::Timestamp(_) => "timestamp",
+    }
+}
+
 impl<'a, R: Runtime> Builder<'a, R> {
     /// Creates a builder. `types` holds the resolved type of every message
     /// the rules will refer to.
@@ -668,6 +696,28 @@ impl<'a, R: Runtime> Builder<'a, R> {
         value: &mut ValueValidator<R>,
         predefined: &mut CelExpressions,
     ) -> Result<(), String> {
+        // A repeated or map field takes only its container's rules; its
+        // elements' rules go under `items`, `keys` and `values`. Checking
+        // the element type alone would let scalar rules through onto the
+        // container, where they would test the type's default in place of
+        // each element.
+        match (&target.kind, standard) {
+            (DescriptorKind::List(_), RulesType::Repeated(_))
+            | (DescriptorKind::Map { .. }, RulesType::Map(_))
+            | (DescriptorKind::Singular(_), _) => {}
+            (DescriptorKind::List(_), _) => {
+                return Err(format!(
+                    "{} field validator on repeated field",
+                    rules_name(standard)
+                ));
+            }
+            (DescriptorKind::Map { .. }, _) => {
+                return Err(format!(
+                    "{} field validator on map field",
+                    rules_name(standard)
+                ));
+            }
+        }
         if let Some((name, expected, wrapper)) = scalar_rules(standard) {
             self.check_scalar_type(&target, expected, wrapper)?;
             value.wrapper = self
@@ -692,14 +742,14 @@ impl<'a, R: Runtime> Builder<'a, R> {
                 self.well_known_rules(&target, "timestamp", descriptors::TIMESTAMP)?
             }
             RulesType::Any(_) => self.well_known_rules(&target, "any", descriptors::ANY)?,
-            RulesType::Repeated(_) => match target.kind {
+            RulesType::Repeated(rules) => match target.kind {
+                DescriptorKind::List(SingularKind::Message(_)) if rules.unique == Some(true) => {
+                    // `unique()` compares scalars only, and would otherwise
+                    // fail every validation of the message.
+                    return Err("repeated.unique is not supported for message items".to_owned());
+                }
                 DescriptorKind::List(_) => "repeated",
-                DescriptorKind::Map { .. } => {
-                    return Err("repeated field validator on map field".to_owned());
-                }
-                DescriptorKind::Singular(_) => {
-                    return Err("repeated field validator on non-repeated field".to_owned());
-                }
+                _ => return Err("repeated field validator on non-repeated field".to_owned()),
             },
             RulesType::Map(_) => match target.kind {
                 DescriptorKind::Map { .. } => "map",

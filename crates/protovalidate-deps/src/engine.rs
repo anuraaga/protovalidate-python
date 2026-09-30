@@ -188,12 +188,24 @@ unsafe extern "C" fn call_function(
     let function: NativeFn = unsafe { std::mem::transmute(ctx.addr()) };
     // SAFETY: `args` is valid for `len` values for the call.
     let values = unsafe { slice::from_raw_parts(args, len) };
-    let result = values
-        .iter()
-        // SAFETY: each value's data outlives the call.
-        .map(|value| unsafe { argument(value) })
-        .collect::<Result<Vec<_>, _>>()
-        .and_then(|arguments| function(&arguments));
+    // A panic must not unwind into C++, which would abort the process; it
+    // is reported as the call failing instead.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        values
+            .iter()
+            // SAFETY: each value's data outlives the call.
+            .map(|value| unsafe { argument(value) })
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|arguments| function(&arguments))
+    }))
+    .unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        Err(format!("function panicked: {message}"))
+    });
     match result {
         Ok(value) => {
             // SAFETY: `out` is a live out-param.
@@ -369,6 +381,7 @@ impl Engine {
         unsafe { finish(code, error) }?;
         Ok(Program {
             raw: out,
+            len: expressions.len(),
             _engine: Arc::clone(&self.shared),
         })
     }
@@ -410,6 +423,8 @@ impl Engine {
 /// engine that compiled it alive.
 pub struct Program {
     raw: *mut CelProgram,
+    /// The number of expressions, which `eval` indexes.
+    len: usize,
     _engine: Arc<Shared>,
 }
 
@@ -426,8 +441,14 @@ impl Program {
     ///
     /// [`Error::Runtime`] for an expression that fails to evaluate or
     /// produces an error; [`Error::Argument`] for a `this` field that does
-    /// not exist.
+    /// not exist, or an `index` the program has no expression at.
     pub fn eval(&self, index: usize, this: This<'_>) -> Result<Value, Error> {
+        if index >= self.len {
+            return Err(Error::Argument(format!(
+                "no expression {index} in a program of {}",
+                self.len
+            )));
+        }
         let (kind, scalar, frame, field_number) = match this {
             This::Scalar(scalar) => (CEL_THIS_SCALAR, Some(scalar.to_ffi()), ptr::null(), 0),
             This::Message(frame) => (CEL_THIS_MESSAGE, None, frame.raw.cast_const(), 0),
@@ -436,9 +457,9 @@ impl Program {
         let mut out = CelValue::default();
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: `self.raw` is a live program and `index` is one of its
-        // expressions; the scalar and its borrowed string storage outlive the
-        // call, as does `frame` (`This`'s lifetime); `out` and `error` are
-        // live out-params.
+        // expressions, checked above; the scalar and its borrowed string
+        // storage outlive the call, as does `frame` (`This`'s lifetime);
+        // `out` and `error` are live out-params.
         let code = unsafe {
             cel_program_eval(
                 self.raw,

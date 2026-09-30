@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import math
+
 import protobuf
 import pytest
 from protobuf import Oneof
+from protobuf.wkt import Duration, Int32Value, Timestamp
 
 import protovalidate
 from protovalidate import Violation
@@ -283,3 +286,113 @@ def test_violation_before_compilation_error(validator: ValidatorProtocol) -> Non
     check_compilation_errors(
         validator, msg, "duration field validator on non-duration field"
     )
+
+
+@pytest.mark.parametrize("validator", validators)
+@pytest.mark.parametrize(
+    ("msg", "expected"),
+    [
+        (
+            validations_pb.RepeatedFieldScalarRule(val=["abcd"]),
+            "string field validator on repeated field",
+        ),
+        (
+            validations_pb.RepeatedFieldWrapperRule(val=[Int32Value(value=100)]),
+            "int32 field validator on repeated field",
+        ),
+        (
+            validations_pb.RepeatedFieldEnumRule(val=[1]),
+            "enum field validator on repeated field",
+        ),
+        (
+            validations_pb.RepeatedFieldDurationRule(val=[Duration(seconds=2)]),
+            "duration field validator on repeated field",
+        ),
+        (
+            validations_pb.MapFieldScalarRule(val={"abcd": "abcd"}),
+            "string field validator on map field",
+        ),
+        (
+            validations_pb.RepeatedUniqueMessages(val=[validations_pb.Embed(val=1)]),
+            "repeated.unique is not supported for message items",
+        ),
+        (
+            validations_pb.TimestampOutOfRange(val=Timestamp(seconds=1)),
+            (
+                "timestamp rule value out of range: seconds 253402300800 nanos 0 "
+                "is not between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999999Z"
+            ),
+        ),
+    ],
+)
+def test_rules_that_do_not_apply_to_field(
+    validator: ValidatorProtocol, msg: protobuf.Message, expected: str
+) -> None:
+    """Rules that cannot apply to their field fail to compile rather than test the wrong value."""
+    check_compilation_errors(validator, msg, expected)
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_cel_unique_on_messages(validator: ValidatorProtocol) -> None:
+    """`unique()` on a list of messages has no overload, and says so rather than passing."""
+    msg = validations_pb.CelUniqueMessages(
+        val=[validations_pb.Embed(val=1), validations_pb.Embed(val=1)]
+    )
+    with pytest.raises(protovalidate.EvaluationError):
+        validator.validate(msg)
+    with pytest.raises(protovalidate.EvaluationError):
+        validator.collect_violations(msg)
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_timestamp_rule_order(validator: ValidatorProtocol) -> None:
+    """`const` is checked before `lt_now`, as validate.proto declares them."""
+    msg = validations_pb.TimestampRuleOrder(val=Timestamp(seconds=32503680000))
+    violations = validator.collect_violations(msg)
+    assert [v.proto.rule_id for v in violations] == [
+        "timestamp.const",
+        "timestamp.lt_now",
+    ]
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_enum_rule_order(validator: ValidatorProtocol) -> None:
+    """`defined_only` is checked after the comparisons."""
+    msg = validations_pb.EnumRuleOrder(val=5)
+    violations = validator.collect_violations(msg)
+    assert [v.proto.rule_id for v in violations] == [
+        "enum.const",
+        "enum.in",
+        "enum.not_in",
+        "enum.defined_only",
+    ]
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_hostname_length_excludes_trailing_dot(validator: ValidatorProtocol) -> None:
+    longest = ".".join(["a" * 63] * 3 + ["a" * 61])
+    assert len(longest) == 253
+    check_valid(validator, validations_pb.Hostname(val=longest))
+    check_valid(validator, validations_pb.Hostname(val=longest + "."))
+
+    too_long = ".".join(["a" * 63] * 3 + ["a" * 62])
+    assert len(too_long) == 254
+    for val in (too_long, too_long + "."):
+        violations = validator.collect_violations(validations_pb.Hostname(val=val))
+        assert [v.proto.rule_id for v in violations] == ["string.hostname"]
+
+
+@pytest.mark.parametrize("validator", validators)
+def test_infinity_in_messages(validator: ValidatorProtocol) -> None:
+    """Infinite rule values print as CEL's `Infinity`, not Rust's `inf`."""
+    violations = validator.collect_violations(validations_pb.DoubleInfinity(val=1.0))
+    assert [v.proto.message for v in violations] == ["must equal Infinity"]
+    check_valid(validator, validations_pb.DoubleInfinity(val=math.inf))
+
+    violations = validator.collect_violations(
+        validations_pb.DoubleInfiniteRange(val=math.inf)
+    )
+    assert [v.proto.message for v in violations] == [
+        "must be greater than -Infinity and less than Infinity"
+    ]
+    check_valid(validator, validations_pb.DoubleInfiniteRange(val=1.0))

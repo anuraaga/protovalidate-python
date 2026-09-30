@@ -35,7 +35,7 @@ use buffa_descriptor::EnumIndex;
 use buffa_types::google::protobuf::{Duration as DurationPb, Timestamp as TimestampPb};
 use regex::Regex;
 
-use super::format::{Duration, List, Timestamp, total_nanos};
+use super::format::{Double, Duration, List, Timestamp, total_nanos};
 use super::{Check, Checks, Cmp, DoubleTest, MaybeNan, NowTest, TimestampTest};
 use crate::validate::__buffa::oneof;
 use crate::validate::__buffa::oneof::field_rules::Type as RulesType;
@@ -307,6 +307,21 @@ fn timestamp(t: &TimestampPb) -> Timestamp {
     Timestamp(total_nanos(t.seconds, i64::from(t.nanos)))
 }
 
+/// Rejects a timestamp rule value outside the range a `Timestamp` allows.
+fn check_timestamp(t: &TimestampPb) -> Result<(), String> {
+    if (0..=999_999_999).contains(&t.nanos) && timestamp(t).in_range() {
+        Ok(())
+    } else {
+        Err(format!(
+            "timestamp rule value out of range: seconds {} nanos {} is not between {} and {}",
+            t.seconds,
+            t.nanos,
+            Timestamp::MIN,
+            Timestamp::MAX
+        ))
+    }
+}
+
 pub(super) fn regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(pattern).map_err(|error| format!("invalid regex pattern `{pattern}`: {error}"))
 }
@@ -334,11 +349,11 @@ pub(crate) fn checks(
 ) -> Result<Checks, String> {
     Ok(match rules {
         RulesType::Float(r) => {
-            let bounds = numeric_bounds!(r, float_rules, |v: &f32| f64::from(*v));
+            let bounds = numeric_bounds!(r, float_rules, |v: &f32| Double(f64::from(*v)));
             Checks::Double(at.place(floating(prefix, &bounds, r.finite.take())))
         }
         RulesType::Double(r) => {
-            let bounds = numeric_bounds!(r, double_rules, |v: &f64| *v);
+            let bounds = numeric_bounds!(r, double_rules, |v: &f64| Double(*v));
             Checks::Double(at.place(floating(prefix, &bounds, r.finite.take())))
         }
         RulesType::Int32(r) => integer_checks!(Int, at, prefix, r, int32rules, i32 => i64),
@@ -364,7 +379,7 @@ pub(crate) fn checks(
                 .checks(prefix, 2),
             ),
         ),
-        RulesType::Timestamp(r) => Checks::Timestamp(at.place(timestamp_checks(prefix, r))),
+        RulesType::Timestamp(r) => Checks::Timestamp(at.place(timestamp_checks(prefix, r)?)),
         RulesType::Bool(r) => Checks::Bool(at.place(misc::bool_checks(prefix, r))),
         RulesType::Enum(r) => Checks::Enum(at.place(misc::enum_checks(prefix, r, at.r#enum))),
         RulesType::String(r) => Checks::String(at.place(string::checks(prefix, r)?)),
@@ -380,7 +395,7 @@ pub(crate) fn checks(
 /// the comparisons.
 fn floating<'a>(
     prefix: &'a str,
-    bounds: &Bounds<f64>,
+    bounds: &Bounds<Double>,
     finite: Option<bool>,
 ) -> Unplaced<'a, DoubleTest> {
     let mut checks = bounds.checks(prefix, 1).map(DoubleTest::Cmp);
@@ -391,22 +406,37 @@ fn floating<'a>(
 }
 
 /// The checks of a timestamp rules message. `lt_now` and `gt_now` take the
-/// place of a bound in their oneofs.
-fn timestamp_checks<'a>(prefix: &'a str, r: &mut TimestampRules) -> Unplaced<'a, TimestampTest> {
+/// place of a bound in their oneofs, and are checked after the bounds, in
+/// the order `validate.proto` declares them. Fails for a value outside the
+/// range a `Timestamp` allows.
+fn timestamp_checks<'a>(
+    prefix: &'a str,
+    r: &mut TimestampRules,
+) -> Result<Unplaced<'a, TimestampTest>, String> {
+    use oneof::timestamp_rules::{GreaterThan, LessThan};
+    let values = [
+        r.r#const.as_option(),
+        match &r.less_than {
+            Some(LessThan::Lt(v) | LessThan::Lte(v)) => Some(v),
+            _ => None,
+        },
+        match &r.greater_than {
+            Some(GreaterThan::Gt(v) | GreaterThan::Gte(v)) => Some(v),
+            _ => None,
+        },
+    ];
+    values.into_iter().flatten().try_for_each(check_timestamp)?;
+
     let mut checks = Unplaced::new(prefix);
-    if let Some(oneof::timestamp_rules::LessThan::LtNow(lt_now)) = r.less_than {
-        r.less_than = None;
-        if lt_now {
-            checks.push(
-                7,
-                "lt_now",
-                "must be less than now",
-                TimestampTest::Now(NowTest::LtNow),
-            );
+    let lt_now = match r.less_than {
+        Some(LessThan::LtNow(lt_now)) => {
+            r.less_than = None;
+            lt_now
         }
-    }
+        _ => false,
+    };
     let gt_now = match r.greater_than {
-        Some(oneof::timestamp_rules::GreaterThan::GtNow(gt_now)) => {
+        Some(GreaterThan::GtNow(gt_now)) => {
             r.greater_than = None;
             gt_now
         }
@@ -415,6 +445,14 @@ fn timestamp_checks<'a>(prefix: &'a str, r: &mut TimestampRules) -> Unplaced<'a,
     let none: [TimestampPb; 0] = [];
     let bounds = bounds!(r, timestamp_rules, timestamp, r.r#const.take(), none, none);
     checks.extend(bounds.checks(prefix, 2).map(TimestampTest::Cmp));
+    if lt_now {
+        checks.push(
+            7,
+            "lt_now",
+            "must be less than now",
+            TimestampTest::Now(NowTest::LtNow),
+        );
+    }
     if gt_now {
         checks.push(
             8,
@@ -432,5 +470,5 @@ fn timestamp_checks<'a>(prefix: &'a str, r: &mut TimestampRules) -> Unplaced<'a,
             TimestampTest::Now(NowTest::Within(within)),
         );
     }
-    checks
+    Ok(checks)
 }

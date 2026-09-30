@@ -31,10 +31,14 @@ use super::ip::{is_ipv4, is_ipv6};
 /// - The name can have a trailing dot, for example `foo.example.com.`.
 /// - The name can be 253 characters at most, excluding the optional trailing dot.
 pub(crate) fn is_hostname(s: &str) -> bool {
-    if s.is_empty() || s.len() > 253 {
+    if s.is_empty() {
         return false;
     }
+    // The limit excludes the trailing dot, so strip it before measuring.
     let s = s.strip_suffix('.').unwrap_or(s);
+    if s.len() > 253 {
+        return false;
+    }
     let mut all_digits = false;
     for part in s.split('.') {
         all_digits = true;

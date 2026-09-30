@@ -12,13 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ....buf.validate import validate_pb2 as _validate_pb2
+from google.protobuf import duration_pb2 as _duration_pb2
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
+from google.protobuf import wrappers_pb2 as _wrappers_pb2
 from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
+
+class TestEnum(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    TEST_ENUM_UNSPECIFIED: _ClassVar[TestEnum]
+    TEST_ENUM_ONE: _ClassVar[TestEnum]
+    TEST_ENUM_TWO: _ClassVar[TestEnum]
+TEST_ENUM_UNSPECIFIED: TestEnum
+TEST_ENUM_ONE: TestEnum
+TEST_ENUM_TWO: TestEnum
 
 class MultipleValidations(_message.Message):
     __slots__ = ("title", "name")
@@ -173,3 +185,88 @@ class ViolationBeforeError(_message.Message):
     a: str
     b: str
     def __init__(self, a: _Optional[str] = ..., b: _Optional[str] = ...) -> None: ...
+
+class RepeatedFieldScalarRule(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, val: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class RepeatedFieldWrapperRule(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _containers.RepeatedCompositeFieldContainer[_wrappers_pb2.Int32Value]
+    def __init__(self, val: _Optional[_Iterable[_Union[_wrappers_pb2.Int32Value, _Mapping]]] = ...) -> None: ...
+
+class RepeatedFieldEnumRule(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _containers.RepeatedScalarFieldContainer[TestEnum]
+    def __init__(self, val: _Optional[_Iterable[_Union[TestEnum, str]]] = ...) -> None: ...
+
+class RepeatedFieldDurationRule(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _containers.RepeatedCompositeFieldContainer[_duration_pb2.Duration]
+    def __init__(self, val: _Optional[_Iterable[_Union[_duration_pb2.Duration, _Mapping]]] = ...) -> None: ...
+
+class MapFieldScalarRule(_message.Message):
+    __slots__ = ("val",)
+    class ValEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _containers.ScalarMap[str, str]
+    def __init__(self, val: _Optional[_Mapping[str, str]] = ...) -> None: ...
+
+class RepeatedUniqueMessages(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _containers.RepeatedCompositeFieldContainer[Embed]
+    def __init__(self, val: _Optional[_Iterable[_Union[Embed, _Mapping]]] = ...) -> None: ...
+
+class CelUniqueMessages(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _containers.RepeatedCompositeFieldContainer[Embed]
+    def __init__(self, val: _Optional[_Iterable[_Union[Embed, _Mapping]]] = ...) -> None: ...
+
+class TimestampOutOfRange(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _timestamp_pb2.Timestamp
+    def __init__(self, val: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class TimestampRuleOrder(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: _timestamp_pb2.Timestamp
+    def __init__(self, val: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class EnumRuleOrder(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: TestEnum
+    def __init__(self, val: _Optional[_Union[TestEnum, str]] = ...) -> None: ...
+
+class Hostname(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: str
+    def __init__(self, val: _Optional[str] = ...) -> None: ...
+
+class DoubleInfinity(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: float
+    def __init__(self, val: _Optional[float] = ...) -> None: ...
+
+class DoubleInfiniteRange(_message.Message):
+    __slots__ = ("val",)
+    VAL_FIELD_NUMBER: _ClassVar[int]
+    val: float
+    def __init__(self, val: _Optional[float] = ...) -> None: ...

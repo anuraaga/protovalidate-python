@@ -19,8 +19,8 @@
 //! decimal integers, lists in brackets, durations as seconds with an `s`,
 //! timestamps in RFC 3339. Integers, strings and doubles print through
 //! [`Display`], timestamps through jiff; the types here cover the rest.
-//! Doubles print in the shortest round-trip form, and fractions of a second
-//! with the digits they need.
+//! Doubles print in the shortest round-trip form, infinities as `Infinity`
+//! and `-Infinity`, and fractions of a second with the digits they need.
 
 use std::fmt::{self, Display};
 
@@ -40,6 +40,22 @@ pub(crate) struct Duration(pub i128);
 /// A `google.protobuf.Timestamp`, as nanoseconds since the Unix epoch.
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
 pub(crate) struct Timestamp(pub i128);
+
+impl Timestamp {
+    /// `0001-01-01T00:00:00Z`, the earliest value a `Timestamp` may hold.
+    pub(crate) const MIN: Self = Self(-62_135_596_800 * NANOS_PER_SECOND);
+    /// `9999-12-31T23:59:59.999999999Z`, the latest.
+    pub(crate) const MAX: Self = Self(253_402_300_799 * NANOS_PER_SECOND + 999_999_999);
+
+    /// Whether the value is in the range `google.protobuf.Timestamp` allows.
+    pub(crate) fn in_range(self) -> bool {
+        (Self::MIN..=Self::MAX).contains(&self)
+    }
+}
+
+/// A `double` or `float` rule value, compared as an `f64`.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+pub(crate) struct Double(pub f64);
 
 /// Bytes as `%s` prints them: as text, with what is not UTF-8 replaced.
 #[derive(Clone, Copy)]
@@ -77,12 +93,52 @@ impl Display for Duration {
 }
 
 /// RFC 3339 in UTC, with the fractional digits the value needs. A value
-/// outside the years jiff represents prints as seconds since the epoch.
+/// outside the range a `Timestamp` allows prints as seconds since the
+/// epoch.
+///
+/// The value is added to the epoch as a civil date-time rather than made a
+/// `jiff::Timestamp`, whose range stops a day short of `9999-12-31`.
 impl Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match jiff::Timestamp::from_nanosecond(self.0) {
-            Ok(timestamp) => write!(f, "{timestamp}"),
-            Err(_) => write!(f, "{} since the epoch", Duration(self.0)),
+        let civil = if self.in_range() {
+            let seconds = self.0.div_euclid(NANOS_PER_SECOND);
+            let nanos = self.0.rem_euclid(NANOS_PER_SECOND);
+            i64::try_from(seconds)
+                .ok()
+                .zip(i64::try_from(nanos).ok())
+                .and_then(|(seconds, nanos)| {
+                    let span = jiff::Span::new()
+                        .try_seconds(seconds)
+                        .ok()?
+                        .try_nanoseconds(nanos)
+                        .ok()?;
+                    jiff::civil::date(1970, 1, 1)
+                        .at(0, 0, 0, 0)
+                        .checked_add(span)
+                        .ok()
+                })
+        } else {
+            None
+        };
+        match civil {
+            Some(civil) => write!(f, "{civil}Z"),
+            None => write!(f, "{} since the epoch", Duration(self.0)),
+        }
+    }
+}
+
+/// As `%s` prints a double: `Infinity`, `-Infinity`, or the shortest form
+/// that reads back to the value.
+impl Display for Double {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_infinite() {
+            f.write_str(if self.0 > 0.0 {
+                "Infinity"
+            } else {
+                "-Infinity"
+            })
+        } else {
+            write!(f, "{}", self.0)
         }
     }
 }
@@ -144,6 +200,29 @@ mod tests {
         assert_eq!(
             Timestamp(-NANOS_PER_SECOND).to_string(),
             "1969-12-31T23:59:59Z"
+        );
+        assert_eq!(Timestamp::MIN.to_string(), "0001-01-01T00:00:00Z");
+        assert_eq!(Timestamp::MAX.to_string(), "9999-12-31T23:59:59.999999999Z");
+        // One nanosecond past the range: never handed to jiff.
+        assert!(!Timestamp(Timestamp::MAX.0 + 1).in_range());
+        assert_eq!(
+            Timestamp(Timestamp::MAX.0 + 1).to_string(),
+            "253402300800s since the epoch"
+        );
+        assert!(!Timestamp(Timestamp::MIN.0 - 1).in_range());
+    }
+
+    #[test]
+    fn doubles() {
+        assert_eq!(Double(1.5).to_string(), "1.5");
+        assert_eq!(Double(123.0).to_string(), "123");
+        assert_eq!(Double(1e21).to_string(), "1000000000000000000000");
+        assert_eq!(Double(f64::INFINITY).to_string(), "Infinity");
+        assert_eq!(Double(f64::NEG_INFINITY).to_string(), "-Infinity");
+        assert_eq!(Double(f64::NAN).to_string(), "NaN");
+        assert_eq!(
+            List([f64::INFINITY, 1e21].map(Double)).to_string(),
+            "[Infinity, 1000000000000000000000]"
         );
     }
 

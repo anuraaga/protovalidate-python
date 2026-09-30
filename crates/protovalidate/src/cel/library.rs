@@ -20,18 +20,21 @@ use protovalidate_deps::{Arg, Element, Kind, NativeFn};
 
 use crate::rules::standard::{UniqueKey, has_duplicates, wellknown};
 
-/// The key `unique()` compares a list element by; `None` for elements that
-/// equal nothing.
-fn unique_key<'a>(element: &'a Element<'a>) -> Option<UniqueKey<'a>> {
-    match element {
+/// The key `unique()` compares a list element by; `None` for a NaN, which
+/// equals nothing. `unique()` has no overload for a list of messages,
+/// lists or maps, so those are an error.
+fn unique_key<'a>(element: &'a Element<'a>) -> Result<Option<UniqueKey<'a>>, String> {
+    Ok(match element {
         Element::Bool(b) => Some(UniqueKey::Bool(*b)),
         Element::Int(i) => Some(UniqueKey::Int(*i)),
         Element::Uint(u) => Some(UniqueKey::Uint(*u)),
         Element::Double(f) => UniqueKey::double(*f),
         Element::String(s) => Some(UniqueKey::Str(s)),
         Element::Bytes(b) => Some(UniqueKey::Bytes(b)),
-        Element::Other => None,
-    }
+        Element::Other => {
+            return Err("no such overload: unique(list) on non-scalar elements".to_owned());
+        }
+    })
 }
 
 /// One library function, called as a method of its first argument:
@@ -165,7 +168,13 @@ fn is_inf(args: &[Arg<'_>]) -> Result<bool, String> {
 
 fn unique(args: &[Arg<'_>]) -> Result<bool, String> {
     match args {
-        [Arg::List(elements)] => Ok(!has_duplicates(elements.iter().map(unique_key))),
+        [Arg::List(elements)] => {
+            let keys = elements
+                .iter()
+                .map(unique_key)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(!has_duplicates(keys))
+        }
         _ => Err(mismatch("unique")),
     }
 }
@@ -286,7 +295,8 @@ mod tests {
             Element::Double(f64::NAN)
         ]));
         assert!(!list(vec![Element::Double(0.0), Element::Double(-0.0)]));
-        assert!(list(vec![Element::Other, Element::Other]));
+        assert!(unique(&[Arg::List(vec![Element::Other, Element::Other])]).is_err());
+        assert!(unique(&[Arg::List(vec![Element::Int(1), Element::Other])]).is_err());
         assert!(!list(vec![
             Element::String("a".into()),
             Element::String("a".into())

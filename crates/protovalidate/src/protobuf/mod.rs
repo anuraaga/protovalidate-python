@@ -77,6 +77,7 @@ pub trait Reader<R: Runtime> {
 /// A field's value, borrowed from the message that holds it.
 ///
 /// Numbers are widened to their equivalent CEL types.
+#[non_exhaustive]
 pub enum Val<'a, R: Runtime> {
     Bool(bool),
     Int(i64),
@@ -122,7 +123,7 @@ pub trait Message<R: Runtime> {
 
 /// A repeated field.
 // A length that may fail to be read has no `is_empty` to pair with.
-#[allow(clippy::len_without_is_empty)]
+#[expect(clippy::len_without_is_empty)]
 pub trait List<R: Runtime> {
     /// The number of elements.
     ///
@@ -141,7 +142,7 @@ pub trait List<R: Runtime> {
 
 /// A map field.
 // As for `List`.
-#[allow(clippy::len_without_is_empty)]
+#[expect(clippy::len_without_is_empty)]
 pub trait Map<R: Runtime> {
     /// The number of entries.
     ///
