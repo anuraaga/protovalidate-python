@@ -37,13 +37,18 @@ fn encode_violations(violations: Vec<ViolationPb>) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// Appended to a panic that only a broken build can reach.
+const BUILD_BUG: &str = "this is a bug in protovalidate, please report it";
+
 /// A CEL environment with the files of `set` registered.
 pub(crate) fn cel_env(set: &FileDescriptorSet) -> cel::Env {
-    let mut env = cel::new_env()
-        .unwrap_or_else(|error| panic!("could not initialize the CEL runtime: {error}"));
+    let mut env = cel::new_env().unwrap_or_else(|error| {
+        panic!("could not initialize the CEL runtime: {error}; {BUILD_BUG}")
+    });
     for file in &set.file {
-        env.add_file(&file.encode_to_vec())
-            .unwrap_or_else(|error| panic!("could not register the buf.validate schema: {error}"));
+        env.add_file(&file.encode_to_vec()).unwrap_or_else(|error| {
+            panic!("could not register the buf.validate schema: {error}; {BUILD_BUG}")
+        });
     }
     env
 }
@@ -105,6 +110,11 @@ impl<R: Runtime> Validator<R> {
         self.descriptors
             .add_file_set(set)
             .map_err(DescriptorError::new)?;
+        // Not atomic: the file is in the validator's pool before the CEL
+        // pool takes it. There is no real case where they would disagree when
+        // adding descriptors, in the off chance, the error is returned here, and
+        // a rule reaching a type the CEL pool lacks fails with "unknown message type"
+        // rather than running against the wrong schema.
         self.env
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
@@ -155,6 +165,8 @@ impl<R: Runtime> Validator<R> {
     ) -> Result<Vec<ViolationPb>, Error<R::Error>> {
         let index = self.message_index(type_name)?;
         let validators = self.validators(index, reader)?;
+        // `validators` either found `index` in the cache or just built it,
+        // so the lookup cannot miss.
         let validator = validators[&index]
             .as_ref()
             .map_err(|error| Error::Compilation(error.clone()))?;

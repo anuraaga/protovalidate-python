@@ -494,8 +494,15 @@ impl<'a, R: Runtime> Builder<'a, R> {
             }
         }
 
+        let message_type = self.types.get(&idx).cloned().ok_or_else(|| {
+            // Can't happen in practice.
+            format!(
+                "the message type {} was not resolved before its rules were built",
+                message.full_name()
+            )
+        })?;
         Ok(MessageValidator {
-            message_type: self.types[&idx].clone(),
+            message_type,
             cel,
             message_oneofs,
             oneofs: self.required_oneofs(message),
