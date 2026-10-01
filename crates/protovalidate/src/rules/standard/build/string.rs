@@ -32,7 +32,7 @@ pub(super) fn checks<'a>(
     }
     length_checks(&mut checks, r);
     if let Some(p) = r.pattern.take() {
-        let compiled = regex(&format!("{prefix}.pattern"), &p)?;
+        let compiled = regex(prefix, &p)?;
         checks.push(
             6,
             "pattern",
@@ -181,7 +181,7 @@ fn well_known_checks(
     if allows_empty {
         checks.push(
             number,
-            &format!("{suffix}_empty"),
+            format_args!("{suffix}_empty"),
             format!("value is empty, which is not a valid {empty}"),
             StrTest::Empty,
         );

@@ -20,6 +20,7 @@
 //! compile is kept as the error, reported when validation reaches it.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Display, Write as _};
 use std::sync::Arc;
 
 use buffa::editions::FieldPresence;
@@ -41,7 +42,7 @@ use crate::descriptors::{self, Descriptors};
 use crate::protobuf::{Field, Reader, Runtime};
 use crate::validate::__buffa::oneof::field_path_element::Subscript;
 use crate::validate::__buffa::oneof::field_rules::Type as RulesType;
-use crate::validate::{FieldPathElement, FieldRules, Ignore, MessageRules, Rule};
+use crate::validate::{FieldPathElement, FieldRules, Ignore, MessageOneofRule, Rule};
 
 /// Compiles the rules of message types.
 pub(crate) struct Builder<'a, R: Runtime> {
@@ -110,8 +111,7 @@ pub(crate) fn resolve<R: Runtime>(
 }
 
 /// The value a set of rules applies to.
-#[derive(Clone)]
-struct Target {
+struct Target<'a> {
     /// The field's kind. An item of a container is singular.
     kind: DescriptorKind,
     /// The value's `FieldDescriptorProto.Type`, for type checks and path
@@ -119,23 +119,67 @@ struct Target {
     ty: Type,
     /// The field's presence.
     presence: FieldPresence,
-    /// The field's full name, as compile errors name it. A map's keys and
-    /// values are the `key` and `value` fields of its entry type.
-    name: String,
+    /// The value's full name, as compile errors name it.
+    name: TargetName<'a>,
 }
 
-impl Target {
-    fn field(message: &MessageDescriptor, field: &FieldDescriptor) -> Self {
+/// How compile errors name a target: a field by its full name, and a map's
+/// keys and values as the `key` and `value` fields of its entry type.
+#[derive(Clone, Copy)]
+struct TargetName<'a> {
+    message: &'a MessageDescriptor,
+    field: &'a FieldDescriptor,
+    /// For a map's keys or values, `key` or `value`.
+    entry: Option<&'static str>,
+}
+
+impl Display for TargetName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.", self.message.full_name())?;
+        match self.entry {
+            None => f.write_str(self.field.name()),
+            Some(part) => write!(f, "{}.{part}", MapEntryName(self.field.name())),
+        }
+    }
+}
+
+/// The name of a map field's synthesized entry message: the field name in
+/// upper camel case, then `Entry`, as the Protobuf compiler forms it.
+struct MapEntryName<'a>(&'a str);
+
+impl Display for MapEntryName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut upper = true;
+        for c in self.0.chars() {
+            if c == '_' {
+                upper = true;
+            } else if upper {
+                c.to_uppercase().try_for_each(|c| f.write_char(c))?;
+                upper = false;
+            } else {
+                f.write_char(c)?;
+            }
+        }
+        f.write_str("Entry")
+    }
+}
+
+impl<'a> Target<'a> {
+    fn field(message: &'a MessageDescriptor, field: &'a FieldDescriptor) -> Self {
         Self {
             kind: field.kind(),
             ty: descriptors::proto_type(field),
             presence: field.presence(),
-            name: format!("{}.{}", message.full_name(), field.name()),
+            name: TargetName {
+                message,
+                field,
+                entry: None,
+            },
         }
     }
 
     /// One list element or map key or value.
-    fn item(kind: SingularKind, name: String) -> Self {
+    fn item(kind: SingularKind, name: TargetName<'a>) -> Self {
         Self {
             kind: DescriptorKind::Singular(kind),
             ty: singular_type(kind),
@@ -165,9 +209,9 @@ impl Target {
         }
     }
 
-    /// Whether rules skip an unset value.
-    fn ignore_empty(&self, rules: &FieldRules) -> bool {
-        rules.ignore == Some(Ignore::IGNORE_IF_ZERO_VALUE)
+    /// Whether rules with the given `ignore` skip an unset value.
+    fn ignore_empty(&self, ignore: Option<Ignore>) -> bool {
+        ignore == Some(Ignore::IGNORE_IF_ZERO_VALUE)
             || (self.is_singular() && self.presence != FieldPresence::Implicit)
     }
 }
@@ -188,47 +232,37 @@ impl CelExpressions {
         }
     }
 
-    fn push(
-        &mut self,
-        id: &str,
-        message: &str,
-        expression: &str,
-        rule_field_number: i32,
-        rule_path: Vec<FieldPathElement>,
-    ) {
+    fn push(&mut self, rule: Rule, rule_field_number: i32, rule_path: Vec<FieldPathElement>) {
         self.rules.push(CelRule {
-            id: id.to_owned(),
-            message: message.to_owned(),
-            expression: expression.to_owned(),
+            id: rule.id.unwrap_or_default(),
+            message: rule.message.unwrap_or_default(),
+            expression: rule.expression.unwrap_or_default(),
             rule_field_number,
             rule_path,
         });
     }
-
-    fn push_rule(&mut self, rule: &Rule, rule_field_number: i32, rule_path: Vec<FieldPathElement>) {
-        self.push(
-            rule.id.as_deref().unwrap_or_default(),
-            rule.message.as_deref().unwrap_or_default(),
-            rule.expression.as_deref().unwrap_or_default(),
-            rule_field_number,
-            rule_path,
-        );
-    }
 }
 
-/// The custom rules of a field or message.
+/// The custom rules of a field or message. A bare expression is its own
+/// id, and has no message.
 fn custom_rules(
-    cel_expression: &[String],
-    cel: &[Rule],
+    cel_expression: Vec<String>,
+    cel: Vec<Rule>,
     expression_path: impl Fn(usize) -> Vec<FieldPathElement>,
     rule_path: impl Fn(usize) -> Vec<FieldPathElement>,
 ) -> CelExpressions {
     let mut expressions = CelExpressions::new();
-    for (index, expression) in cel_expression.iter().enumerate() {
-        expressions.push(expression, "", expression, 0, expression_path(index));
+    for (index, expression) in cel_expression.into_iter().enumerate() {
+        expressions.rules.push(CelRule {
+            id: expression.clone(),
+            message: String::new(),
+            expression,
+            rule_field_number: 0,
+            rule_path: expression_path(index),
+        });
     }
-    for (index, rule) in cel.iter().enumerate() {
-        expressions.push_rule(rule, 0, rule_path(index));
+    for (index, rule) in cel.into_iter().enumerate() {
+        expressions.push(rule, 0, rule_path(index));
     }
     expressions
 }
@@ -240,10 +274,14 @@ fn indexed(mut element: FieldPathElement, index: usize) -> FieldPathElement {
 
 /// `prefix` followed by `elements`.
 fn path(
-    prefix: &[FieldPathElement],
+    prefix: &[&FieldPathElement],
     elements: impl IntoIterator<Item = FieldPathElement>,
 ) -> Vec<FieldPathElement> {
-    prefix.iter().cloned().chain(elements).collect()
+    prefix
+        .iter()
+        .map(|element| (*element).clone())
+        .chain(elements)
+        .collect()
 }
 
 fn singular_type(kind: SingularKind) -> Type {
@@ -316,25 +354,6 @@ fn well_known_rules(type_name: &str) -> Option<&'static str> {
     })
 }
 
-/// The name of a map field's synthesized entry message: the field name in
-/// upper camel case, then `Entry`, as the Protobuf compiler forms it.
-fn map_entry_name(field_name: &str) -> String {
-    let mut name = String::with_capacity(field_name.len() + 5);
-    let mut upper = true;
-    for c in field_name.chars() {
-        if c == '_' {
-            upper = true;
-        } else if upper {
-            name.extend(c.to_uppercase());
-            upper = false;
-        } else {
-            name.push(c);
-        }
-    }
-    name.push_str("Entry");
-    name
-}
-
 /// The name of the `FieldRules` field holding the rules, for messages.
 fn rules_name(rules: &RulesType) -> &'static str {
     match rules {
@@ -396,38 +415,42 @@ impl<'a, R: Runtime> Builder<'a, R> {
         }
 
         // A field whose message type did not compile does not compile either.
-        let mut failed: HashMap<MessageIndex, String> = HashMap::new();
-        failed.extend(
-            known
-                .iter()
-                .filter_map(|(idx, validator)| Some((*idx, validator.as_ref().err()?.clone()))),
-        );
-        failed.extend(
-            built
-                .iter()
-                .filter_map(|(idx, validator)| Some((*idx, validator.as_ref().err()?.clone()))),
-        );
-        for (idx, validator) in &mut built {
+        let mut failures = Vec::new();
+        for (&idx, validator) in &built {
             let Ok(validator) = validator else {
                 continue;
             };
-            let message = pool.message(*idx);
-            for field in &mut validator.fields {
-                let Ok(compiled) = field.as_ref() else {
+            for (position, field) in validator.fields.iter().enumerate() {
+                let Ok(compiled) = field else {
                     continue;
                 };
                 let Some(nested) = nested_type(compiled) else {
                     continue;
                 };
-                let Some(error) = failed.get(&nested) else {
+                let error = match known.get(&nested) {
+                    Some(validator) => validator.as_ref().err(),
+                    None => built
+                        .get(&nested)
+                        .and_then(|validator| validator.as_ref().err()),
+                };
+                let Some(error) = error else {
                     continue;
                 };
-                *field = Err(format!(
-                    "failed to compile embedded type {} for {}.{}: {error}",
-                    pool.message(nested).full_name(),
-                    message.full_name(),
-                    compiled.field.name()
+                failures.push((
+                    idx,
+                    position,
+                    format!(
+                        "failed to compile embedded type {} for {}.{}: {error}",
+                        pool.message(nested).full_name(),
+                        pool.message(idx).full_name(),
+                        compiled.field.name()
+                    ),
                 ));
+            }
+        }
+        for (idx, position, error) in failures {
+            if let Some(Ok(validator)) = built.get_mut(&idx) {
+                validator.fields[position] = Err(error);
             }
         }
         out.extend(
@@ -437,41 +460,48 @@ impl<'a, R: Runtime> Builder<'a, R> {
         );
     }
 
+    /// The resolved type of a message, which [`resolve`] found before any
+    /// rules were built.
+    fn resolved(&self, idx: MessageIndex) -> R::MessageType {
+        self.types
+            .get(&idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the message type {} was not resolved before the rules referring to it were built",
+                    self.descriptors.pool.message(idx).full_name()
+                )
+            })
+            .clone()
+    }
+
     /// Describes `field` for the runtime, including the resolved type of
     /// the messages it holds.
     fn field(&self, field: &FieldDescriptor) -> Field<R> {
-        let message_type = descriptors::message_type(field).map(|idx| {
-            self.types
-                .get(&idx)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "the message type {} was not resolved before the rules referring to it were built",
-                        self.descriptors.pool.message(idx).full_name()
-                    )
-                })
-                .clone()
-        });
+        let message_type = descriptors::message_type(field).map(|idx| self.resolved(idx));
         Field::from_descriptor(field, message_type)
     }
 
     fn build_message(&mut self, idx: MessageIndex) -> Result<MessageValidator<R>, String> {
         let pool = &*self.descriptors.pool;
         let message = pool.message(idx);
-        let rules = descriptors::message_rules(message);
+        let (custom, oneof_rules) = match descriptors::message_rules(message) {
+            Some(rules) => (
+                Some(custom_rules(
+                    rules.cel_expression,
+                    rules.cel,
+                    |_| Vec::new(),
+                    |_| Vec::new(),
+                )),
+                rules.oneof,
+            ),
+            None => (None, Vec::new()),
+        };
         let MessageLevel {
             oneofs: message_oneofs,
             members,
-        } = match &rules {
-            Some(rules) => self.message_oneofs(message, rules)?,
-            None => MessageLevel::default(),
-        };
-        let cel = match &rules {
-            Some(rules) => self.compile(custom_rules(
-                &rules.cel_expression,
-                &rules.cel,
-                |_| Vec::new(),
-                |_| Vec::new(),
-            ))?,
+        } = self.message_oneofs(message, &oneof_rules)?;
+        let cel = match custom {
+            Some(custom) => self.compile(custom)?,
             None => None,
         };
 
@@ -482,26 +512,19 @@ impl<'a, R: Runtime> Builder<'a, R> {
             if rules.is_none() && descriptors::message_type(field).is_none() {
                 continue;
             }
-            let mut field_rules = rules.unwrap_or_default();
+            let mut rules = rules.unwrap_or_default();
             // A member of a message oneof is only validated when set, unless
             // it says otherwise.
-            if field_rules.ignore.is_none() && members.contains(field.name()) {
-                field_rules.ignore = Some(Ignore::IGNORE_IF_ZERO_VALUE);
+            if rules.ignore.is_none() && members.contains(field.name()) {
+                rules.ignore = Some(Ignore::IGNORE_IF_ZERO_VALUE);
             }
-            if let Some(validator) = self.build_field(message, field, &field_rules).transpose() {
+            if let Some(validator) = self.build_field(message, field, rules).transpose() {
                 fields.push(validator);
             }
         }
 
-        let message_type = self.types.get(&idx).cloned().ok_or_else(|| {
-            // Can't happen in practice.
-            format!(
-                "the message type {} was not resolved before its rules were built",
-                message.full_name()
-            )
-        })?;
         Ok(MessageValidator {
-            message_type,
+            message_type: self.resolved(idx),
             cel,
             message_oneofs,
             oneofs: self.required_oneofs(message),
@@ -533,11 +556,11 @@ impl<'a, R: Runtime> Builder<'a, R> {
     fn message_oneofs<'m>(
         &self,
         message: &'m MessageDescriptor,
-        rules: &'m MessageRules,
+        rules: &'m [MessageOneofRule],
     ) -> Result<MessageLevel<'m, R>, String> {
         let mut oneofs = Vec::new();
         let mut members = HashSet::new();
-        for oneof in &rules.oneof {
+        for oneof in rules {
             if oneof.fields.is_empty() {
                 return Err(format!(
                     "at least one field must be specified in oneof rule for the message {}",
@@ -577,41 +600,46 @@ impl<'a, R: Runtime> Builder<'a, R> {
         &mut self,
         message: &MessageDescriptor,
         field: &FieldDescriptor,
-        rules: &FieldRules,
+        rules: FieldRules,
     ) -> Result<Option<FieldValidator<R>>, String> {
         if rules.ignore == Some(Ignore::IGNORE_ALWAYS) {
             return Ok(None);
         }
         let target = Target::field(message, field);
-        let value = self.build_value(&target, rules, &[])?;
-        let kind = self.build_kind(field, &target, rules)?;
+        let required = rules.required.unwrap_or(false);
+        let ignore_empty = target.ignore_empty(rules.ignore);
+        let (value, remaining) = self.build_value(&target, rules, &[])?;
+        let kind = self.build_kind(field, &target, remaining)?;
         Ok(Some(FieldValidator {
             field: self.field(field),
             element: descriptors::path_element(field),
-            required: rules.required.unwrap_or(false),
-            ignore_empty: target.ignore_empty(rules),
+            required,
+            ignore_empty,
             value,
             kind,
         }))
     }
 
-    /// The validators of the items inside a container field.
+    /// The validators of the items inside a container field. `remaining`
+    /// is what is left of the field's standard rules once its own checks
+    /// were taken from them, which for a container is the rules of its
+    /// items.
     fn build_kind(
         &mut self,
         field: &FieldDescriptor,
-        target: &Target,
-        rules: &FieldRules,
+        target: &Target<'_>,
+        remaining: Option<RulesType>,
     ) -> Result<FieldKind<R>, String> {
         let schema = &self.descriptors.schema;
         match target.kind {
             DescriptorKind::Singular(_) => Ok(FieldKind::Singular),
             DescriptorKind::List(element) => {
-                let items = match &rules.r#type {
-                    Some(RulesType::Repeated(repeated)) => repeated.items.as_option(),
+                let items = match remaining {
+                    Some(RulesType::Repeated(mut repeated)) => repeated.items.take(),
                     _ => None,
                 };
-                let prefix = [schema.repeated.clone(), schema.repeated_items.clone()];
-                let item = Target::item(element, target.name.clone());
+                let prefix = [&schema.repeated, &schema.repeated_items];
+                let item = Target::item(element, target.name);
                 Ok(FieldKind::List {
                     items: self.build_item(&item, items, &prefix).map_err(|error| {
                         format!(
@@ -622,18 +650,18 @@ impl<'a, R: Runtime> Builder<'a, R> {
                 })
             }
             DescriptorKind::Map { key, value } => {
-                let (keys, values) = match &rules.r#type {
-                    Some(RulesType::Map(map)) => (map.keys.as_option(), map.values.as_option()),
+                let (keys, values) = match remaining {
+                    Some(RulesType::Map(mut map)) => (map.keys.take(), map.values.take()),
                     _ => (None, None),
                 };
-                let keys_prefix = [schema.map.clone(), schema.map_keys.clone()];
-                let values_prefix = [schema.map.clone(), schema.map_values.clone()];
-                let entry = match target.name.rsplit_once('.') {
-                    Some((message, name)) => format!("{message}.{}", map_entry_name(name)),
-                    None => map_entry_name(&target.name),
+                let keys_prefix = [&schema.map, &schema.map_keys];
+                let values_prefix = [&schema.map, &schema.map_values];
+                let entry = |part| TargetName {
+                    entry: Some(part),
+                    ..target.name
                 };
-                let key_target = Target::item(SingularKind::Scalar(key), format!("{entry}.key"));
-                let value_target = Target::item(value, format!("{entry}.value"));
+                let key_target = Target::item(SingularKind::Scalar(key), entry("key"));
+                let value_target = Target::item(value, entry("value"));
                 Ok(FieldKind::Map {
                     element: entry_element(field),
                     keys: self
@@ -660,9 +688,9 @@ impl<'a, R: Runtime> Builder<'a, R> {
     /// The validator of a container's items.
     fn build_item(
         &mut self,
-        target: &Target,
-        rules: Option<&FieldRules>,
-        prefix: &[FieldPathElement],
+        target: &Target<'_>,
+        rules: Option<FieldRules>,
+        prefix: &[&FieldPathElement],
     ) -> Result<Option<Box<ItemValidator<R>>>, String> {
         let Some(rules) = rules else {
             return Ok(target.nested().map(|nested| {
@@ -678,23 +706,29 @@ impl<'a, R: Runtime> Builder<'a, R> {
         if rules.ignore == Some(Ignore::IGNORE_ALWAYS) {
             return Ok(None);
         }
+        let ignore_empty = target.ignore_empty(rules.ignore);
+        // An item is not a container, so nothing of its standard rules
+        // remains once its checks are taken.
+        let (value, _) = self.build_value(target, rules, prefix)?;
         Ok(Some(Box::new(ItemValidator {
-            ignore_empty: target.ignore_empty(rules),
-            value: self.build_value(target, rules, prefix)?,
+            ignore_empty,
+            value,
         })))
     }
 
     /// The rules of one value. `prefix` is prepended to their rule paths.
+    /// Also returns what is left of the standard rules message once the
+    /// native checks took their fields from it; see [`Self::build_kind`].
     fn build_value(
         &mut self,
-        target: &Target,
-        rules: &FieldRules,
-        prefix: &[FieldPathElement],
-    ) -> Result<ValueValidator<R>, String> {
+        target: &Target<'_>,
+        rules: FieldRules,
+        prefix: &[&FieldPathElement],
+    ) -> Result<(ValueValidator<R>, Option<RulesType>), String> {
         let schema = &self.descriptors.schema;
         let custom = custom_rules(
-            &rules.cel_expression,
-            &rules.cel,
+            rules.cel_expression,
+            rules.cel,
             |index| path(prefix, [indexed(schema.cel_expression.clone(), index)]),
             |index| path(prefix, [indexed(schema.cel.clone(), index)]),
         );
@@ -704,28 +738,32 @@ impl<'a, R: Runtime> Builder<'a, R> {
         };
 
         let mut predefined = CelExpressions::new();
-        if let Some(standard) = &rules.r#type {
-            self.standard_rules(target, standard, prefix, &mut value, &mut predefined)?;
-        }
+        let remaining = match rules.r#type {
+            Some(standard) => {
+                Some(self.standard_rules(target, standard, prefix, &mut value, &mut predefined)?)
+            }
+            None => None,
+        };
         value.predefined = self.compile(predefined)?;
 
         // A message value's own type is validated after its rules. A
         // container field's messages are its items', validated there.
         value.nested = target.nested();
-        Ok(value)
+        Ok((value, remaining))
     }
 
     /// The standard rules set in a `FieldRules`, after checking that they
-    /// are the rules for the value's type.
+    /// are the rules for the value's type. Returns what is left of them
+    /// once the native checks took their fields.
     fn standard_rules(
         &mut self,
-        target: &Target,
-        standard: &RulesType,
-        prefix: &[FieldPathElement],
+        target: &Target<'_>,
+        standard: RulesType,
+        prefix: &[&FieldPathElement],
         value: &mut ValueValidator<R>,
         predefined: &mut CelExpressions,
-    ) -> Result<(), String> {
-        let got = rules_name(standard);
+    ) -> Result<RulesType, String> {
+        let got = rules_name(&standard);
         match self.expected_rules(target) {
             Some(expected) if expected == got => {}
             Some(expected) => {
@@ -743,32 +781,33 @@ impl<'a, R: Runtime> Builder<'a, R> {
                 ));
             }
         }
-        if is_scalar_rules(standard) {
+        let enum_ = if is_scalar_rules(&standard) {
             value.wrapper = self
                 .message(target)
                 .and_then(|wrapper| wrapper.field(1))
                 .map(|field| self.field(field));
-            let enum_ = match target.kind {
+            match target.kind {
                 DescriptorKind::Singular(SingularKind::Enum(idx)) => Some(idx),
                 _ => None,
-            };
-            value.checks = self.standard_checks(got, standard, prefix, enum_, predefined)?;
-            return Ok(());
-        }
-        if let (RulesType::Repeated(rules), DescriptorKind::List(SingularKind::Message(_))) =
-            (standard, target.kind)
-            && rules.unique == Some(true)
-        {
-            // `unique()` compares scalars only, and would otherwise fail
-            // every validation of the message.
-            return Err("repeated.unique is not supported for message items".to_owned());
-        }
-        value.checks = self.standard_checks(got, standard, prefix, None, predefined)?;
-        Ok(())
+            }
+        } else {
+            if let (RulesType::Repeated(rules), DescriptorKind::List(SingularKind::Message(_))) =
+                (&standard, target.kind)
+                && rules.unique == Some(true)
+            {
+                // `unique()` compares scalars only, and would otherwise fail
+                // every validation of the message.
+                return Err("repeated.unique is not supported for message items".to_owned());
+            }
+            None
+        };
+        let (checks, remaining) = self.standard_checks(got, standard, prefix, enum_, predefined)?;
+        value.checks = checks;
+        Ok(remaining)
     }
 
     /// The message type of a target's values, if they are messages.
-    fn message(&self, target: &Target) -> Option<&MessageDescriptor> {
+    fn message(&self, target: &Target<'_>) -> Option<&MessageDescriptor> {
         match target.value() {
             SingularKind::Message(idx) => Some(self.descriptors.pool.message(idx)),
             _ => None,
@@ -780,7 +819,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
     /// `items`, `keys` and `values`; the scalar type's for a scalar, an
     /// enum or a wrapper; the well-known type's for the others that have
     /// one. `None` for a message type that takes no standard rules.
-    fn expected_rules(&self, target: &Target) -> Option<&'static str> {
+    fn expected_rules(&self, target: &Target<'_>) -> Option<&'static str> {
         match target.kind {
             DescriptorKind::List(_) => Some("repeated"),
             DescriptorKind::Map { .. } => Some("map"),
@@ -793,22 +832,22 @@ impl<'a, R: Runtime> Builder<'a, R> {
 
     /// The checks of every rule field set in the rules message.
     ///
-    /// A rule field with a native check is removed from a copy of the
-    /// message as its check is built. Any rule field still set afterwards,
-    /// which is an extension or a field without a native check, is
-    /// evaluated with its predefined CEL expression instead. That runs
-    /// after the native checks, with `rules` bound to the rules message
-    /// and `rule` to the field.
+    /// A rule field with a native check is removed from the message as its
+    /// check is built. Any rule field still set afterwards, which is an
+    /// extension or a field without a native check, is evaluated with its
+    /// predefined CEL expression instead. That runs after the native
+    /// checks, with `rules` bound to the rules message and `rule` to the
+    /// field. What remains of the message is returned with the checks.
     fn standard_checks(
         &self,
         type_field: &'static str,
-        standard: &RulesType,
-        prefix: &[FieldPathElement],
+        standard: RulesType,
+        prefix: &[&FieldPathElement],
         enum_: Option<EnumIndex>,
         predefined: &mut CelExpressions,
-    ) -> Result<Checks, String> {
+    ) -> Result<(Checks, RulesType), String> {
         let pool = &self.descriptors.pool;
-        let rules = self.dynamic_rules(type_field, standard);
+        let (rules, mut remaining) = self.dynamic_rules(type_field, standard);
         let idx = rules.message_index();
         let message = rules.message_descriptor();
         let full_name = message.full_name();
@@ -824,7 +863,6 @@ impl<'a, R: Runtime> Builder<'a, R> {
             rule_path(descriptors::path_element(field))
         };
 
-        let mut remaining = standard.clone();
         let checks = standard::build::checks(
             type_field,
             &mut remaining,
@@ -834,35 +872,36 @@ impl<'a, R: Runtime> Builder<'a, R> {
             },
         )?;
 
-        self.dynamic_rules(type_field, &remaining)
-            .for_each_set(&mut |field, _value| {
-                // `example` documents the field; its rule is `true`.
-                if field.name() == "example" {
-                    return;
+        let (unchecked, remaining) = self.dynamic_rules(type_field, remaining);
+        unchecked.for_each_set(&mut |field, _value| {
+            // `example` documents the field; its rule is `true`.
+            if field.name() == "example" {
+                return;
+            }
+            let element = match pool.extension_for(idx, field.number()) {
+                Some(extension) if message.field(field.number()).is_none() => {
+                    descriptors::extension_path_element(extension)
                 }
-                let element = match pool.extension_for(idx, field.number()) {
-                    Some(extension) if message.field(field.number()).is_none() => {
-                        descriptors::extension_path_element(extension)
-                    }
-                    _ => descriptors::path_element(field),
-                };
-                let Some(option) = descriptors::predefined_rules(field) else {
-                    return;
-                };
-                let number = descriptors::field_number(field.number());
-                for rule in &option.cel {
-                    predefined.push_rule(rule, number, rule_path(element.clone()));
-                }
-            });
+                _ => descriptors::path_element(field),
+            };
+            let Some(option) = descriptors::predefined_rules(field) else {
+                return;
+            };
+            let number = descriptors::field_number(field.number());
+            for rule in option.cel {
+                predefined.push(rule, number, rule_path(element.clone()));
+            }
+        });
         predefined.bound = Some((full_name.to_owned(), rules.encode_to_vec()));
-        Ok(checks)
+        Ok((checks, remaining))
     }
 
-    /// The rules message set in `standard`, as a dynamic message.
-    fn dynamic_rules(&self, type_field: &str, standard: &RulesType) -> DynamicMessage {
+    /// The rules message set in `standard`, as a dynamic message, with
+    /// `standard` handed back.
+    fn dynamic_rules(&self, type_field: &str, standard: RulesType) -> (DynamicMessage, RulesType) {
         let pool = &self.descriptors.pool;
         let field_rules = FieldRules {
-            r#type: Some(standard.clone()),
+            r#type: Some(standard),
             ..Default::default()
         };
         let dynamic = DynamicMessage::from_message(
@@ -874,10 +913,14 @@ impl<'a, R: Runtime> Builder<'a, R> {
             .message_descriptor()
             .field_by_name(type_field)
             .unwrap_or_else(|| panic!("FieldRules.{type_field} exists"));
-        match dynamic.get(field) {
+        let rules = match dynamic.get(field) {
             ValueRef::Message(rules) => rules.to_dynamic(),
             _ => unreachable!("FieldRules.{type_field} holds a message"),
-        }
+        };
+        let Some(standard) = field_rules.r#type else {
+            unreachable!("the rules were just put in FieldRules.{type_field}")
+        };
+        (rules, standard)
     }
 
     fn compile(&mut self, expressions: CelExpressions) -> Result<Option<CelPrograms>, String> {
@@ -931,15 +974,6 @@ impl<'a, R: Runtime> Builder<'a, R> {
 struct MessageLevel<'m, R: Runtime> {
     oneofs: Vec<MessageOneof<R>>,
     members: HashSet<&'m str>,
-}
-
-impl<R: Runtime> Default for MessageLevel<'_, R> {
-    fn default() -> Self {
-        Self {
-            oneofs: Vec::new(),
-            members: HashSet::new(),
-        }
-    }
 }
 
 #[cfg(all(test, feature = "cel"))]

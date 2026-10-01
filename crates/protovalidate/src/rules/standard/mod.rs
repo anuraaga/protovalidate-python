@@ -30,6 +30,7 @@ mod format;
 mod regex;
 pub(crate) mod wellknown;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::SystemTime;
 
@@ -411,14 +412,15 @@ pub(crate) enum NowTest {
 
 impl Test<Timestamp> for TimestampTest {
     fn fails(&self, value: &Timestamp) -> Result<bool, String> {
-        let now = now();
-        Ok(match self {
+        let test = match self {
             Self::Cmp(cmp) => return cmp.fails(value),
-            Self::Now(NowTest::LtNow) => *value > now,
-            Self::Now(NowTest::GtNow) => *value < now,
-            Self::Now(NowTest::Within(within)) => {
-                value.0 < now.0 - within.0 || value.0 > now.0 + within.0
-            }
+            Self::Now(test) => test,
+        };
+        let now = now();
+        Ok(match test {
+            NowTest::LtNow => *value > now,
+            NowTest::GtNow => *value < now,
+            NowTest::Within(within) => value.0 < now.0 - within.0 || value.0 > now.0 + within.0,
         })
     }
 }
@@ -447,8 +449,8 @@ fn covered(paths: &[String], path: &str) -> bool {
     })
 }
 
-impl Test<[String]> for FieldMaskTest {
-    fn fails(&self, paths: &[String]) -> Result<bool, String> {
+impl Test<[Cow<'_, str>]> for FieldMaskTest {
+    fn fails(&self, paths: &[Cow<'_, str>]) -> Result<bool, String> {
         Ok(match self {
             Self::Const(c) => paths != c.as_slice(),
             Self::In(list) => !paths.iter().all(|path| covered(list, path)),

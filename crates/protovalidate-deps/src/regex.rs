@@ -42,7 +42,6 @@ unsafe extern "C" {
 /// A compiled regular expression, in RE2 syntax.
 pub struct Regex {
     raw: *mut Re2Regex,
-    pattern: String,
 }
 
 // SAFETY: a compiled RE2 is immutable, and RE2 documents matching as safe
@@ -72,16 +71,7 @@ impl Regex {
         };
         // SAFETY: `code` and `error` are the call's, untouched since.
         unsafe { finish(code, error) }?;
-        Ok(Self {
-            raw: out,
-            pattern: pattern.to_owned(),
-        })
-    }
-
-    /// The pattern the expression was compiled from.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.pattern
+        Ok(Self { raw: out })
     }
 
     /// Whether `text` contains a match, anchored only where the pattern
@@ -96,7 +86,7 @@ impl Regex {
 
 impl fmt::Debug for Regex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Regex").field(&self.pattern).finish()
+        f.debug_struct("Regex").finish_non_exhaustive()
     }
 }
 
@@ -118,7 +108,6 @@ mod tests {
         assert!(regex.is_match("abbc"));
         assert!(!regex.is_match("ac"));
         assert!(Regex::new("^é$").expect("valid").is_match("é"));
-        assert_eq!(regex.as_str(), "b+");
     }
 
     #[test]

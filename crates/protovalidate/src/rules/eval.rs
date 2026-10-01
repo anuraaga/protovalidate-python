@@ -20,6 +20,7 @@
 //! that ends the walk early, a read failing or the first violation when
 //! failing fast, propagates as an [`Abort`] through `?`.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
@@ -112,7 +113,7 @@ impl Violations<'_> {
     fn push<E>(
         &mut self,
         id: &str,
-        message: &str,
+        message: String,
         rule_path: &[FieldPathElement],
     ) -> Result<(), Abort<E>> {
         let field_path = |elements: Vec<FieldPathElement>| {
@@ -124,16 +125,17 @@ impl Violations<'_> {
         let field = self
             .path
             .iter()
-            .map(|at| FieldPathElement {
-                subscript: at.subscript.clone(),
-                ..at.element.clone()
+            .map(|at| {
+                let mut element = at.element.clone();
+                element.subscript.clone_from(&at.subscript);
+                element
             })
             .collect();
         self.list.push(Violation {
             field: field_path(field).into(),
             rule: field_path(rule_path.to_vec()).into(),
             rule_id: Some(id.to_owned()),
-            message: Some(message.to_owned()),
+            message: Some(message),
             for_key: self.for_key.then_some(true),
             ..Default::default()
         });
@@ -292,7 +294,7 @@ impl<'a, 'm, R: Runtime> CelFrame<'a, 'm, R> {
             .env
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .frame(self.type_name, &bytes)?;
+            .frame(self.type_name, bytes.as_ref())?;
         Ok(self.parsed.get_or_init(|| frame))
     }
 }
@@ -366,7 +368,7 @@ impl CelPrograms {
                     .into());
                 }
             };
-            out.push(&meta.id, &message, &meta.rule_path)?;
+            out.push(&meta.id, message, &meta.rule_path)?;
         }
         Ok(())
     }
@@ -386,11 +388,11 @@ impl<R: Runtime> MessageOneof<R> {
         }
         if set > 1 {
             let message = format!("only one of {} can be set", self.names);
-            walk.out.push("message.oneof", &message, &[])?;
+            walk.out.push("message.oneof", message, &[])?;
         }
         if self.required && set == 0 {
             let message = format!("one of {} must be set", self.names);
-            walk.out.push("message.oneof", &message, &[])?;
+            walk.out.push("message.oneof", message, &[])?;
         }
         Ok(())
     }
@@ -408,8 +410,11 @@ impl<R: Runtime> OneofRequired<R> {
             }
         }
         walk.at(&self.element, |walk| {
-            walk.out
-                .push("required", "exactly one field is required in oneof", &[])
+            walk.out.push(
+                "required",
+                "exactly one field is required in oneof".to_owned(),
+                &[],
+            )
         })
     }
 }
@@ -432,7 +437,8 @@ impl<R: Runtime> FieldValidator<R> {
             if self.required {
                 let required = std::slice::from_ref(&walk.schema.required);
                 return walk.at(&self.element, |walk| {
-                    walk.out.push("required", "value is required", required)
+                    walk.out
+                        .push("required", "value is required".to_owned(), required)
                 });
             }
             if self.ignore_empty {
@@ -514,18 +520,15 @@ fn validate_map<R: Runtime>(
     map: &R::Map<'_>,
     entries: &Entries<'_, R>,
 ) -> Result<(), Abort<R::Error>> {
-    let mut result = Ok(());
-    let visited = map.for_each(
-        |key, value| match validate_entry(walk, entries, &key, &value) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(abort) => {
-                result = Err(abort);
-                ControlFlow::Break(())
-            }
-        },
-    );
-    visited.read()?;
-    result
+    let visited = map
+        .for_each(
+            |key, value| match validate_entry(walk, entries, &key, &value) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(abort) => ControlFlow::Break(abort),
+            },
+        )
+        .read()?;
+    visited.break_value().map_or(Ok(()), Err)
 }
 
 fn validate_entry<R: Runtime>(
@@ -546,20 +549,20 @@ fn validate_entry_values<R: Runtime>(
     key: &Val<'_, R>,
     value: &Val<'_, R>,
 ) -> Result<(), Abort<R::Error>> {
-    if let Some(keys) = entries.keys {
-        if !(keys.ignore_empty && is_empty_item::<R>(key)?) {
-            walk.for_key(|walk| {
-                keys.value
-                    .validate(walk, Some(key), CelBind::Item(entries.key))
-            })?;
-        }
+    if let Some(keys) = entries.keys
+        && !(keys.ignore_empty && is_empty_item::<R>(key)?)
+    {
+        walk.for_key(|walk| {
+            keys.value
+                .validate(walk, Some(key), CelBind::Item(entries.key))
+        })?;
     }
-    if let Some(values) = entries.values {
-        if !(values.ignore_empty && is_empty_item::<R>(value)?) {
-            values
-                .value
-                .validate(walk, Some(value), CelBind::Item(entries.value))?;
-        }
+    if let Some(values) = entries.values
+        && !(values.ignore_empty && is_empty_item::<R>(value)?)
+    {
+        values
+            .value
+            .validate(walk, Some(value), CelBind::Item(entries.value))?;
     }
     Ok(())
 }
@@ -669,7 +672,7 @@ impl Checks {
             Self::Bytes(checks) => run(checks, bytes_of(value)?, out),
             Self::Duration(checks) => run(checks, &Duration(nanos_of(value)?), out),
             Self::Timestamp(checks) => run(checks, &Timestamp(nanos_of(value)?), out),
-            Self::FieldMask(checks) => run(checks, paths_of(value)?.as_slice(), out),
+            Self::FieldMask(checks) => with_paths(value, |paths| run(checks, paths, out))?,
             Self::Any(checks) => {
                 let field = wkt::any_type_url();
                 let type_url = match value {
@@ -748,7 +751,7 @@ fn run_with<T, E>(
 ) -> Result<(), Abort<E>> {
     for check in checks {
         if fails(&check.test)? {
-            out.push(&check.id, &check.message, &check.rule_path)?;
+            out.push(&check.id, check.message.clone(), &check.rule_path)?;
         }
     }
     Ok(())
@@ -802,7 +805,7 @@ fn is_empty_item<R: Runtime>(value: &Val<'_, R>) -> Result<bool, Abort<R::Error>
         Val::Enum(e) => *e == 0,
         Val::String(s) => s.is_empty(),
         Val::Bytes(b) => b.is_empty(),
-        Val::Message(message) => message.encode().read()?.is_empty(),
+        Val::Message(message) => message.encode().read()?.as_ref().is_empty(),
         Val::List(_) | Val::Map(_) => false,
     })
 }
@@ -956,24 +959,28 @@ fn nanos_of<R: Runtime>(value: Option<&Val<'_, R>>) -> Result<i128, Abort<R::Err
     Ok(total_nanos(seconds, nanos))
 }
 
-/// The `paths` of a `FieldMask` message.
-fn paths_of<R: Runtime>(value: Option<&Val<'_, R>>) -> Result<Vec<String>, Abort<R::Error>> {
+/// Runs `f` on the `paths` of a `FieldMask` message, none for a missing
+/// message.
+fn with_paths<R: Runtime, T>(
+    value: Option<&Val<'_, R>>,
+    f: impl FnOnce(&[Cow<'_, str>]) -> T,
+) -> Result<T, Abort<R::Error>> {
     let message = match value {
-        None => return Ok(Vec::new()),
+        None => return Ok(f(&[])),
         Some(Val::Message(message)) => message,
         Some(other) => return Err(mismatch("a message", other)),
     };
     let field = wkt::field_mask_paths();
     let Some(Val::List(list)) = message.get(&field).read()? else {
-        return Ok(Vec::new());
+        return Ok(f(&[]));
     };
     let mut paths = Vec::new();
     for index in 0..list.len().read()? {
         if let Some(Val::String(path)) = list.get(index).read()? {
-            paths.push(path.into_owned());
+            paths.push(path);
         }
     }
-    Ok(paths)
+    Ok(f(&paths))
 }
 
 /// Whether a list has two elements that `unique()` considers equal.

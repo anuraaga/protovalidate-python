@@ -69,25 +69,28 @@ pub(crate) struct Hex<'a>(pub &'a [u8]);
 pub(crate) struct List<I>(pub I);
 
 /// A fraction of a second, in the digits it needs; nothing for zero.
-fn fraction(f: &mut fmt::Formatter<'_>, nanos: i128) -> fmt::Result {
+fn fraction(f: &mut fmt::Formatter<'_>, mut nanos: u128) -> fmt::Result {
     if nanos == 0 {
         return Ok(());
     }
-    let digits = format!("{nanos:09}");
-    write!(f, ".{}", digits.trim_end_matches('0'))
+    let mut width = 9;
+    while nanos.is_multiple_of(10) {
+        nanos /= 10;
+        width -= 1;
+    }
+    write!(f, ".{nanos:0width$}")
 }
 
 /// `1.5s`, `-0.000001s`, `0s`.
 impl Display for Duration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let magnitude = self.0.unsigned_abs();
-        let seconds = magnitude / NANOS_PER_SECOND.unsigned_abs();
-        let nanos = magnitude % NANOS_PER_SECOND.unsigned_abs();
         if self.0 < 0 {
             f.write_str("-")?;
         }
-        write!(f, "{seconds}")?;
-        fraction(f, i128::try_from(nanos).expect("under a second"))?;
+        let magnitude = self.0.unsigned_abs();
+        let nanos_per_second = NANOS_PER_SECOND.unsigned_abs();
+        write!(f, "{}", magnitude / nanos_per_second)?;
+        fraction(f, magnitude % nanos_per_second)?;
         f.write_str("s")
     }
 }

@@ -50,10 +50,10 @@ pub(crate) struct Native<T> {
 }
 
 impl<T> Native<T> {
-    fn new(prefix: &str, suffix: &str, message: impl Display, test: T) -> Self {
+    fn new(prefix: &str, suffix: impl Display, message: String, test: T) -> Self {
         Self {
             id: format!("{prefix}.{suffix}"),
-            message: message.to_string(),
+            message,
             test,
         }
     }
@@ -84,7 +84,7 @@ impl<'a, T> Unplaced<'a, T> {
     }
 
     /// Adds the check of rule field `number`, with id `prefix.suffix`.
-    fn push(&mut self, number: u32, suffix: &str, message: impl Display, test: T) {
+    fn push(&mut self, number: u32, suffix: impl Display, message: String, test: T) {
         self.checks
             .push((number, Native::new(self.prefix, suffix, message, test)));
     }
@@ -153,7 +153,9 @@ struct Side<T> {
 
 /// Takes the [`Bounds`] out of a rules message whose `less_than` and
 /// `greater_than` oneofs live in `$module`; `$const`, `$in` and `$not_in`
-/// take the fields outside the oneofs, whose shape varies by message.
+/// take the fields outside the oneofs, whose shape varies by message, the
+/// lists as iterators of their values. A message without lists leaves
+/// them out.
 macro_rules! bounds {
     ($rules:expr, $module:ident, $convert:expr, $const:expr, $in:expr, $not_in:expr) => {{
         let convert = $convert;
@@ -173,10 +175,20 @@ macro_rules! bounds {
             lte,
             gt,
             gte,
-            r#in: $in.iter().map(convert).collect(),
-            not_in: $not_in.iter().map(convert).collect(),
+            r#in: $in.into_iter().map(|v| convert(&v)).collect(),
+            not_in: $not_in.into_iter().map(|v| convert(&v)).collect(),
         }
     }};
+    ($rules:expr, $module:ident, $convert:expr, $const:expr) => {
+        bounds!(
+            $rules,
+            $module,
+            $convert,
+            $const,
+            ::std::iter::empty(),
+            ::std::iter::empty()
+        )
+    };
 }
 
 /// The [`bounds!`] of a numeric rules message, whose `const`, `in` and
@@ -198,7 +210,7 @@ impl<T: Copy + PartialOrd + MaybeNan + Display> Bounds<T> {
     /// The comparison checks. `first` is the field number of `const`; `lt`,
     /// `lte`, `gt`, `gte`, `in` and `not_in` follow it in that order in
     /// every rules message.
-    fn checks<'a>(&self, prefix: &'a str, first: u32) -> Unplaced<'a, Cmp<T>> {
+    fn checks(self, prefix: &str, first: u32) -> Unplaced<'_, Cmp<T>> {
         let mut checks = Unplaced::new(prefix);
         if let Some(c) = self.r#const {
             checks.push(first, "const", format!("must equal {c}"), Cmp::Const(c));
@@ -209,7 +221,7 @@ impl<T: Copy + PartialOrd + MaybeNan + Display> Bounds<T> {
                 first + 5,
                 "in",
                 format!("must be in list {}", List(&self.r#in)),
-                Cmp::In(self.r#in.clone()),
+                Cmp::In(self.r#in),
             );
         }
         if !self.not_in.is_empty() {
@@ -217,7 +229,7 @@ impl<T: Copy + PartialOrd + MaybeNan + Display> Bounds<T> {
                 first + 6,
                 "not_in",
                 format!("must not be in list {}", List(&self.not_in)),
-                Cmp::NotIn(self.not_in.clone()),
+                Cmp::NotIn(self.not_in),
             );
         }
         checks
@@ -269,10 +281,10 @@ impl<T: Copy + PartialOrd + MaybeNan + Display> Bounds<T> {
             (Some(lower), Some(upper)) => (lower, upper),
         };
         let (lo, hi) = (lower.value, upper.value);
-        let (suffix, message, cmp) = if hi >= lo {
+        let (tail, conjunction, cmp) = if hi >= lo {
             (
-                format!("{}_{}", lower.name, upper.name),
-                format!("must be {} {lo} and {} {hi}", lower.words, upper.words),
+                "",
+                "and",
                 match (lower.inclusive, upper.inclusive) {
                     (false, false) => Cmp::GtLt { gt: lo, lt: hi },
                     (false, true) => Cmp::GtLte { gt: lo, lte: hi },
@@ -282,8 +294,8 @@ impl<T: Copy + PartialOrd + MaybeNan + Display> Bounds<T> {
             )
         } else if hi < lo {
             (
-                format!("{}_{}_exclusive", lower.name, upper.name),
-                format!("must be {} {lo} or {} {hi}", lower.words, upper.words),
+                "_exclusive",
+                "or",
                 match (lower.inclusive, upper.inclusive) {
                     (false, false) => Cmp::GtLtExclusive { gt: lo, lt: hi },
                     (false, true) => Cmp::GtLteExclusive { gt: lo, lte: hi },
@@ -294,7 +306,19 @@ impl<T: Copy + PartialOrd + MaybeNan + Display> Bounds<T> {
         } else {
             return None;
         };
-        Some((lower.number, Native::new(prefix, &suffix, message, cmp)))
+        let message = format!(
+            "must be {} {lo} {conjunction} {} {hi}",
+            lower.words, upper.words
+        );
+        Some((
+            lower.number,
+            Native::new(
+                prefix,
+                format_args!("{}_{}{tail}", lower.name, upper.name),
+                message,
+                cmp,
+            ),
+        ))
     }
 }
 
@@ -321,9 +345,11 @@ fn check_timestamp(t: &TimestampPb) -> Result<(), String> {
     }
 }
 
-/// Compiles the pattern of the rule `id`, such as `string.pattern`.
-pub(super) fn regex(id: &str, pattern: &str) -> Result<Regex, String> {
-    Regex::new(pattern).map_err(|error| format!("failed to compile program {id}: {error}"))
+/// Compiles the pattern of the `pattern` rule of `prefix`, such as
+/// `string`.
+pub(super) fn regex(prefix: &str, pattern: &str) -> Result<Regex, String> {
+    Regex::new(pattern)
+        .map_err(|error| format!("failed to compile program {prefix}.pattern: {error}"))
 }
 
 /// The placed checks of an integer rules message holding `$narrow` values,
@@ -350,11 +376,11 @@ pub(crate) fn checks(
     Ok(match rules {
         RulesType::Float(r) => {
             let bounds = numeric_bounds!(r, float_rules, |v: &f32| Double(f64::from(*v)));
-            Checks::Double(at.place(floating(prefix, &bounds, r.finite.take())))
+            Checks::Double(at.place(floating(prefix, bounds, r.finite.take())))
         }
         RulesType::Double(r) => {
             let bounds = numeric_bounds!(r, double_rules, |v: &f64| Double(*v));
-            Checks::Double(at.place(floating(prefix, &bounds, r.finite.take())))
+            Checks::Double(at.place(floating(prefix, bounds, r.finite.take())))
         }
         RulesType::Int32(r) => integer_checks!(Int, at, prefix, r, int32rules, i32 => i64),
         RulesType::Int64(r) => integer_checks!(Int, at, prefix, r, int64rules, i64 => i64),
@@ -393,14 +419,14 @@ pub(crate) fn checks(
 
 /// The checks of a float or double rules message, which add `finite` to
 /// the comparisons.
-fn floating<'a>(
-    prefix: &'a str,
-    bounds: &Bounds<Double>,
+fn floating(
+    prefix: &str,
+    bounds: Bounds<Double>,
     finite: Option<bool>,
-) -> Unplaced<'a, DoubleTest> {
+) -> Unplaced<'_, DoubleTest> {
     let mut checks = bounds.checks(prefix, 1).map(DoubleTest::Cmp);
     if finite == Some(true) {
-        checks.push(8, "finite", "must be finite", DoubleTest::Finite);
+        checks.push(8, "finite", "must be finite".to_owned(), DoubleTest::Finite);
     }
     checks
 }
@@ -442,14 +468,13 @@ fn timestamp_checks<'a>(
         }
         _ => false,
     };
-    let none: [TimestampPb; 0] = [];
-    let bounds = bounds!(r, timestamp_rules, timestamp, r.r#const.take(), none, none);
+    let bounds = bounds!(r, timestamp_rules, timestamp, r.r#const.take());
     checks.extend(bounds.checks(prefix, 2).map(TimestampTest::Cmp));
     if lt_now {
         checks.push(
             7,
             "lt_now",
-            "must be less than now",
+            "must be less than now".to_owned(),
             TimestampTest::Now(NowTest::LtNow),
         );
     }
@@ -457,7 +482,7 @@ fn timestamp_checks<'a>(
         checks.push(
             8,
             "gt_now",
-            "must be greater than now",
+            "must be greater than now".to_owned(),
             TimestampTest::Now(NowTest::GtNow),
         );
     }

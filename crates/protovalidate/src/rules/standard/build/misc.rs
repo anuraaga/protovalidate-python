@@ -74,7 +74,7 @@ pub(super) fn enum_checks<'a>(
         checks.push(
             2,
             "defined_only",
-            "value must be one of the defined enum values",
+            "value must be one of the defined enum values".to_owned(),
             EnumTest::DefinedOnly(enum_),
         );
     }
@@ -114,7 +114,7 @@ pub(super) fn bytes_checks<'a>(
         );
     }
     if let Some(p) = r.pattern.take() {
-        let compiled = regex(&format!("{prefix}.pattern"), &p)?;
+        let compiled = regex(prefix, &p)?;
         checks.push(
             4,
             "pattern",
@@ -194,7 +194,7 @@ fn bytes_format_checks(
     checks.push(number, suffix, format!("must be a valid {what}"), test);
     checks.push(
         number,
-        &format!("{suffix}_empty"),
+        format_args!("{suffix}_empty"),
         format!("value is empty, which is not a valid {what}"),
         BytesTest::Empty,
     );
@@ -225,7 +225,7 @@ pub(super) fn repeated_checks<'a>(
         checks.push(
             3,
             "unique",
-            "repeated value must contain unique items",
+            "repeated value must contain unique items".to_owned(),
             ListTest::Unique,
         );
     }
@@ -297,7 +297,7 @@ pub(super) fn any_checks<'a>(prefix: &'a str, r: &mut AnyRules) -> Unplaced<'a, 
         checks.push(
             2,
             "in",
-            "type URL must be in the allow list",
+            "type URL must be in the allow list".to_owned(),
             AnyTest::In(mem::take(&mut r.r#in)),
         );
     }
@@ -305,7 +305,7 @@ pub(super) fn any_checks<'a>(prefix: &'a str, r: &mut AnyRules) -> Unplaced<'a, 
         checks.push(
             3,
             "not_in",
-            "type URL must not be in the block list",
+            "type URL must not be in the block list".to_owned(),
             AnyTest::NotIn(mem::take(&mut r.not_in)),
         );
     }

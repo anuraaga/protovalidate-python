@@ -18,7 +18,7 @@
 //! Upstream sources are git submodules under `third_party/` with code generated
 //! by Bazel (protoc output, the ANTLR-generated CEL parser) checked
 //! in under `gen/`. The files each library compiles are listed in
-//! `filelists/`.All of it is produced by `scripts/extract_native_sources.py`
+//! `filelists/`. All of it is produced by `scripts/extract_native_sources.py`
 //! from bazel's action graph without hand maintenance.
 
 use std::env;

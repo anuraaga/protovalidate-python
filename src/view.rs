@@ -216,7 +216,7 @@ impl Drop for MessageView<'_> {
 
 impl Message<PyRuntime> for MessageView<'_> {
     #[inline]
-    fn encode(&self) -> Result<Vec<u8>, ReadError> {
+    fn encode(&self) -> Result<impl AsRef<[u8]>, ReadError> {
         // An unset protobuf-py message field is `None`, and reads as a
         // message with nothing set, which encodes to nothing.
         if self.object.is_none() {
@@ -446,12 +446,12 @@ impl Map<PyRuntime> for MapView<'_> {
     }
 
     #[inline]
-    fn for_each<F>(&self, mut f: F) -> Result<(), ReadError>
+    fn for_each<B, F>(&self, mut f: F) -> Result<ControlFlow<B>, ReadError>
     where
-        F: FnMut(Val<'_, PyRuntime>, Val<'_, PyRuntime>) -> ControlFlow<()>,
+        F: FnMut(Val<'_, PyRuntime>, Val<'_, PyRuntime>) -> ControlFlow<B>,
     {
         let Some(object) = self.object else {
-            return Ok(());
+            return Ok(ControlFlow::Continue(()));
         };
         for entry in self.ctx.runtime.map_entries(object, self.ctx.constants)? {
             let (k, v) = entry?;
@@ -460,9 +460,9 @@ impl Map<PyRuntime> for MapView<'_> {
                 singular(self.ctx, self.element, Some(&v), self.message_type)?,
             );
             if flow.is_break() {
-                return Ok(());
+                return Ok(flow);
             }
         }
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 }

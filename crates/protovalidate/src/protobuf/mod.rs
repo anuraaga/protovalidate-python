@@ -118,7 +118,7 @@ pub trait Message<R: Runtime> {
     /// # Errors
     ///
     /// The runtime could not serialize the message.
-    fn encode(&self) -> Result<Vec<u8>, R::Error>;
+    fn encode(&self) -> Result<impl AsRef<[u8]>, R::Error>;
 }
 
 /// A repeated field.
@@ -151,15 +151,16 @@ pub trait Map<R: Runtime> {
     /// The runtime could not count them.
     fn len(&self) -> Result<usize, R::Error>;
 
-    /// Visits each entry, as key then value, until `f` breaks. A key has
-    /// one of the scalar types Protobuf allows for map keys.
+    /// Visits each entry, as key then value, until `f` breaks, returning
+    /// what it broke with. A key has one of the scalar types Protobuf
+    /// allows for map keys.
     ///
     /// # Errors
     ///
     /// The runtime could not read an entry, which stops the visit.
-    fn for_each<F>(&self, f: F) -> Result<(), R::Error>
+    fn for_each<B, F>(&self, f: F) -> Result<ControlFlow<B>, R::Error>
     where
-        F: FnMut(Val<'_, R>, Val<'_, R>) -> ControlFlow<()>;
+        F: FnMut(Val<'_, R>, Val<'_, R>) -> ControlFlow<B>;
 }
 
 /// A runtime for tests that never read a message.
@@ -207,8 +208,9 @@ pub(crate) mod testing {
             unreachable!("the test does not read a message")
         }
 
-        fn encode(&self) -> Result<Vec<u8>, Infallible> {
-            unreachable!("the test does not read a message")
+        #[expect(unreachable_code, reason = "the hidden type must be named")]
+        fn encode(&self) -> Result<impl AsRef<[u8]>, Infallible> {
+            Ok::<&[u8], _>(unreachable!("the test does not read a message"))
         }
     }
 
@@ -227,9 +229,9 @@ pub(crate) mod testing {
             unreachable!("the test does not read a map")
         }
 
-        fn for_each<F>(&self, _f: F) -> Result<(), Infallible>
+        fn for_each<B, F>(&self, _f: F) -> Result<ControlFlow<B>, Infallible>
         where
-            F: FnMut(Val<'_, Untyped>, Val<'_, Untyped>) -> ControlFlow<()>,
+            F: FnMut(Val<'_, Untyped>, Val<'_, Untyped>) -> ControlFlow<B>,
         {
             unreachable!("the test does not read a map")
         }
