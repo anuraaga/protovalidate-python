@@ -110,11 +110,11 @@ impl<R: Runtime> Validator<R> {
         self.descriptors
             .add_file_set(set)
             .map_err(DescriptorError::new)?;
-        // Not atomic: the file is in the validator's pool before the CEL
-        // pool takes it. There is no real case where they would disagree when
-        // adding descriptors, in the off chance, the error is returned here, and
-        // a rule reaching a type the CEL pool lacks fails with "unknown message type"
-        // rather than running against the wrong schema.
+        // Not atomic since the file is in the validator's pool before the CEL
+        // pool takes it. The only conceivable case the two pools would differ is when
+        // passing manually crafted descriptors not created by protoc, buf, etc.
+        // Even then, the error is returned here, and a rule reaching a type the CEL pool lacks
+        // fails with "unknown message type" rather than running against the wrong schema.
         self.env
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
