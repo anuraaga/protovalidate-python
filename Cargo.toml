@@ -40,7 +40,7 @@ foldhash = "0.1.5"
 iri-string = "0.7.14"
 jiff = { version = "0.2.37", default-features = false, features = ["std"] }
 percent-encoding = "2.3.2"
-regex-lite = "0.1.9"
+regex = "1.13.1"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

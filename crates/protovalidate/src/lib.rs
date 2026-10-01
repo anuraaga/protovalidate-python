@@ -21,8 +21,9 @@
 //! by [cel-cpp]. The `cel` feature, on by default, brings cel-cpp in,
 //! and with it RE2 as the engine for `pattern` rules, the same one CEL's
 //! `matches()` uses. A schema without custom rules can disable it,
-//! removing the need to compile any C++; patterns then go through
-//! `regex-lite` instead.
+//! removing the need to compile any C++; patterns then go through the
+//! `regex` crate instead, with perl classes restricted to ASCII-only like
+//! RE2.
 //!
 //! # Usage
 //!

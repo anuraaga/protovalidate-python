@@ -31,7 +31,7 @@ foldhash.workspace = true
 iri-string.workspace = true
 jiff.workspace = true
 percent-encoding.workspace = true
-regex-lite.workspace = true
+regex.workspace = true
 
 [features]
 default = ["cel"]
