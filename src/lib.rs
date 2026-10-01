@@ -82,8 +82,7 @@ struct Validator {
     /// The files from the constructor's `registry` argument that declare
     /// extensions. They are registered with each engine when it is created.
     preregistered: Vec<Py<PyAny>>,
-    /// Interned strings, shared by every call site.
-    constants: Constants,
+    constants: &'static Constants,
     /// Python types and extensions.
     imports: Arc<Imports>,
 }
@@ -116,7 +115,7 @@ impl Validator {
     fn new(py: Python<'_>, registry: Option<PbRegistry<'_, '_>>) -> PyResult<Self> {
         let constants = Constants::get(py);
         let preregistered = match registry {
-            Some(registry) => collect_registry(&registry.0, &constants)?,
+            Some(registry) => collect_registry(&registry.0, constants)?,
             None => Vec::new(),
         };
         Ok(Self {
@@ -198,12 +197,12 @@ impl Validator {
         message: PbMessage<'_, 'py>,
         fail_fast: bool,
     ) -> PyResult<(ProtoAdapter, ViolationList<'py>)> {
-        let adapter = ProtoAdapter::resolve(&message.0, &self.constants)?;
+        let adapter = ProtoAdapter::resolve(&message.0, self.constants)?;
         let engine = self.engine(py, adapter.runtime)?;
         let file = adapter.descriptor(py).getattr(&self.constants.file)?;
-        engine.register(py, adapter.runtime, &file, &self.constants)?;
+        engine.register(py, adapter.runtime, &file, self.constants)?;
 
-        let type_name = adapter.type_name(py, &self.constants)?;
+        let type_name = adapter.type_name(py, self.constants)?;
         let Some(serialized) = self.evaluate(
             py,
             engine,
@@ -213,20 +212,18 @@ impl Validator {
             fail_fast,
         )?
         else {
-            // `descriptor` keeps the adapter borrowed for `'py`, so hand the
-            // caller a cheap reference clone rather than the local.
-            return Ok((adapter.clone_ref(py), ViolationList(PyList::empty(py))));
+            return Ok((adapter, ViolationList(PyList::empty(py))));
         };
         let violations = violation::build_violations(
             py,
             &serialized,
             &message.0,
             &adapter,
-            &self.constants,
+            self.constants,
             &self.imports,
         )
         .map(ViolationList)?;
-        Ok((adapter.clone_ref(py), violations))
+        Ok((adapter, violations))
     }
 
     /// Returns the engine for `runtime`.
@@ -240,7 +237,7 @@ impl Validator {
                 py,
                 runtime,
                 &self.preregistered,
-                &self.constants,
+                self.constants,
                 &self.imports,
             )
         })
@@ -271,7 +268,7 @@ impl Validator {
             Some(registry) => TypeSource::Registry(registry),
             None => TypeSource::Descriptor(adapter.descriptor(py)),
         };
-        let ctx = Ctx::new(py, adapter.runtime, &self.constants, message, source);
+        let ctx = Ctx::new(py, adapter.runtime, self.constants, message, source);
         match core.validate_message(type_name, &ctx, fail_fast) {
             Ok(()) => Ok(None),
             Err(Error::Validation(error)) => Ok(Some(PyBytes::new(py, error.violations()))),

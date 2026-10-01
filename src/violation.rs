@@ -34,8 +34,8 @@ struct Values {
     rule: Py<PyAny>,
 }
 
-/// Where an engine-produced violation came from, kept for lazy resolution
-/// of a violation field value.
+/// The validation an engine-produced violation came from, shared by its
+/// violations for the lazy resolution of their values.
 struct Origin {
     message: Py<PyAny>,
     adapter: ProtoAdapter,
@@ -48,25 +48,16 @@ pub struct Violation {
     /// The `buf.validate.Violation` form of this violation.
     proto: Py<PyAny>,
     /// `None` for hand-built violations, which have nothing to resolve from.
-    origin: Option<Origin>,
+    origin: Option<Arc<Origin>>,
     values: PyOnceLock<Values>,
 }
 
 impl Violation {
     /// Wraps a violation the engine produced, deferring value resolution.
-    pub(crate) fn deferred(
-        proto: Py<PyAny>,
-        message: Py<PyAny>,
-        adapter: ProtoAdapter,
-        imports: Arc<Imports>,
-    ) -> Self {
+    fn deferred(proto: Py<PyAny>, origin: Arc<Origin>) -> Self {
         Self {
             proto,
-            origin: Some(Origin {
-                message,
-                adapter,
-                imports,
-            }),
+            origin: Some(origin),
             values: PyOnceLock::new(),
         }
     }
@@ -75,13 +66,12 @@ impl Violation {
     fn values(&self, py: Python<'_>) -> PyResult<&Values> {
         self.values.get_or_try_init(py, || match &self.origin {
             Some(origin) => {
-                let constants = Constants::get(py);
                 let (field, rule) = resolve_values(
                     py,
                     self.proto.bind(py),
                     origin.message.bind(py),
                     &origin.adapter,
-                    &constants,
+                    Constants::get(py),
                     &origin.imports,
                 )?;
                 Ok(Values { field, rule })
@@ -300,7 +290,7 @@ fn resolve_rule_value<'py>(
     } else {
         rules_of(
             py,
-            adapter.descriptor(py),
+            &adapter.descriptor(py),
             adapter,
             constants,
             imports,
@@ -384,15 +374,15 @@ pub fn build_violations<'py>(
     let violations = parsed
         .getattr(&constants.violations)?
         .cast_into::<PyList>()?;
+    let origin = Arc::new(Origin {
+        message: message.clone().unbind(),
+        adapter: adapter.clone_ref(py),
+        imports: Arc::clone(imports),
+    });
     PyList::new(
         py,
-        violations.iter().map(|violation| {
-            Violation::deferred(
-                violation.unbind(),
-                message.clone().unbind(),
-                adapter.clone_ref(py),
-                Arc::clone(imports),
-            )
-        }),
+        violations
+            .iter()
+            .map(|violation| Violation::deferred(violation.unbind(), Arc::clone(&origin))),
     )
 }

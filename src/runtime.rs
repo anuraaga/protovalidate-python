@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 
 use protovalidate::protobuf::{Kind, Singular};
+use pyo3::Borrowed;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::iter::BoundDictIterator;
@@ -60,8 +61,8 @@ impl ProtoAdapter {
     }
 
     /// The descriptor this adapter was resolved from.
-    pub(crate) fn descriptor<'py>(&'py self, py: Python<'py>) -> &'py Bound<'py, PyAny> {
-        self.descriptor.bind(py)
+    pub(crate) fn descriptor<'py>(&self, py: Python<'py>) -> Borrowed<'_, 'py, PyAny> {
+        self.descriptor.bind_borrowed(py)
     }
 
     pub(crate) fn clone_ref(&self, py: Python<'_>) -> Self {
@@ -243,7 +244,6 @@ impl ProtoRuntime {
         if registered.contains(name) {
             return Ok(());
         }
-        let name = name.to_owned();
         for dependency in file.getattr(&constants.dependencies)?.try_iter()? {
             self.collect_files(&dependency?, constants, registered, add)?;
         }
@@ -256,7 +256,7 @@ impl ProtoRuntime {
             Self::Google => file.getattr(&constants.serialized_pb)?.cast_into()?,
         };
         add(file, &bytes)?;
-        registered.insert(name);
+        registered.insert(name.to_owned());
         Ok(())
     }
 
