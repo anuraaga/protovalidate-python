@@ -32,7 +32,7 @@ pub(super) fn checks<'a>(
     }
     length_checks(&mut checks, r);
     if let Some(p) = r.pattern.take() {
-        let compiled = regex(&p)?;
+        let compiled = regex(&format!("{prefix}.pattern"), &p)?;
         checks.push(
             6,
             "pattern",

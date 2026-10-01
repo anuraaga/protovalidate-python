@@ -321,8 +321,9 @@ fn check_timestamp(t: &TimestampPb) -> Result<(), String> {
     }
 }
 
-pub(super) fn regex(pattern: &str) -> Result<Regex, String> {
-    Regex::new(pattern).map_err(|error| format!("invalid regex pattern `{pattern}`: {error}"))
+/// Compiles the pattern of the rule `id`, such as `string.pattern`.
+pub(super) fn regex(id: &str, pattern: &str) -> Result<Regex, String> {
+    Regex::new(pattern).map_err(|error| format!("failed to compile program {id}: {error}"))
 }
 
 /// The placed checks of an integer rules message holding `$narrow` values,

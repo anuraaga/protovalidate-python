@@ -347,7 +347,10 @@ impl CelPrograms {
     /// string fails with that string as the message.
     fn run<E>(&self, this: This<'_>, out: &mut Violations<'_>) -> Result<(), Abort<E>> {
         for (index, meta) in self.rules.iter().enumerate() {
-            let message = match self.program.eval(index, this)? {
+            let value = self.program.eval(index, this).map_err(|error| {
+                Error::Evaluation(format!("error evaluating {}: {}", meta.id, error.message()))
+            })?;
+            let message = match value {
                 Value::Bool(true) => continue,
                 Value::Bool(false) if meta.message.is_empty() => {
                     format!("\"{}\" returned false", meta.expression)
@@ -356,7 +359,11 @@ impl CelPrograms {
                 Value::String(text) if text.is_empty() => continue,
                 Value::String(text) => text,
                 Value::Other => {
-                    return Err(Error::Evaluation("invalid result type".to_owned()).into());
+                    return Err(Error::Evaluation(format!(
+                        "expression {} outputs an unexpected type, wanted either bool or string",
+                        meta.id
+                    ))
+                    .into());
                 }
             };
             out.push(&meta.id, &message, &meta.rule_path)?;

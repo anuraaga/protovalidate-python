@@ -114,7 +114,7 @@ pub(super) fn bytes_checks<'a>(
         );
     }
     if let Some(p) = r.pattern.take() {
-        let compiled = regex(&p)?;
+        let compiled = regex(&format!("{prefix}.pattern"), &p)?;
         checks.push(
             4,
             "pattern",

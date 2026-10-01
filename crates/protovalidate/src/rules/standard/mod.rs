@@ -340,7 +340,7 @@ impl Test<[u8]> for BytesTest {
             Self::MaxLen(n) => b.len() as u64 > *n,
             Self::Pattern(regex) => match std::str::from_utf8(b) {
                 Ok(s) => !regex.is_match(s),
-                Err(_) => return Err("value must be valid UTF-8 to apply regexp".to_owned()),
+                Err(_) => return Err("must be valid UTF-8 to apply regexp".to_owned()),
             },
             Self::Prefix(p) => !b.starts_with(p),
             Self::Suffix(p) => !b.ends_with(p),

@@ -124,7 +124,7 @@ def test_protovalidate_oneof_unknown_field_name(validator: ValidatorProtocol) ->
     check_compilation_errors(
         validator,
         msg,
-        'field "xxx" not found in message tests.example.v1.ProtovalidateOneofUnknownFieldName',
+        "field xxx not found in message tests.example.v1.ProtovalidateOneofUnknownFieldName",
     )
 
 
@@ -134,7 +134,9 @@ def test_protovalidate_mistyped_rule(validator: ValidatorProtocol) -> None:
     msg = validations_pb.ProtovalidateMistypedRule()
 
     check_compilation_errors(
-        validator, msg, "duration field validator on non-duration field"
+        validator,
+        msg,
+        'expected rule "buf.validate.FieldRules.string", got "buf.validate.FieldRules.duration" on field "tests.example.v1.ProtovalidateMistypedRule.val"',
     )
 
 
@@ -251,7 +253,7 @@ def test_nested_compilation_error_reached_lazily(validator: ValidatorProtocol) -
         validations_pb.NestedMistypedRule(
             child=validations_pb.ProtovalidateMistypedRule()
         ),
-        "duration field validator on non-duration field",
+        'expected rule "buf.validate.FieldRules.string", got "buf.validate.FieldRules.duration" on field "tests.example.v1.ProtovalidateMistypedRule.val"',
     )
 
 
@@ -284,7 +286,11 @@ def test_violation_before_compilation_error(validator: ValidatorProtocol) -> Non
     compare_violations(violations, [expected_violation])
 
     check_compilation_errors(
-        validator, msg, "duration field validator on non-duration field"
+        validator,
+        msg,
+        'expected rule "buf.validate.FieldRules.string", '
+        'got "buf.validate.FieldRules.duration" '
+        'on field "tests.example.v1.ViolationBeforeError.b"',
     )
 
 
@@ -294,23 +300,23 @@ def test_violation_before_compilation_error(validator: ValidatorProtocol) -> Non
     [
         (
             validations_pb.RepeatedFieldScalarRule(val=["abcd"]),
-            "string field validator on repeated field",
+            'expected rule "buf.validate.FieldRules.repeated", got "buf.validate.FieldRules.string" on field "tests.example.v1.RepeatedFieldScalarRule.val"',
         ),
         (
             validations_pb.RepeatedFieldWrapperRule(val=[Int32Value(value=100)]),
-            "int32 field validator on repeated field",
+            'expected rule "buf.validate.FieldRules.repeated", got "buf.validate.FieldRules.int32" on field "tests.example.v1.RepeatedFieldWrapperRule.val"',
         ),
         (
             validations_pb.RepeatedFieldEnumRule(val=[1]),
-            "enum field validator on repeated field",
+            'expected rule "buf.validate.FieldRules.repeated", got "buf.validate.FieldRules.enum" on field "tests.example.v1.RepeatedFieldEnumRule.val"',
         ),
         (
             validations_pb.RepeatedFieldDurationRule(val=[Duration(seconds=2)]),
-            "duration field validator on repeated field",
+            'expected rule "buf.validate.FieldRules.repeated", got "buf.validate.FieldRules.duration" on field "tests.example.v1.RepeatedFieldDurationRule.val"',
         ),
         (
             validations_pb.MapFieldScalarRule(val={"abcd": "abcd"}),
-            "string field validator on map field",
+            'expected rule "buf.validate.FieldRules.map", got "buf.validate.FieldRules.string" on field "tests.example.v1.MapFieldScalarRule.val"',
         ),
         (
             validations_pb.RepeatedUniqueMessages(val=[validations_pb.Embed(val=1)]),
@@ -415,4 +421,4 @@ def test_pattern_is_re2(validator: ValidatorProtocol) -> None:
 
     with pytest.raises(protovalidate.CompilationError) as exc_info:
         validator.validate(validations_pb.PatternRepeatTooLarge(val="a"))
-    assert str(exc_info.value).startswith("invalid regex pattern `a{1001}`: ")
+    assert str(exc_info.value).startswith("failed to compile program string.pattern: ")

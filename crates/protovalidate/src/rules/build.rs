@@ -110,7 +110,7 @@ pub(crate) fn resolve<R: Runtime>(
 }
 
 /// The value a set of rules applies to.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Target {
     /// The field's kind. An item of a container is singular.
     kind: DescriptorKind,
@@ -119,23 +119,28 @@ struct Target {
     ty: Type,
     /// The field's presence.
     presence: FieldPresence,
+    /// The field's full name, as compile errors name it. A map's keys and
+    /// values are the `key` and `value` fields of its entry type.
+    name: String,
 }
 
 impl Target {
-    fn field(field: &FieldDescriptor) -> Self {
+    fn field(message: &MessageDescriptor, field: &FieldDescriptor) -> Self {
         Self {
             kind: field.kind(),
             ty: descriptors::proto_type(field),
             presence: field.presence(),
+            name: format!("{}.{}", message.full_name(), field.name()),
         }
     }
 
     /// One list element or map key or value.
-    fn item(kind: SingularKind) -> Self {
+    fn item(kind: SingularKind, name: String) -> Self {
         Self {
             kind: DescriptorKind::Singular(kind),
             ty: singular_type(kind),
             presence: FieldPresence::Implicit,
+            name,
         }
     }
 
@@ -274,66 +279,60 @@ fn nested_type<R: Runtime>(field: &FieldValidator<R>) -> Option<MessageIndex> {
         .or_else(|| items.and_then(|items| items.value.nested))
 }
 
-/// The name of the `FieldRules` field holding a scalar type's rules, the
-/// field type those rules expect, and the wrapper message type they also
-/// accept, if there is one.
-fn scalar_rules(rules: &RulesType) -> Option<(&'static str, Type, Option<&'static str>)> {
-    Some(match rules {
-        RulesType::Float(_) => (
-            "float",
-            Type::TYPE_FLOAT,
-            Some("google.protobuf.FloatValue"),
-        ),
-        RulesType::Double(_) => (
-            "double",
-            Type::TYPE_DOUBLE,
-            Some("google.protobuf.DoubleValue"),
-        ),
-        RulesType::Int32(_) => (
-            "int32",
-            Type::TYPE_INT32,
-            Some("google.protobuf.Int32Value"),
-        ),
-        RulesType::Int64(_) => (
-            "int64",
-            Type::TYPE_INT64,
-            Some("google.protobuf.Int64Value"),
-        ),
-        RulesType::Uint32(_) => (
-            "uint32",
-            Type::TYPE_UINT32,
-            Some("google.protobuf.UInt32Value"),
-        ),
-        RulesType::Uint64(_) => (
-            "uint64",
-            Type::TYPE_UINT64,
-            Some("google.protobuf.UInt64Value"),
-        ),
-        RulesType::Sint32(_) => ("sint32", Type::TYPE_SINT32, None),
-        RulesType::Sint64(_) => ("sint64", Type::TYPE_SINT64, None),
-        RulesType::Fixed32(_) => ("fixed32", Type::TYPE_FIXED32, None),
-        RulesType::Fixed64(_) => ("fixed64", Type::TYPE_FIXED64, None),
-        RulesType::Sfixed32(_) => ("sfixed32", Type::TYPE_SFIXED32, None),
-        RulesType::Sfixed64(_) => ("sfixed64", Type::TYPE_SFIXED64, None),
-        RulesType::Bool(_) => ("bool", Type::TYPE_BOOL, Some("google.protobuf.BoolValue")),
-        RulesType::String(_) => (
-            "string",
-            Type::TYPE_STRING,
-            Some("google.protobuf.StringValue"),
-        ),
-        RulesType::Bytes(_) => (
-            "bytes",
-            Type::TYPE_BYTES,
-            Some("google.protobuf.BytesValue"),
-        ),
-        RulesType::Enum(_) => ("enum", Type::TYPE_ENUM, None),
+/// Whether the rules are a scalar type's, which also apply to the type's
+/// wrapper message.
+fn is_scalar_rules(rules: &RulesType) -> bool {
+    !matches!(
+        rules,
         RulesType::Repeated(_)
-        | RulesType::Map(_)
-        | RulesType::Any(_)
-        | RulesType::Duration(_)
-        | RulesType::FieldMask(_)
-        | RulesType::Timestamp(_) => return None,
+            | RulesType::Map(_)
+            | RulesType::Any(_)
+            | RulesType::Duration(_)
+            | RulesType::FieldMask(_)
+            | RulesType::Timestamp(_)
+    )
+}
+
+/// The `FieldRules` field whose rules apply to values of a well-known
+/// message type: its own for `Any`, `Duration`, `FieldMask` and
+/// `Timestamp`, and the wrapped scalar's for a wrapper. `None` for any
+/// other message type, which takes no standard rules.
+fn well_known_rules(type_name: &str) -> Option<&'static str> {
+    Some(match type_name {
+        descriptors::ANY => "any",
+        descriptors::DURATION => "duration",
+        descriptors::FIELD_MASK => "field_mask",
+        descriptors::TIMESTAMP => "timestamp",
+        "google.protobuf.BoolValue" => "bool",
+        "google.protobuf.BytesValue" => "bytes",
+        "google.protobuf.DoubleValue" => "double",
+        "google.protobuf.FloatValue" => "float",
+        "google.protobuf.Int32Value" => "int32",
+        "google.protobuf.Int64Value" => "int64",
+        "google.protobuf.StringValue" => "string",
+        "google.protobuf.UInt32Value" => "uint32",
+        "google.protobuf.UInt64Value" => "uint64",
+        _ => return None,
     })
+}
+
+/// The name of a map field's synthesized entry message: the field name in
+/// upper camel case, then `Entry`, as the Protobuf compiler forms it.
+fn map_entry_name(field_name: &str) -> String {
+    let mut name = String::with_capacity(field_name.len() + 5);
+    let mut upper = true;
+    for c in field_name.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            name.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            name.push(c);
+        }
+    }
+    name.push_str("Entry");
+    name
 }
 
 /// The name of the `FieldRules` field holding the rules, for messages.
@@ -489,7 +488,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
             if field_rules.ignore.is_none() && members.contains(field.name()) {
                 field_rules.ignore = Some(Ignore::IGNORE_IF_ZERO_VALUE);
             }
-            if let Some(validator) = self.build_field(field, &field_rules).transpose() {
+            if let Some(validator) = self.build_field(message, field, &field_rules).transpose() {
                 fields.push(validator);
             }
         }
@@ -550,13 +549,13 @@ impl<'a, R: Runtime> Builder<'a, R> {
             for name in &oneof.fields {
                 if !seen.insert(name.as_str()) {
                     return Err(format!(
-                        "duplicate \"{name}\" in oneof rule for the message {}",
+                        "duplicate {name} in oneof rule for the message {}",
                         message.full_name()
                     ));
                 }
                 let Some(field) = message.field_by_name(name) else {
                     return Err(format!(
-                        "field \"{name}\" not found in message {}",
+                        "field {name} not found in message {}",
                         message.full_name()
                     ));
                 };
@@ -576,15 +575,16 @@ impl<'a, R: Runtime> Builder<'a, R> {
     /// ignore it.
     fn build_field(
         &mut self,
+        message: &MessageDescriptor,
         field: &FieldDescriptor,
         rules: &FieldRules,
     ) -> Result<Option<FieldValidator<R>>, String> {
         if rules.ignore == Some(Ignore::IGNORE_ALWAYS) {
             return Ok(None);
         }
-        let target = Target::field(field);
-        let value = self.build_value(target, rules, &[])?;
-        let kind = self.build_kind(field, target, rules)?;
+        let target = Target::field(message, field);
+        let value = self.build_value(&target, rules, &[])?;
+        let kind = self.build_kind(field, &target, rules)?;
         Ok(Some(FieldValidator {
             field: self.field(field),
             element: descriptors::path_element(field),
@@ -599,7 +599,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
     fn build_kind(
         &mut self,
         field: &FieldDescriptor,
-        target: Target,
+        target: &Target,
         rules: &FieldRules,
     ) -> Result<FieldKind<R>, String> {
         let schema = &self.descriptors.schema;
@@ -611,8 +611,14 @@ impl<'a, R: Runtime> Builder<'a, R> {
                     _ => None,
                 };
                 let prefix = [schema.repeated.clone(), schema.repeated_items.clone()];
+                let item = Target::item(element, target.name.clone());
                 Ok(FieldKind::List {
-                    items: self.build_item(Target::item(element), items, &prefix)?,
+                    items: self.build_item(&item, items, &prefix).map_err(|error| {
+                        format!(
+                            "failed to compile items rules for repeated {}: {error}",
+                            target.name
+                        )
+                    })?,
                 })
             }
             DescriptorKind::Map { key, value } => {
@@ -622,14 +628,30 @@ impl<'a, R: Runtime> Builder<'a, R> {
                 };
                 let keys_prefix = [schema.map.clone(), schema.map_keys.clone()];
                 let values_prefix = [schema.map.clone(), schema.map_values.clone()];
+                let entry = match target.name.rsplit_once('.') {
+                    Some((message, name)) => format!("{message}.{}", map_entry_name(name)),
+                    None => map_entry_name(&target.name),
+                };
+                let key_target = Target::item(SingularKind::Scalar(key), format!("{entry}.key"));
+                let value_target = Target::item(value, format!("{entry}.value"));
                 Ok(FieldKind::Map {
                     element: entry_element(field),
-                    keys: self.build_item(
-                        Target::item(SingularKind::Scalar(key)),
-                        keys,
-                        &keys_prefix,
-                    )?,
-                    values: self.build_item(Target::item(value), values, &values_prefix)?,
+                    keys: self
+                        .build_item(&key_target, keys, &keys_prefix)
+                        .map_err(|error| {
+                            format!(
+                                "failed to compile key rules for map {}: {error}",
+                                target.name
+                            )
+                        })?,
+                    values: self
+                        .build_item(&value_target, values, &values_prefix)
+                        .map_err(|error| {
+                            format!(
+                                "failed to compile value rules for map {}: {error}",
+                                target.name
+                            )
+                        })?,
                 })
             }
         }
@@ -638,7 +660,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
     /// The validator of a container's items.
     fn build_item(
         &mut self,
-        target: Target,
+        target: &Target,
         rules: Option<&FieldRules>,
         prefix: &[FieldPathElement],
     ) -> Result<Option<Box<ItemValidator<R>>>, String> {
@@ -665,7 +687,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
     /// The rules of one value. `prefix` is prepended to their rule paths.
     fn build_value(
         &mut self,
-        target: Target,
+        target: &Target,
         rules: &FieldRules,
         prefix: &[FieldPathElement],
     ) -> Result<ValueValidator<R>, String> {
@@ -694,77 +716,54 @@ impl<'a, R: Runtime> Builder<'a, R> {
     }
 
     /// The standard rules set in a `FieldRules`, after checking that they
-    /// apply to the value's type.
+    /// are the rules for the value's type.
     fn standard_rules(
         &mut self,
-        target: Target,
+        target: &Target,
         standard: &RulesType,
         prefix: &[FieldPathElement],
         value: &mut ValueValidator<R>,
         predefined: &mut CelExpressions,
     ) -> Result<(), String> {
-        // A repeated or map field takes only its container's rules; its
-        // elements' rules go under `items`, `keys` and `values`. Checking
-        // the element type alone would let scalar rules through onto the
-        // container, where they would test the type's default in place of
-        // each element.
-        match (&target.kind, standard) {
-            (DescriptorKind::List(_), RulesType::Repeated(_))
-            | (DescriptorKind::Map { .. }, RulesType::Map(_))
-            | (DescriptorKind::Singular(_), _) => {}
-            (DescriptorKind::List(_), _) => {
+        let got = rules_name(standard);
+        match self.expected_rules(target) {
+            Some(expected) if expected == got => {}
+            Some(expected) => {
                 return Err(format!(
-                    "{} field validator on repeated field",
-                    rules_name(standard)
+                    "expected rule \"buf.validate.FieldRules.{expected}\", \
+                     got \"buf.validate.FieldRules.{got}\" on field \"{}\"",
+                    target.name
                 ));
             }
-            (DescriptorKind::Map { .. }, _) => {
+            None => {
                 return Err(format!(
-                    "{} field validator on map field",
-                    rules_name(standard)
+                    "mismatched message rules, \"buf.validate.FieldRules.{got}\" \
+                     is not a valid rule for field \"{}\"",
+                    target.name
                 ));
             }
         }
-        if let Some((name, expected, wrapper)) = scalar_rules(standard) {
-            self.check_scalar_type(&target, expected, wrapper)?;
+        if is_scalar_rules(standard) {
             value.wrapper = self
-                .message(&target)
+                .message(target)
                 .and_then(|wrapper| wrapper.field(1))
                 .map(|field| self.field(field));
             let enum_ = match target.kind {
                 DescriptorKind::Singular(SingularKind::Enum(idx)) => Some(idx),
                 _ => None,
             };
-            value.checks = self.standard_checks(name, standard, prefix, enum_, predefined)?;
+            value.checks = self.standard_checks(got, standard, prefix, enum_, predefined)?;
             return Ok(());
         }
-        let name = match standard {
-            RulesType::Duration(_) => {
-                self.well_known_rules(&target, "duration", descriptors::DURATION)?
-            }
-            RulesType::FieldMask(_) => {
-                self.well_known_rules(&target, "field_mask", descriptors::FIELD_MASK)?
-            }
-            RulesType::Timestamp(_) => {
-                self.well_known_rules(&target, "timestamp", descriptors::TIMESTAMP)?
-            }
-            RulesType::Any(_) => self.well_known_rules(&target, "any", descriptors::ANY)?,
-            RulesType::Repeated(rules) => match target.kind {
-                DescriptorKind::List(SingularKind::Message(_)) if rules.unique == Some(true) => {
-                    // `unique()` compares scalars only, and would otherwise
-                    // fail every validation of the message.
-                    return Err("repeated.unique is not supported for message items".to_owned());
-                }
-                DescriptorKind::List(_) => "repeated",
-                _ => return Err("repeated field validator on non-repeated field".to_owned()),
-            },
-            RulesType::Map(_) => match target.kind {
-                DescriptorKind::Map { .. } => "map",
-                _ => return Err("map field validator on non-map field".to_owned()),
-            },
-            _ => return Ok(()),
-        };
-        value.checks = self.standard_checks(name, standard, prefix, None, predefined)?;
+        if let (RulesType::Repeated(rules), DescriptorKind::List(SingularKind::Message(_))) =
+            (standard, target.kind)
+            && rules.unique == Some(true)
+        {
+            // `unique()` compares scalars only, and would otherwise fail
+            // every validation of the message.
+            return Err("repeated.unique is not supported for message items".to_owned());
+        }
+        value.checks = self.standard_checks(got, standard, prefix, None, predefined)?;
         Ok(())
     }
 
@@ -776,43 +775,20 @@ impl<'a, R: Runtime> Builder<'a, R> {
         }
     }
 
-    /// Checks that the rules in the `FieldRules` field `name`, which apply
-    /// only to the well-known type `type_name`, are on a field of that type.
-    fn well_known_rules(
-        &self,
-        target: &Target,
-        name: &'static str,
-        type_name: &str,
-    ) -> Result<&'static str, String> {
-        if self.message(target).map(MessageDescriptor::full_name) == Some(type_name) {
-            Ok(name)
-        } else {
-            Err(format!("{name} field validator on non-{name} field"))
+    /// The `FieldRules` field whose rules apply to the target: `repeated`
+    /// and `map` for the containers, whose elements' rules go under
+    /// `items`, `keys` and `values`; the scalar type's for a scalar, an
+    /// enum or a wrapper; the well-known type's for the others that have
+    /// one. `None` for a message type that takes no standard rules.
+    fn expected_rules(&self, target: &Target) -> Option<&'static str> {
+        match target.kind {
+            DescriptorKind::List(_) => Some("repeated"),
+            DescriptorKind::Map { .. } => Some("map"),
+            DescriptorKind::Singular(SingularKind::Message(idx)) => {
+                well_known_rules(self.descriptors.pool.message(idx).full_name())
+            }
+            DescriptorKind::Singular(_) => Some(descriptors::type_name(target.ty)),
         }
-    }
-
-    /// Checks that the field has the type the rules apply to, or is that
-    /// type's wrapper message.
-    fn check_scalar_type(
-        &self,
-        target: &Target,
-        expected: Type,
-        wrapper: Option<&str>,
-    ) -> Result<(), String> {
-        if target.ty == expected {
-            return Ok(());
-        }
-        if target.ty == Type::TYPE_MESSAGE
-            && wrapper.is_some()
-            && self.message(target).map(MessageDescriptor::full_name) == wrapper
-        {
-            return Ok(());
-        }
-        Err(format!(
-            "field type does not match rule type: {} != {}",
-            descriptors::type_name(target.ty),
-            descriptors::type_name(expected)
-        ))
     }
 
     /// The checks of every rule field set in the rules message.
@@ -920,10 +896,30 @@ impl<'a, R: Runtime> Builder<'a, R> {
                 rule_field_number: rule.rule_field_number,
             })
             .collect();
-        let program = self
-            .env
-            .compile(bound, &to_compile)
-            .map_err(|error| error.message().to_owned())?;
+        let program = match self.env.compile(bound, &to_compile) {
+            Ok(program) => program,
+            Err(error) => {
+                // The engine compiles the expressions together and names
+                // none in its error, so find the one at fault.
+                let culprit =
+                    expressions
+                        .rules
+                        .iter()
+                        .zip(&to_compile)
+                        .find_map(|(rule, expression)| {
+                            self.env
+                                .compile(bound, std::slice::from_ref(expression))
+                                .err()
+                                .map(|error| (rule.id.as_str(), error))
+                        });
+                return Err(match culprit {
+                    Some((id, error)) => {
+                        format!("failed to compile expression {id}: {}", error.message())
+                    }
+                    None => error.message().to_owned(),
+                });
+            }
+        };
         Ok(Some(CelPrograms {
             program,
             rules: expressions.rules,
