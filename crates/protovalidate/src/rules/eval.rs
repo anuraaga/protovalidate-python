@@ -639,6 +639,7 @@ fn cel_this<'v, R: Runtime>(
 impl Checks {
     /// Runs the standard checks against a value. A wrapper message is
     /// checked through its `value` field, matching how CEL unboxes wrappers.
+    /// For a list of wrappers, `wrapper` is the elements' `value` field.
     fn check<R: Runtime>(
         &self,
         walk: &mut Walk<'_, R>,
@@ -648,17 +649,21 @@ impl Checks {
         match (wrapper, value) {
             (Some(wrapper), Some(Val::Message(message))) => {
                 let unboxed = message.get(wrapper).read()?;
-                self.check_value(walk, unboxed.as_ref())
+                self.check_value(walk, unboxed.as_ref(), None)
             }
-            (Some(_), _) => self.check_value(walk, None),
-            (None, value) => self.check_value(walk, value),
+            (Some(wrapper), Some(Val::List(_))) => self.check_value(walk, value, Some(wrapper)),
+            (Some(_), _) => self.check_value(walk, None, None),
+            (None, value) => self.check_value(walk, value, None),
         }
     }
 
+    /// `element_wrapper` is the `value` field of a list's wrapper elements,
+    /// which `unique` compares through.
     fn check_value<R: Runtime>(
         &self,
         walk: &mut Walk<'_, R>,
         value: Option<&Val<'_, R>>,
+        element_wrapper: Option<&Field<R>>,
     ) -> Result<(), Abort<R::Error>> {
         let pool = walk.pool;
         let out = &mut walk.out;
@@ -711,7 +716,9 @@ impl Checks {
                     Ok(match (test, list) {
                         (ListTest::MinItems(n), _) => (len as u64) < *n,
                         (ListTest::MaxItems(n), _) => len as u64 > *n,
-                        (ListTest::Unique, Some(list)) => has_duplicate_items::<R>(list, len)?,
+                        (ListTest::Unique, Some(list)) => {
+                            has_duplicate_items::<R>(list, len, element_wrapper)?
+                        }
                         (ListTest::Unique, None) => false,
                     })
                 })
@@ -984,9 +991,11 @@ fn with_paths<R: Runtime, T>(
 }
 
 /// Whether a list has two elements that `unique()` considers equal.
+/// Wrapper elements are compared by the scalar in their `wrapper` field.
 fn has_duplicate_items<R: Runtime>(
     list: &R::List<'_>,
     len: usize,
+    wrapper: Option<&Field<R>>,
 ) -> Result<bool, Abort<R::Error>> {
     let mut items = Vec::with_capacity(len);
     for index in 0..len {
@@ -994,7 +1003,21 @@ fn has_duplicate_items<R: Runtime>(
             items.push(item);
         }
     }
-    Ok(has_duplicates(items.iter().map(unique_key)))
+    let Some(wrapper) = wrapper else {
+        return Ok(has_duplicates(items.iter().map(unique_key)));
+    };
+    let mut unboxed = Vec::with_capacity(items.len());
+    for item in &items {
+        match item {
+            Val::Message(message) => unboxed.push(message.get(wrapper).read()?),
+            other => return Err(mismatch("a wrapper message", other)),
+        }
+    }
+    Ok(has_duplicates(
+        unboxed
+            .iter()
+            .map(|value| value.as_ref().and_then(unique_key)),
+    ))
 }
 
 fn unique_key<'a, R: Runtime>(value: &'a Val<'_, R>) -> Option<UniqueKey<'a>> {

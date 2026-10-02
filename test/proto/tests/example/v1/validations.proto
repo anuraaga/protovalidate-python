@@ -20,6 +20,7 @@ import "buf/validate/validate.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
+import "tests/example/v1/rules.proto";
 
 message MultipleValidations {
   string title = 1 [(buf.validate.field).string.prefix = "foo"];
@@ -153,12 +154,6 @@ message ViolationBeforeError {
   string b = 2 [(buf.validate.field).duration.gt = {seconds: 1}];
 }
 
-enum TestEnum {
-  TEST_ENUM_UNSPECIFIED = 0;
-  TEST_ENUM_ONE = 1;
-  TEST_ENUM_TWO = 2;
-}
-
 // A repeated or map field takes only `repeated` or `map` rules; rules for
 // its elements' type do not compile.
 message RepeatedFieldScalarRule {
@@ -243,4 +238,18 @@ message PatternQuotedLiteral {
 
 message PatternRepeatTooLarge {
   string val = 1 [(buf.validate.field).string.pattern = "a{1001}"];
+}
+
+// A wrapper element stands for the scalar it holds, so `unique` compares
+// the inner values.
+message UniqueWrappers {
+  repeated google.protobuf.Int32Value val = 1 [(buf.validate.field).repeated.unique = true];
+}
+
+message CelUniqueWrappers {
+  repeated google.protobuf.Int32Value val = 1 [(buf.validate.field).cel = {
+    id: "unique_wrappers"
+    message: "must be unique"
+    expression: "this.unique()"
+  }];
 }

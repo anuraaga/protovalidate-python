@@ -341,6 +341,14 @@ fn well_known_rules(type_name: &str) -> Option<&'static str> {
         descriptors::DURATION => "duration",
         descriptors::FIELD_MASK => "field_mask",
         descriptors::TIMESTAMP => "timestamp",
+        _ => return wrapper_rules(type_name),
+    })
+}
+
+/// The `FieldRules` field for the scalar a wrapper message holds, or
+/// `None` for a message that is not a wrapper.
+fn wrapper_rules(type_name: &str) -> Option<&'static str> {
+    Some(match type_name {
         "google.protobuf.BoolValue" => "bool",
         "google.protobuf.BytesValue" => "bytes",
         "google.protobuf.DoubleValue" => "double",
@@ -795,9 +803,18 @@ impl<'a, R: Runtime> Builder<'a, R> {
                 (&standard, target.kind)
                 && rules.unique == Some(true)
             {
-                // `unique()` compares scalars only, and would otherwise fail
-                // every validation of the message.
-                return Err("repeated.unique is not supported for message items".to_owned());
+                // `unique()` compares scalars. Wrapper elements stand for
+                // the scalars they hold, as they do for every other rule,
+                // and are compared through their `value` field. Any other
+                // message element would fail every validation.
+                let wrapper = self
+                    .message(target)
+                    .filter(|message| wrapper_rules(message.full_name()).is_some())
+                    .and_then(|wrapper| wrapper.field(1));
+                let Some(wrapper) = wrapper else {
+                    return Err("repeated.unique is not supported for message items".to_owned());
+                };
+                value.wrapper = Some(self.field(wrapper));
             }
             None
         };

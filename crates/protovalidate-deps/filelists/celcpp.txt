@@ -141,6 +141,7 @@ third_party/cel-cpp/eval/public/containers/field_access.cc
 third_party/cel-cpp/eval/public/containers/internal_field_backed_list_impl.cc
 third_party/cel-cpp/eval/public/containers/internal_field_backed_map_impl.cc
 third_party/cel-cpp/eval/public/string_extension_func_registrar.cc
+third_party/cel-cpp/eval/public/structs/cel_proto_descriptor_pool_builder.cc
 third_party/cel-cpp/eval/public/structs/cel_proto_wrap_util.cc
 third_party/cel-cpp/eval/public/structs/cel_proto_wrapper.cc
 third_party/cel-cpp/eval/public/structs/field_access_impl.cc

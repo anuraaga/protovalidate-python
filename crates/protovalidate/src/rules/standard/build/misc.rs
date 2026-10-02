@@ -52,6 +52,14 @@ pub(super) fn enum_checks<'a>(
             EnumTest::Cmp(Cmp::Const(i64::from(c))),
         );
     }
+    if let (Some(true), Some(enum_)) = (r.defined_only.take(), enum_) {
+        checks.push(
+            2,
+            "defined_only",
+            "value must be one of the defined enum values".to_owned(),
+            EnumTest::DefinedOnly(enum_),
+        );
+    }
     if !r.r#in.is_empty() {
         let list = ints(mem::take(&mut r.r#in));
         checks.push(
@@ -68,14 +76,6 @@ pub(super) fn enum_checks<'a>(
             "not_in",
             format!("must not be in list {}", List(&list)),
             EnumTest::Cmp(Cmp::NotIn(list)),
-        );
-    }
-    if let (Some(true), Some(enum_)) = (r.defined_only.take(), enum_) {
-        checks.push(
-            2,
-            "defined_only",
-            "value must be one of the defined enum values".to_owned(),
-            EnumTest::DefinedOnly(enum_),
         );
     }
     checks

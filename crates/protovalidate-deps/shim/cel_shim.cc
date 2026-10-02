@@ -39,6 +39,7 @@
 #include "eval/public/containers/field_backed_list_impl.h"
 #include "eval/public/containers/field_backed_map_impl.h"
 #include "eval/public/string_extension_func_registrar.h"
+#include "eval/public/structs/cel_proto_descriptor_pool_builder.h"
 #include "eval/public/structs/cel_proto_wrapper.h"
 #include "google/protobuf/arena.h"
 #include "google/protobuf/descriptor.h"
@@ -245,6 +246,8 @@ class NativeFunction : public celrt::CelFunction {
 
 // The expression builder, with the options and functions rules need.
 absl::StatusOr<std::unique_ptr<celrt::CelExpressionBuilder>> NewBuilder(
+    const google::protobuf::DescriptorPool* pool,
+    google::protobuf::MessageFactory* message_factory,
     google::protobuf::Arena* arena) {
   celrt::InterpreterOptions options;
   options.enable_qualified_type_identifiers = true;
@@ -256,7 +259,7 @@ absl::StatusOr<std::unique_ptr<celrt::CelExpressionBuilder>> NewBuilder(
   options.constant_arena = arena;
 
   std::unique_ptr<celrt::CelExpressionBuilder> builder =
-      celrt::CreateCelExpressionBuilder(options);
+      celrt::CreateCelExpressionBuilder(pool, message_factory, options);
   celrt::CelFunctionRegistry* registry = builder->GetRegistry();
   absl::Status status = celrt::RegisterBuiltinFunctions(registry, options);
   if (!status.ok()) return status;
@@ -270,18 +273,15 @@ absl::StatusOr<std::unique_ptr<celrt::CelExpressionBuilder>> NewBuilder(
 
 }  // namespace
 
-// The pool is an overlay on the descriptors compiled into this library, so
-// the well-known types always match the C++ types cel-cpp was built against,
-// and user files are only consulted for names the underlay does not define.
+// The pool holds every descriptor the engine knows, starting with the
+// well-known types.
 //
 // Files are added with BuildFile rather than through a DescriptorDatabase,
 // because the engine learns about descriptors incrementally and a
 // database-backed pool must not be mutated after construction. The
 // consequence for callers: a file's imports must be added before the file.
 struct cel_engine {
-  cel_engine()
-      : pool(google::protobuf::DescriptorPool::generated_pool()),
-        message_factory(&pool) {}
+  cel_engine() : message_factory(&pool) {}
 
   google::protobuf::DescriptorPool pool;
   google::protobuf::DynamicMessageFactory message_factory;
@@ -328,7 +328,14 @@ extern "C" {
 
 cel_engine* cel_engine_new(char** error) {
   auto engine = std::make_unique<cel_engine>();
-  auto builder = NewBuilder(&engine->constant_arena);
+  absl::Status status =
+      celrt::AddStandardMessageTypesToDescriptorPool(engine->pool);
+  if (!status.ok()) {
+    SetError(error, status.message());
+    return nullptr;
+  }
+  auto builder = NewBuilder(&engine->pool, &engine->message_factory,
+                            &engine->constant_arena);
   if (!builder.ok()) {
     SetError(error, builder.status().message());
     return nullptr;

@@ -363,14 +363,14 @@ def test_timestamp_rule_order(validator: ValidatorProtocol) -> None:
 
 @pytest.mark.parametrize("validator", validators)
 def test_enum_rule_order(validator: ValidatorProtocol) -> None:
-    """`defined_only` is checked after the comparisons."""
+    """Enum rules are checked in the order validate.proto declares them."""
     msg = validations_pb.EnumRuleOrder(val=5)
     violations = validator.collect_violations(msg)
     assert [v.proto.rule_id for v in violations] == [
         "enum.const",
+        "enum.defined_only",
         "enum.in",
         "enum.not_in",
-        "enum.defined_only",
     ]
 
 
@@ -422,3 +422,18 @@ def test_pattern_is_re2(validator: ValidatorProtocol) -> None:
     with pytest.raises(protovalidate.CompilationError) as exc_info:
         validator.validate(validations_pb.PatternRepeatTooLarge(val="a"))
     assert str(exc_info.value).startswith("failed to compile program string.pattern: ")
+
+
+@pytest.mark.parametrize("validator", validators)
+@pytest.mark.parametrize(
+    "msg_type", [validations_pb.UniqueWrappers, validations_pb.CelUniqueWrappers]
+)
+def test_unique_wrappers(
+    validator: ValidatorProtocol, msg_type: type[protobuf.Message]
+) -> None:
+    """`unique` compares wrapper elements by the scalars they hold."""
+    check_valid(validator, msg_type(val=[Int32Value(value=1), Int32Value(value=2)]))
+    violations = validator.collect_violations(
+        msg_type(val=[Int32Value(value=1), Int32Value(value=1)])
+    )
+    assert len(violations) == 1
