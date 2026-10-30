@@ -24,13 +24,13 @@ pub(crate) mod build;
 pub(crate) mod eval;
 pub(crate) mod standard;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use buffa_descriptor::MessageIndex;
 
 use crate::cel;
-use crate::protobuf::{Field, Runtime};
+use crate::protobuf::{Field, Kind, Oneof, Runtime, Singular};
 use crate::validate::FieldPathElement;
 use standard::Checks;
 
@@ -57,8 +57,80 @@ pub(crate) struct CelPrograms {
 /// A message type's validator, or why its rules did not compile.
 pub(crate) type Built<R> = Result<Arc<MessageValidator<R>>, String>;
 
-/// The compiled rules of every message type validated so far.
-pub(crate) type ValidatorCache<R> = HashMap<MessageIndex, Built<R>, foldhash::fast::RandomState>;
+/// The position of a message type's validator in a [`ValidatorCache`], by
+/// which rules refer to the validators of nested message types, much as a
+/// `MessageIndex` positions a descriptor in its pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ValidatorIndex(u32);
+
+/// The compiled rules of every message type validated so far. Validators
+/// are only ever added, so a [`ValidatorIndex`] stays valid.
+pub(crate) struct ValidatorCache<R: Runtime> {
+    /// Each validator, at its index, with the message type it validates.
+    validators: Vec<(MessageIndex, Built<R>)>,
+    indices: HashMap<MessageIndex, ValidatorIndex, foldhash::fast::RandomState>,
+}
+
+impl<R: Runtime> Default for ValidatorCache<R> {
+    fn default() -> Self {
+        Self {
+            validators: Vec::new(),
+            indices: HashMap::default(),
+        }
+    }
+}
+
+impl<R: Runtime> ValidatorCache<R> {
+    /// Whether the rules of `message` are compiled.
+    pub(crate) fn contains(&self, message: MessageIndex) -> bool {
+        self.indices.contains_key(&message)
+    }
+
+    /// The index of the validator of `message`, if its rules are compiled.
+    pub(crate) fn index(&self, message: MessageIndex) -> Option<ValidatorIndex> {
+        self.indices.get(&message).copied()
+    }
+
+    /// The validator of `message`, if its rules are compiled.
+    pub(crate) fn get(&self, message: MessageIndex) -> Option<&Built<R>> {
+        self.index(message).map(|index| self.validator(index).1)
+    }
+
+    /// The message type of the validator at `index`, and the validator.
+    pub(crate) fn validator(&self, index: ValidatorIndex) -> (MessageIndex, &Built<R>) {
+        let (message, built) = &self.validators[index.0 as usize];
+        (*message, built)
+    }
+
+    /// Every compiled message type, with its validator.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (MessageIndex, &Built<R>)> {
+        self.validators
+            .iter()
+            .map(|(message, built)| (*message, built))
+    }
+
+    /// The index the validator added `offset` validators from now gets.
+    pub(crate) fn next_index(&self, offset: usize) -> ValidatorIndex {
+        let index = self.validators.len() + offset;
+        ValidatorIndex(u32::try_from(index).expect("fewer than 2^32 message types are validated"))
+    }
+
+    /// Adds the validator of `message`, whose rules were not compiled yet.
+    pub(crate) fn push(&mut self, message: MessageIndex, built: Built<R>) -> ValidatorIndex {
+        let index = self.next_index(0);
+        self.validators.push((message, built));
+        self.indices.insert(message, index);
+        index
+    }
+}
+
+/// A message type whose rules are evaluated on a value after its own, with
+/// the index of its validator.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Nested {
+    pub message: MessageIndex,
+    pub validator: ValidatorIndex,
+}
 
 /// The rules of one message type. A message-typed field's messages are
 /// evaluated inside that field, after its own rules.
@@ -67,9 +139,15 @@ pub(crate) struct MessageValidator<R: Runtime> {
     pub message_type: R::MessageType,
     pub cel: Option<CelPrograms>,
     pub message_oneofs: Vec<MessageOneof<R>>,
-    pub oneofs: Vec<OneofRequired<R>>,
+    /// The oneofs whose set member is found once and alone validated.
+    pub oneofs: Vec<OneofValidator<R>>,
     /// The fields with rules, or why a field's rules did not compile.
     pub fields: Vec<Result<FieldValidator<R>, String>>,
+    /// The positions in `fields` validated on their own: neither through
+    /// a oneof nor fields whose rules do nothing. A field whose rules did
+    /// not compile is among them, to report why. Set by
+    /// [`finalize`](Self::finalize).
+    pub plain: Box<[u32]>,
 }
 
 /// A `(buf.validate.message).oneof` rule.
@@ -80,10 +158,34 @@ pub(crate) struct MessageOneof<R: Runtime> {
     pub required: bool,
 }
 
-/// A `(buf.validate.oneof).required` rule.
-pub(crate) struct OneofRequired<R: Runtime> {
-    pub element: FieldPathElement,
-    pub members: Vec<Field<R>>,
+/// A oneof, whose set member is asked for once and alone validated.
+pub(crate) struct OneofValidator<R: Runtime> {
+    pub oneof: Oneof<R>,
+    /// The oneof's path element, if it is `required`.
+    pub required: Option<FieldPathElement>,
+    /// For each member, the index in `fields` of its validator, if it is
+    /// validated through the oneof.
+    pub validators: Vec<Option<usize>>,
+    /// The field number and position in `fields` of each member that has
+    /// a validator, which the set member is looked up in. Set by
+    /// [`MessageValidator::finalize`].
+    pub by_number: Box<[(u32, u32)]>,
+}
+
+/// How a field is validated, decided once its rules are final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Plan {
+    /// No rule reads the value: only whether it is set matters, if it is
+    /// required.
+    Presence,
+    /// A singular scalar or enum whose only rules are native checks, read
+    /// through the typed getter for its kind.
+    Scalar,
+    /// A singular message whose only rules are its type's, validated
+    /// without its own value rules.
+    Message,
+    /// Anything else, read as a [`Val`](crate::protobuf::Val).
+    Generic,
 }
 
 /// The rules of one field.
@@ -97,6 +199,8 @@ pub(crate) struct FieldValidator<R: Runtime> {
     /// whole list or map.
     pub value: ValueValidator<R>,
     pub kind: FieldKind<R>,
+    /// Set by [`MessageValidator::finalize`].
+    pub plan: Plan,
 }
 
 /// How a field holds its values, and the validators of the values inside a
@@ -131,12 +235,17 @@ pub(crate) struct ValueValidator<R: Runtime> {
     pub checks: Checks,
     /// The field to validate for wrapper types.
     pub wrapper: Option<Field<R>>,
+    /// The fields of a well-known type that its rules read.
+    pub wkt: Option<WellKnownFields<R>>,
     /// The predefined CEL of the standard rules for which we do not have
     /// native rule implementations.
     pub predefined: Option<CelPrograms>,
     /// The message type of the value, whose own rules are evaluated after
     /// these.
-    pub nested: Option<MessageIndex>,
+    pub nested: Option<Nested>,
+    /// Whether any rule but the nested type's reads the value. Set by
+    /// [`MessageValidator::finalize`].
+    pub reads_value: bool,
 }
 
 impl<R: Runtime> Default for ValueValidator<R> {
@@ -145,8 +254,201 @@ impl<R: Runtime> Default for ValueValidator<R> {
             custom: None,
             checks: Checks::default(),
             wrapper: None,
+            wkt: None,
             predefined: None,
             nested: None,
+            reads_value: true,
         }
+    }
+}
+
+/// The fields of a well-known type that its standard rules read.
+pub(crate) enum WellKnownFields<R: Runtime> {
+    /// `google.protobuf.Any.type_url`.
+    Any { type_url: Field<R> },
+    /// `seconds` and `nanos` of `google.protobuf.Duration` or `Timestamp`.
+    Time { seconds: Field<R>, nanos: Field<R> },
+    /// `google.protobuf.FieldMask.paths`.
+    FieldMask { paths: Field<R> },
+}
+
+impl<R: Runtime> ValueValidator<R> {
+    /// Whether validating a value does nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.custom.is_none()
+            && matches!(self.checks, Checks::None)
+            && self.wrapper.is_none()
+            && self.wkt.is_none()
+            && self.predefined.is_none()
+            && self.nested.is_none()
+    }
+}
+
+impl<R: Runtime> FieldValidator<R> {
+    /// Whether nothing reads the field's value: its own rules are empty and
+    /// it has no item rules.
+    pub(crate) fn value_unused(&self) -> bool {
+        self.value.is_empty()
+            && match &self.kind {
+                FieldKind::Singular => true,
+                FieldKind::List { items } => items.is_none(),
+                FieldKind::Map { keys, values, .. } => keys.is_none() && values.is_none(),
+            }
+    }
+}
+
+impl<R: Runtime> MessageValidator<R> {
+    /// Whether validating a message of this type does nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cel.is_none()
+            && self.message_oneofs.is_empty()
+            && self.oneofs.iter().all(|oneof| oneof.required.is_none())
+            && self.fields.iter().all(|field| {
+                field
+                    .as_ref()
+                    .is_ok_and(|field| !field.required && field.value_unused())
+            })
+    }
+
+    /// Validates field `position` on its own rather than through its oneof,
+    /// as when its rules no longer compile.
+    pub(crate) fn ungroup(&mut self, position: usize) {
+        for oneof in &mut self.oneofs {
+            for validator in &mut oneof.validators {
+                if *validator == Some(position) {
+                    *validator = None;
+                }
+            }
+        }
+    }
+
+    /// Stops validating into the nested message types in `empty`, whose
+    /// rules do nothing. Returns whether anything changed.
+    pub(crate) fn prune(&mut self, empty: &HashSet<MessageIndex>) -> bool {
+        let mut changed = false;
+        let mut prune = |value: &mut ValueValidator<R>| {
+            // CEL rules bind the nested message, so it stays.
+            if value.custom.is_none()
+                && value.predefined.is_none()
+                && value
+                    .nested
+                    .is_some_and(|nested| empty.contains(&nested.message))
+            {
+                value.nested = None;
+                changed = true;
+            }
+        };
+        for field in self.fields.iter_mut().flatten() {
+            prune(&mut field.value);
+            match &mut field.kind {
+                FieldKind::Singular => {}
+                FieldKind::List { items } => {
+                    if let Some(items) = items {
+                        prune(&mut items.value);
+                    }
+                }
+                FieldKind::Map { keys, values, .. } => {
+                    for items in [keys, values].into_iter().flatten() {
+                        prune(&mut items.value);
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Decides how each field is validated, once its rules no longer
+    /// change: after the errors of nested types are propagated and the
+    /// nested types whose rules do nothing are pruned.
+    pub(crate) fn finalize(&mut self) {
+        for field in self.fields.iter_mut().flatten() {
+            field.finalize();
+        }
+        let fields = &self.fields;
+        let does_nothing = |position: usize| {
+            fields[position]
+                .as_ref()
+                .is_ok_and(|field| !field.required && field.value_unused())
+        };
+        for oneof in &mut self.oneofs {
+            for validator in &mut oneof.validators {
+                if validator.is_some_and(does_nothing) {
+                    *validator = None;
+                }
+            }
+            oneof.by_number = oneof
+                .oneof
+                .members()
+                .iter()
+                .zip(&oneof.validators)
+                .filter_map(|(member, &validator)| Some((member.number(), position(validator?))))
+                .collect();
+        }
+        self.oneofs
+            .retain(|oneof| oneof.required.is_some() || !oneof.by_number.is_empty());
+        let in_oneof: HashSet<usize> = self
+            .oneofs
+            .iter()
+            .flat_map(|oneof| oneof.validators.iter().flatten().copied())
+            .collect();
+        self.plain = (0..self.fields.len())
+            .filter(|&index| !in_oneof.contains(&index) && !does_nothing(index))
+            .map(position)
+            .collect();
+    }
+}
+
+/// A position in a message's fields, as compiled rules store it.
+fn position(index: usize) -> u32 {
+    u32::try_from(index).expect("a message has fewer than 2^32 fields")
+}
+
+impl<R: Runtime> FieldValidator<R> {
+    fn finalize(&mut self) {
+        self.value.finalize();
+        match &mut self.kind {
+            FieldKind::Singular => {}
+            FieldKind::List { items } => {
+                if let Some(items) = items {
+                    items.value.finalize();
+                }
+            }
+            FieldKind::Map { keys, values, .. } => {
+                for items in [keys, values].into_iter().flatten() {
+                    items.value.finalize();
+                }
+            }
+        }
+        let value = &self.value;
+        self.plan = match self.field.kind() {
+            _ if self.value_unused() => Plan::Presence,
+            Kind::Singular(Singular::Scalar(_) | Singular::Enum)
+                if value.custom.is_none()
+                    && value.predefined.is_none()
+                    && value.wrapper.is_none()
+                    && value.wkt.is_none() =>
+            {
+                Plan::Scalar
+            }
+            // An unset message is skipped, which is what ignoring an empty
+            // value with presence amounts to.
+            Kind::Singular(Singular::Message)
+                if !value.reads_value
+                    && value.nested.is_some()
+                    && self.ignore_empty
+                    && self.field.has_presence() =>
+            {
+                Plan::Message
+            }
+            _ => Plan::Generic,
+        };
+    }
+}
+
+impl<R: Runtime> ValueValidator<R> {
+    fn finalize(&mut self) {
+        // The wrapper and well-known fields are only read for the checks.
+        self.reads_value =
+            self.custom.is_some() || self.predefined.is_some() || !self.checks.is_empty();
     }
 }

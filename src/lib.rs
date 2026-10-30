@@ -229,7 +229,7 @@ impl Validator {
     ) -> PyResult<Bound<'py, PyList>> {
         violation::build_violations(
             py,
-            &invalid.error.encode_violations(),
+            &invalid.error.encode(),
             &message.0,
             &invalid.adapter,
             self.constants,
@@ -255,12 +255,13 @@ impl Validator {
     }
 
     /// Validates the message in place, returning its violations, or `None`
-    /// when the message is valid.
+    /// when the message is valid. The first validation of a type compiles
+    /// its rules.
     ///
-    /// Reading the message calls into Python, so the interpreter stays
-    /// attached throughout; the core lock is taken with the
-    /// interpreter-aware variant so a registration waiting on it cannot
-    /// deadlock with a validation that Python has preempted.
+    /// Reading the message and resolving its types call into Python, so the
+    /// interpreter stays attached throughout; the core lock is taken with
+    /// the interpreter-aware variants so a thread waiting on it cannot
+    /// deadlock with one that Python has preempted while holding it.
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
@@ -270,21 +271,44 @@ impl Validator {
         message: &Bound<'py, PyAny>,
         fail_fast: bool,
     ) -> PyResult<Option<protovalidate::ValidationError>> {
-        let core = engine
-            .core
-            .read_py_attached(py)
-            .unwrap_or_else(PoisonError::into_inner);
         let registry = engine.registry.as_ref().map(|registry| registry.bind(py));
         let source = match registry {
             Some(registry) => TypeSource::Registry(registry),
             None => TypeSource::Descriptor(adapter.descriptor(py)),
         };
         let ctx = Ctx::new(py, adapter.runtime, self.constants, message, source);
-        match core.validate_message(type_name, &ctx, fail_fast) {
+        let finish = |result| match result {
             Ok(()) => Ok(None),
             Err(Error::Validation(error)) => Ok(Some(error)),
             Err(error) => Err(to_py_err(error)),
+        };
+        {
+            let core = engine
+                .core
+                .read_py_attached(py)
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(compiled) = core.compiled_type(type_name) {
+                return finish(core.validate_compiled(compiled, &ctx, fail_fast));
+            }
         }
+        // Compiling a type another thread compiled meanwhile does nothing.
+        let compiled = engine
+            .core
+            .write_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner)
+            .compile(type_name, &ctx);
+        match compiled {
+            // Rules that did not compile are reported when validation
+            // reaches them, so a violation found first while failing fast
+            // is reported instead.
+            Ok(()) | Err(Error::Compilation(_)) => {}
+            Err(error) => return Err(to_py_err(error)),
+        }
+        let core = engine
+            .core
+            .read_py_attached(py)
+            .unwrap_or_else(PoisonError::into_inner);
+        finish(core.validate_message(type_name, &ctx, fail_fast))
     }
 }
 
