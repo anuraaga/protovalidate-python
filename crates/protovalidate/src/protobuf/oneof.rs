@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What the validator tells a runtime about a oneof it asks about.
+//! The description of a oneof that the validator passes to a runtime.
 
 use std::borrow::Cow;
 use std::fmt;
 
 use super::{Field, Message, Runtime};
 
-/// A oneof declared in the message being validated, as the validator
-/// describes it when asking a [`Message`] which of its members is set.
+/// A oneof of the message being validated. The validator passes it to
+/// [`Message::which_oneof`] to ask which of its members is set.
 ///
-/// Synthetic oneofs, which hold proto3 `optional` fields, are never
-/// described: such a field [tracks presence](Field::has_presence) instead.
+/// Synthetic oneofs, which proto3 uses for `optional` fields, are never
+/// passed; each such field [tracks its own presence](Field::has_presence).
 pub struct Oneof<R: Runtime> {
     name: Cow<'static, str>,
     index: u32,
@@ -65,8 +65,8 @@ impl<R: Runtime> Oneof<R> {
         &self.name
     }
 
-    /// The oneof's position among the message's oneofs, as declared in its
-    /// `DescriptorProto.oneof_decl`, synthetic oneofs included.
+    /// The oneof's index in its message's `DescriptorProto.oneof_decl`,
+    /// which counts synthetic oneofs.
     #[must_use]
     pub fn index(&self) -> u32 {
         self.index
@@ -79,9 +79,10 @@ impl<R: Runtime> Oneof<R> {
     }
 }
 
-/// Which member of `oneof` is set, by asking [`Message::has`] of each in
-/// turn: the default of [`Message::which_oneof`], for a runtime that does
-/// not track it, or cannot for a particular message.
+/// Returns the field number of the member of `oneof` that is set, by
+/// calling [`Message::has`] on each member in turn. This is the default
+/// implementation of [`Message::which_oneof`], for a runtime that does not
+/// track which member is set.
 ///
 /// # Errors
 ///

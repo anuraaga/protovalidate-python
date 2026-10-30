@@ -259,9 +259,10 @@ impl Validator {
     /// its rules.
     ///
     /// Reading the message and resolving its types call into Python, so the
-    /// interpreter stays attached throughout; the core lock is taken with
-    /// the interpreter-aware variants so a thread waiting on it cannot
-    /// deadlock with one that Python has preempted while holding it.
+    /// thread stays attached to the interpreter throughout. The core lock is
+    /// taken with the interpreter-aware variants, so that a thread waiting
+    /// for it cannot deadlock with a thread that Python preempted while it
+    /// held the lock.
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
@@ -291,16 +292,17 @@ impl Validator {
                 return finish(core.validate_compiled(compiled, &ctx, fail_fast));
             }
         }
-        // Compiling a type another thread compiled meanwhile does nothing.
+        // If another thread compiled the type in the meantime, this does
+        // nothing.
         let compiled = engine
             .core
             .write_py_attached(py)
             .unwrap_or_else(PoisonError::into_inner)
             .compile(type_name, &ctx);
         match compiled {
-            // Rules that did not compile are reported when validation
-            // reaches them, so a violation found first while failing fast
-            // is reported instead.
+            // Rules that did not compile are reported when validation reaches
+            // them, so when failing fast, a violation found before them is
+            // reported instead.
             Ok(()) | Err(Error::Compilation(_)) => {}
             Err(error) => return Err(to_py_err(error)),
         }

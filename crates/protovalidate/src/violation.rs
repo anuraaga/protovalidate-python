@@ -60,9 +60,9 @@ impl Violation {
         self.proto.for_key.unwrap_or_default()
     }
 
-    /// The path to the offending field, as `user.emails[0]`.
+    /// The path to the field that failed, such as `user.emails[0]`.
     ///
-    /// Empty for a message-level rule, which has no field to point at.
+    /// Empty for a message-level rule, which does not apply to a field.
     #[must_use]
     pub fn field_path(&self) -> &str {
         self.field_path
@@ -70,7 +70,7 @@ impl Violation {
     }
 
     /// The path to the rule that failed, relative to the rules of the field
-    /// [`field_path`](Self::field_path) names.
+    /// that [`field_path`](Self::field_path) names.
     #[must_use]
     pub fn rule_path(&self) -> &str {
         self.rule_path
@@ -84,8 +84,8 @@ impl Violation {
     }
 }
 
-/// `<field path>: <message>`, or `[<rule id>]` in place of an empty message,
-/// omitting an empty field path.
+/// Formats as `<field path>: <message>`. An empty message is replaced by
+/// `[<rule id>]`, and an empty field path is omitted.
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.field_path().is_empty() {
@@ -99,7 +99,8 @@ impl fmt::Display for Violation {
     }
 }
 
-/// Renders `user.emails[0]`, matching the other protovalidate implementations.
+/// Formats a path as `user.emails[0]`, matching the other protovalidate
+/// implementations.
 fn path_string(path: Option<&FieldPath>) -> String {
     let mut rendered = String::new();
     let Some(path) = path else {
@@ -123,7 +124,7 @@ fn path_string(path: Option<&FieldPath>) -> String {
             Some(Subscript::BoolKey(key)) => {
                 let _ = write!(rendered, "[{key}]");
             }
-            // Quoted, so a key containing a `.` or `]` stays unambiguous.
+            // Quoted so that a key containing `.` or `]` is unambiguous.
             Some(Subscript::StringKey(key)) => {
                 rendered.push_str("[\"");
                 for c in key.chars() {

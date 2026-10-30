@@ -42,10 +42,11 @@ impl std::error::Error for DescriptorError {}
 
 /// A failed validation.
 ///
-/// [`Validation`](Self::Validation) means the message broke its rules and
-/// carries the violations, while every other variant means validation itself
-/// did not run to completion. `E` is the error the runtime returns when it
-/// cannot read the message; see [`Runtime::Error`](crate::protobuf::Runtime::Error).
+/// [`Validation`](Self::Validation) means that the message failed
+/// validation, and carries the violations. Every other variant means that
+/// validation could not complete. `E` is the error that the runtime returns
+/// when it cannot read the message; see
+/// [`Runtime::Error`](crate::protobuf::Runtime::Error).
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error<E = Infallible> {
@@ -110,7 +111,7 @@ impl ValidationError {
         }
     }
 
-    /// The violations.
+    /// The violations, in the order they were found.
     #[must_use]
     pub fn violations(&self) -> &[Violation] {
         &self.violations
@@ -195,7 +196,7 @@ mod tests {
     fn alternate_form_lists_every_violation() {
         let error = ValidationError::new(vec![violation("bad"), violation("worse")]);
         assert_eq!(format!("{error:#}"), "validation failed:\n - bad\n - worse");
-        // The error's own alternate form goes through.
+        // An `Error` wrapping the validation error formats it the same way.
         assert_eq!(
             format!(
                 "{:#}",

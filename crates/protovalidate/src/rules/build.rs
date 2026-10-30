@@ -50,12 +50,12 @@ pub(crate) struct Builder<'a, R: Runtime> {
     env: &'a mut Env,
     /// The resolved type of every message these rules refer to.
     types: HashMap<MessageIndex, Resolved<R>>,
-    /// The validator index of every message type these rules refer to,
+    /// The validator index of every message type that these rules refer to,
     /// assigned before the validators of new types are built.
     indices: HashMap<MessageIndex, ValidatorIndex>,
 }
 
-/// A message type and its fields, as the runtime resolved them.
+/// A message type and its fields, as resolved by the runtime.
 pub(crate) struct Resolved<R: Runtime> {
     pub message_type: R::MessageType,
     /// By field number.
@@ -86,13 +86,13 @@ fn closure<R: Runtime>(
 }
 
 /// Resolves every message type that the rules of `root`, or of a type
-/// reachable from it, refer to, and the fields of each. Types that `known`
-/// already has are copied from there; the rest are looked up through
+/// reachable from it, refer to, along with the fields of each. Types already
+/// in `known` are copied from there, and the rest are looked up through
 /// `resolver`.
 ///
 /// # Errors
 ///
-/// The resolver did not know one of the types or fields.
+/// The resolver does not know one of the types or fields.
 pub(crate) fn resolve<R: Runtime>(
     descriptors: &Descriptors,
     root: MessageIndex,
@@ -433,14 +433,15 @@ impl<'a, R: Runtime> Builder<'a, R> {
     }
 
     /// Compiles the rules of `root` and of every message type reachable
-    /// from it that `cache` has none for yet, adding them to `cache`.
+    /// from it that is not yet in `cache`, and adds them to `cache`.
     pub(crate) fn build_closure(&mut self, root: MessageIndex, cache: &mut ValidatorCache<R>) {
         // The reference is copied out of `self`, so the loop below can
         // still take `&mut self`.
         let descriptors: &'a Descriptors = self.descriptors;
         let pool = &descriptors.pool;
-        // The new types take the next validator indices, in a stable order,
-        // so that their rules can refer to each other before they are built.
+        // The new types are assigned the next validator indices, in a stable
+        // order, so that their rules can refer to each other before they are
+        // built.
         let mut new: Vec<MessageIndex> = closure(descriptors, root, cache).into_iter().collect();
         new.sort_unstable();
         self.indices = new
@@ -506,8 +507,9 @@ impl<'a, R: Runtime> Builder<'a, R> {
             }
         }
 
-        // Validating into a message type whose rules do nothing is skipped,
-        // which can leave more types with rules that do nothing. A type in
+        // Validation does not descend into a nested message whose type's
+        // rules do nothing. Skipping it can leave more types whose rules do
+        // nothing, so pruning repeats until nothing changes. A type in
         // `known` never refers to one built here.
         loop {
             let known_empty = known
@@ -551,7 +553,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
     }
 
     /// Describes `field` of the message type `owner` for the runtime,
-    /// including the resolved type of the messages it holds.
+    /// including the resolved type of the messages it contains.
     fn field(&self, owner: MessageIndex, field: &FieldDescriptor) -> Field<R> {
         let message_type =
             descriptors::message_type(field).map(|idx| self.resolved(idx).message_type.clone());
@@ -623,10 +625,11 @@ impl<'a, R: Runtime> Builder<'a, R> {
         })
     }
 
-    /// The oneofs that are `required` or have members with validators, with
-    /// which of `fields` they validate. A member whose own rules require it,
-    /// or whose rules did not compile, is left to the fields, as is the
-    /// field of a synthetic oneof, which tracks presence itself.
+    /// The oneofs that are `required` or have members with validators, along
+    /// with which of `fields` each validates. A member that its own rules
+    /// require, or whose rules did not compile, is validated as a field
+    /// instead, as is the field of a synthetic oneof, which tracks its own
+    /// presence.
     fn oneofs(
         &self,
         idx: MessageIndex,
@@ -872,7 +875,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
         Ok((value, remaining))
     }
 
-    /// A nested message type, with the index of its validator.
+    /// A nested message type, along with the index of its validator.
     fn nested(&self, message: MessageIndex) -> Nested {
         let validator = *self.indices.get(&message).unwrap_or_else(|| {
             panic!(
@@ -944,9 +947,9 @@ impl<'a, R: Runtime> Builder<'a, R> {
         };
         value.wkt = self.well_known_fields(target, &standard);
         let (checks, remaining) = self.standard_checks(got, standard, prefix, enum_, predefined)?;
-        // Rules that leave nothing to check natively, such as a map's that
-        // only hold its values' rules, read nothing; only the checks read
-        // the wrapper and well-known fields.
+        // Rules with nothing to check natively, such as map rules that only
+        // contain rules for the values, read nothing. The wrapper and
+        // well-known type fields are only read by the checks.
         if checks.is_empty() {
             value.wrapper = None;
             value.wkt = None;
@@ -965,7 +968,7 @@ impl<'a, R: Runtime> Builder<'a, R> {
     }
 
     /// The fields of a well-known type that its rules read. The type check
-    /// already confirmed that the target is the type the rules are for.
+    /// has already confirmed that the rules are for the target's type.
     fn well_known_fields(
         &self,
         target: &Target<'_>,

@@ -21,11 +21,11 @@
 //! message is read in place without copying, except when it must be
 //! encoded for CEL.
 //!
-//! A runtime plugs in by implementing these, plus a [`Resolver`] that
-//! looks up its message types when rules are compiled and a [`Reader`]
-//! that hands over each message to validate. Each field the validator asks
-//! for is described by a [`Field`], and each oneof by a [`Oneof`],
-//! resolved from the descriptors registered with the validator.
+//! To support a runtime, implement these traits, along with a [`Resolver`]
+//! that looks up the runtime's message types when rules are compiled and a
+//! [`Reader`] that provides each message to validate. The validator
+//! describes each field it reads with a [`Field`] and each oneof with a
+//! [`Oneof`], both resolved from the descriptors registered with it.
 //!
 //! A read fails with the runtime's own [`Runtime::Error`], which ends the
 //! validation and reaches the caller as [`Error::Read`](crate::Error::Read).
@@ -42,7 +42,7 @@ mod oneof;
 pub use field::{Field, Kind, Scalar, Singular};
 pub use oneof::{Oneof, which_oneof_by_has};
 
-/// The resolver of a runtime whose message and field types carry nothing.
+/// The resolver for a runtime whose message and field types hold no data.
 impl<R: Runtime<MessageType = (), FieldType = ()>> Resolver<R> for () {
     fn resolve(&self, _full_name: &str) -> Result<(), R::Error> {
         Ok(())
@@ -60,8 +60,9 @@ pub trait Runtime: Sized {
     /// Whatever the runtime needs in order to read a message of one type,
     /// such as which attribute holds each field.
     type MessageType: Clone;
-    /// Whatever the runtime needs in order to read one field of a message,
-    /// resolved once when the rules compile and kept in the [`Field`].
+    /// Whatever the runtime needs in order to read one field of a message.
+    /// It is resolved once, when the rules are compiled, and stored in the
+    /// [`Field`].
     type FieldType: Clone;
     /// A message.
     type Message<'a>: Message<Self>;
@@ -71,8 +72,8 @@ pub trait Runtime: Sized {
     type Map<'a>: Map<Self>;
 }
 
-/// Looks up message types by name when their rules are compiled. Each
-/// type is looked up once, and its rules keep the result.
+/// Looks up message types by name when their rules are compiled. Each type
+/// is looked up once, and its compiled rules keep the result.
 pub trait Resolver<R: Runtime> {
     /// Looks up the message type named `full_name`, which is fully
     /// qualified and has no leading dot.
@@ -82,7 +83,7 @@ pub trait Resolver<R: Runtime> {
     /// The runtime does not know the type.
     fn resolve(&self, full_name: &str) -> Result<R::MessageType, R::Error>;
 
-    /// Looks up field `number` of a message type.
+    /// Looks up the field numbered `number` in a message type.
     ///
     /// # Errors
     ///
@@ -94,8 +95,8 @@ pub trait Resolver<R: Runtime> {
     ) -> Result<R::FieldType, R::Error>;
 }
 
-/// Provides the message of one validation, and resolves message types when
-/// rules compile on demand.
+/// Provides the message for one validation, and resolves message types if
+/// rules are compiled during validation.
 pub trait Reader<R: Runtime>: Resolver<R> {
     /// Returns the message to validate. `message_type` is the resolved type
     /// of that message.
@@ -135,10 +136,10 @@ pub trait Message<R: Runtime> {
 
     /// The value of a `bool` field.
     ///
-    /// Each getter is asked only of a field of its kind, as
-    /// [`Field::kind`] gives it. It reads the type's default when the field
+    /// Each getter is only called for a field of its kind, as given by
+    /// [`Field::kind`]. It returns the type's default value when the field
     /// is not set, and `None` when the message has no such field, as when
-    /// its runtime knows an older schema than the validator.
+    /// the runtime has an older schema than the validator.
     ///
     /// # Errors
     ///
@@ -146,7 +147,7 @@ pub trait Message<R: Runtime> {
     fn get_bool(&self, field: &Field<R>) -> Result<Option<bool>, R::Error>;
 
     /// The value of a signed integer field of any width or encoding,
-    /// widened.
+    /// widened to 64 bits.
     ///
     /// # Errors
     ///
@@ -154,21 +155,21 @@ pub trait Message<R: Runtime> {
     fn get_int(&self, field: &Field<R>) -> Result<Option<i64>, R::Error>;
 
     /// The value of an unsigned integer field of any width or encoding,
-    /// widened.
+    /// widened to 64 bits.
     ///
     /// # Errors
     ///
     /// The runtime could not read the field.
     fn get_uint(&self, field: &Field<R>) -> Result<Option<u64>, R::Error>;
 
-    /// The value of a `float` or `double` field, widened.
+    /// The value of a `float` or `double` field, widened to `f64`.
     ///
     /// # Errors
     ///
     /// The runtime could not read the field.
     fn get_double(&self, field: &Field<R>) -> Result<Option<f64>, R::Error>;
 
-    /// The number of an enum field's value.
+    /// The numeric value of an enum field.
     ///
     /// # Errors
     ///
@@ -189,42 +190,41 @@ pub trait Message<R: Runtime> {
     /// The runtime could not read the field.
     fn get_bytes<'f>(&'f self, field: &'f Field<R>) -> Result<Option<Cow<'f, [u8]>>, R::Error>;
 
-    /// The value of a singular message field, which reads as a message
-    /// with nothing set when the field is not set. The message may borrow
-    /// from `field`, keeping a reference to the message type stored there.
+    /// The value of a singular message field, which is an empty message
+    /// when the field is not set. The returned message may borrow from
+    /// `field` to keep a reference to the message type stored there.
     ///
     /// # Errors
     ///
     /// The runtime could not read the field.
     fn get_message<'f>(&'f self, field: &'f Field<R>) -> Result<Option<R::Message<'f>>, R::Error>;
 
-    /// A repeated field, which reads as empty when the field is not set.
+    /// A repeated field, which is empty when the field is not set.
     ///
     /// # Errors
     ///
     /// The runtime could not read the field.
     fn get_list<'f>(&'f self, field: &'f Field<R>) -> Result<Option<R::List<'f>>, R::Error>;
 
-    /// A map field, which reads as empty when the field is not set.
+    /// A map field, which is empty when the field is not set.
     ///
     /// # Errors
     ///
     /// The runtime could not read the field.
     fn get_map<'f>(&'f self, field: &'f Field<R>) -> Result<Option<R::Map<'f>>, R::Error>;
 
-    /// The field number of the member of `oneof` that is set, or `None`
-    /// when no member is. A number that is not among its
-    /// [members](Oneof::members), as of a member added in a newer schema
-    /// than the validator's, counts as the oneof being set by a field
-    /// without rules.
+    /// The field number of the member of `oneof` that is set, or `None` if
+    /// no member is set. A number that is not one of its
+    /// [members](Oneof::members), such as a member added in a newer schema
+    /// than the validator's, is treated as a member without rules.
     ///
-    /// The default asks [`has`](Self::has) of each member in turn, as
-    /// [`which_oneof_by_has`] does. A runtime that tracks which member is
-    /// set should answer directly.
+    /// The default implementation calls [`has`](Self::has) on each member
+    /// in turn, as [`which_oneof_by_has`] does. A runtime that tracks which
+    /// member is set should override it.
     ///
     /// # Errors
     ///
-    /// The runtime could not tell.
+    /// The runtime could not determine which member is set.
     fn which_oneof(&self, oneof: &Oneof<R>) -> Result<Option<u32>, R::Error> {
         which_oneof_by_has(self, oneof)
     }
@@ -268,10 +268,12 @@ pub trait Map<R: Runtime> {
     /// The runtime could not count them.
     fn len(&self) -> Result<usize, R::Error>;
 
-    /// Visits each entry, as key then value, until `f` breaks, returning
-    /// what it broke with. The key is read only if `f` calls it, so a
-    /// runtime should defer the work of reading it there; it has one of
-    /// the scalar types Protobuf allows for map keys.
+    /// Calls `f` with the key and value of each entry until `f` returns
+    /// [`ControlFlow::Break`], and returns the value it broke with. The key
+    /// is passed as a function that `f` calls only if it needs the key, so
+    /// a runtime should do the work of reading the key in that function.
+    /// The key has one of the scalar types that Protobuf allows for map
+    /// keys.
     ///
     /// # Errors
     ///
@@ -281,12 +283,12 @@ pub trait Map<R: Runtime> {
         F: for<'k> FnMut(Key<'k, R>, Val<'k, R>) -> ControlFlow<B>;
 }
 
-/// A map entry's key, read only if called: a map without key rules needs
-/// its keys only to describe a violation.
+/// A map entry's key, which is only read when the function is called. A map
+/// without key rules only needs its keys to describe a violation.
 pub type Key<'k, R> = &'k dyn Fn() -> Result<Val<'k, R>, <R as Runtime>::Error>;
 
-/// Reads a field of any kind as a [`Val`], through the typed getter for its
-/// kind; for the validator's generic paths.
+/// Reads a field of any kind as a [`Val`], using the typed getter for its
+/// kind. The validator uses this where it handles fields of any kind.
 pub(crate) fn read<'f, R: Runtime>(
     message: &'f R::Message<'_>,
     field: &'f Field<R>,
@@ -322,8 +324,8 @@ pub(crate) mod testing {
 
     use super::{Field, List, Map, Message, Reader, Resolver, Runtime, Val};
 
-    /// A runtime whose message types carry no information. It serves as
-    /// its own resolver and reader.
+    /// A runtime whose message types hold no data. It is its own resolver
+    /// and reader.
     pub(crate) struct Untyped;
 
     impl Runtime for Untyped {

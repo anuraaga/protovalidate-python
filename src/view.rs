@@ -43,8 +43,8 @@ pub(crate) struct PyRuntime;
 impl Runtime for PyRuntime {
     type Error = ReadError;
     type MessageType = Arc<TypeInfo>;
-    /// The field's position in its type's fields, `None` when the Python
-    /// type has no such field.
+    /// The field's position in its message type's fields, or `None` if the
+    /// Python type has no such field.
     type FieldType = Option<usize>;
     type Message<'a> = MessageView<'a>;
     type List<'a> = ListView<'a>;
@@ -226,8 +226,8 @@ impl Drop for MessageView<'_> {
 }
 
 impl<'a> MessageView<'a> {
-    /// The object, how to read the field, and its position, or `None` when
-    /// the message is unset or its type has no such field.
+    /// The message object, the field's position, and how to read the field,
+    /// or `None` if the message is unset or its type has no such field.
     fn stored(
         &self,
         field: &Field<PyRuntime>,
@@ -237,8 +237,8 @@ impl<'a> MessageView<'a> {
         Some((object, slot, info.fields.get(slot)?))
     }
 
-    /// The field's Python object. Every field of an unset message reads as
-    /// not set.
+    /// The field's Python object. Every field of an unset message is
+    /// treated as not set.
     fn fetch(&self, field: &Field<PyRuntime>) -> PyResult<Fetched<'_, 'a>> {
         if self.object.is_none() {
             return Ok(Fetched::Unset);
@@ -253,17 +253,18 @@ impl<'a> MessageView<'a> {
     }
 }
 
-/// A field as a getter finds it.
+/// The state of a field, as found by a getter.
 enum Fetched<'v, 'a> {
     Set(&'v Bound<'a, PyAny>),
-    /// Not set: the field reads as its type's default.
+    /// The field is not set and reads as its type's default value.
     Unset,
     /// The message's type has no such field.
     Missing,
 }
 
 impl<'v, 'a> Fetched<'v, 'a> {
-    /// A scalar value through `extract`, or `default` when it is not set.
+    /// A scalar value converted by `extract`, or `default` if the field is
+    /// not set.
     fn scalar<T>(
         self,
         default: T,
@@ -394,8 +395,8 @@ impl Message<PyRuntime> for MessageView<'_> {
     }
 }
 
-/// A message value: the object with its type, or an unset message that
-/// reads as one with nothing set.
+/// A message value, which is either the object and its type, or an unset
+/// message that reads as an empty message.
 fn message<'a>(
     ctx: &'a Ctx<'a>,
     value: Option<&'a Bound<'a, PyAny>>,
@@ -556,7 +557,7 @@ impl Map<PyRuntime> for MapView<'_> {
         };
         for entry in self.ctx.runtime.map_entries(object, self.ctx.constants)? {
             let (k, v) = entry?;
-            // The key is converted only if the validator reads it.
+            // The key is only converted if the validator reads it.
             let key = || Ok(scalar_value(self.key, &k)?);
             let flow = f(
                 &key,

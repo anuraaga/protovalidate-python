@@ -42,7 +42,7 @@ pub(crate) fn cel_env(set: &FileDescriptorSet) -> cel::Env {
     env
 }
 
-/// A message type whose rules a [`Validator`] has compiled, from
+/// A message type whose rules a [`Validator`] has compiled, as returned by
 /// [`Validator::compiled_type`]. It is only meaningful to the validator that
 /// returned it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -51,8 +51,8 @@ pub struct CompiledType(ValidatorIndex);
 /// Validates Protobuf messages against the rules in their descriptors,
 /// reading them through the runtime `R`.
 ///
-/// Register descriptors and compile the rules of the message types you
-/// will validate, then validate.
+/// Register your descriptors and compile the rules of the message types you
+/// will validate before validating messages.
 pub struct Validator<R: Runtime> {
     descriptors: Descriptors,
     env: cel::Env,
@@ -108,8 +108,8 @@ impl<R: Runtime> Validator<R> {
     /// `google.protobuf.FileDescriptorSet`, such as the output of `buf build
     /// -o` or `protoc --descriptor_set_out`.
     ///
-    /// Files must be ordered with imports first, which both tools guarantee
-    /// for their whole-image output.
+    /// Each file's imports must come before it, which both tools guarantee
+    /// when they output a complete image.
     ///
     /// # Errors
     ///
@@ -119,13 +119,13 @@ impl<R: Runtime> Validator<R> {
         self.add_file_set(set)
     }
 
-    /// Compiles the rules of `type_name` and of the message types it
-    /// reaches, looking up the runtime's types through `resolver`.
+    /// Compiles the rules of `type_name` and of the message types reachable
+    /// from it, looking up the runtime's types through `resolver`.
     ///
     /// # Errors
     ///
-    /// [`Error::Argument`] if the type is not registered, [`Error::Read`]
-    /// if the resolver does not know a type, [`Error::Compilation`] if the
+    /// [`Error::Argument`] if the type is not registered, [`Error::Read`] if
+    /// the resolver does not know a type, or [`Error::Compilation`] if the
     /// rules do not compile.
     pub fn compile(
         &mut self,
@@ -145,14 +145,14 @@ impl<R: Runtime> Validator<R> {
     /// # Errors
     ///
     /// [`Error::Read`] if the resolver does not know a type, or
-    /// [`Error::Compilation`] naming the types whose rules do not compile;
-    /// every other type is compiled.
+    /// [`Error::Compilation`], naming the types whose rules do not compile.
+    /// All other types are still compiled.
     pub fn compile_all(&mut self, resolver: &dyn Resolver<R>) -> Result<(), Error<R::Error>> {
         let pool = &self.descriptors.pool;
         let pending: Vec<MessageIndex> = pool
             .messages()
             .iter()
-            // A map's entry type is only ever read through the map.
+            // A map's entry type is only ever read through its map.
             .filter(|message| {
                 message
                     .options()
@@ -192,17 +192,17 @@ impl<R: Runtime> Validator<R> {
 
     /// Validates a message read through `reader`.
     ///
-    /// `type_name` is the fully-qualified message type, without a leading
-    /// dot, and must be compiled. With `fail_fast`, validation stops at the
-    /// first violation.
+    /// `type_name` is the fully qualified message type, without a leading
+    /// dot, and its rules must be compiled. With `fail_fast`, validation
+    /// stops at the first violation.
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] if the message breaks its rules;
-    /// [`Error::Read`] if the runtime could not read it; [`Error::Argument`]
-    /// if the type is not registered or compiled; [`Error::Compilation`] if
-    /// its rules do not compile; [`Error::Evaluation`] if a rule fails to
-    /// evaluate.
+    /// [`Error::Validation`] if the message fails validation,
+    /// [`Error::Read`] if the runtime could not read it, [`Error::Argument`]
+    /// if the type is not registered or not compiled, [`Error::Compilation`]
+    /// if its rules do not compile, or [`Error::Evaluation`] if a rule could
+    /// not be evaluated.
     pub fn validate_message(
         &self,
         type_name: &str,
@@ -218,11 +218,12 @@ impl<R: Runtime> Validator<R> {
         self.validate_index(index, reader, fail_fast)
     }
 
-    /// The compiled type `type_name`, to validate with
-    /// [`validate_compiled`](Self::validate_compiled) without looking up its
-    /// name each time; `None` if its rules are not compiled. As with
-    /// [`is_compiled`](Self::is_compiled), rules that failed to compile
-    /// count as compiled, and validating reports their error.
+    /// The compiled type for `type_name`, which
+    /// [`validate_compiled`](Self::validate_compiled) uses to validate
+    /// without looking up the name each time. `None` if its rules are not
+    /// compiled. As with [`is_compiled`](Self::is_compiled), rules that
+    /// failed to compile count as compiled, and validation reports the
+    /// error.
     #[must_use]
     pub fn compiled_type(&self, type_name: &str) -> Option<CompiledType> {
         let message = self.descriptors.pool.message_index(type_name)?;
@@ -230,12 +231,12 @@ impl<R: Runtime> Validator<R> {
     }
 
     /// Validates a message of a type that
-    /// [`compiled_type`](Self::compiled_type) returned for this validator;
-    /// see [`validate_message`](Self::validate_message).
+    /// [`compiled_type`](Self::compiled_type) returned for this validator.
+    /// See [`validate_message`](Self::validate_message).
     ///
     /// # Errors
     ///
-    /// As [`validate_message`](Self::validate_message).
+    /// The same as [`validate_message`](Self::validate_message).
     pub fn validate_compiled(
         &self,
         compiled: CompiledType,
@@ -274,17 +275,17 @@ impl<R: Runtime> Validator<R> {
     }
 
     fn add_file_set(&mut self, set: FileDescriptorSet) -> Result<(), DescriptorError> {
-        // The CEL pool takes each file serialized on its own.
+        // The CEL pool takes each file serialized separately.
         let files: Vec<Vec<u8>> = set.file.iter().map(buffa::Message::encode_to_vec).collect();
         self.descriptors
             .add_file_set(set)
             .map_err(DescriptorError::new)?;
-        // Not atomic since the files are in the validator's pool before the
-        // CEL pool takes them. The only conceivable case the two pools would
-        // differ is when passing manually crafted descriptors not created by
-        // protoc, buf, etc. Even then, the error is returned here, and a
-        // rule reaching a type the CEL pool lacks fails with "unknown message
-        // type" rather than running against the wrong schema.
+        // This is not atomic, since the files are added to the validator's
+        // pool before the CEL pool. The two pools could only differ for
+        // hand-crafted descriptors that protoc, buf and similar tools would
+        // not produce. Even then, the error is returned here, and a rule
+        // that reaches a type missing from the CEL pool fails with "unknown
+        // message type" rather than running against the wrong schema.
         for file in &files {
             self.env
                 .add_file(file)
@@ -305,7 +306,7 @@ impl<R: Runtime> Validator<R> {
     }
 
     /// Compiles the rules of `root` and of every type reachable from it
-    /// that has none yet.
+    /// whose rules are not compiled yet.
     fn compile_index(
         &mut self,
         root: MessageIndex,
@@ -367,7 +368,8 @@ mod tests {
         assert!(validator.compiled_type("unknown.Type").is_none());
     }
 
-    /// A file with a message whose rules compile and one whose do not.
+    /// A file with one message whose rules compile and one whose rules do
+    /// not.
     fn mixed_schema() -> Vec<u8> {
         use buffa::{ExtensionSet as _, Message as _};
         use buffa_descriptor::generated::descriptor::field_descriptor_proto::{Label, Type};
@@ -446,7 +448,7 @@ mod tests {
         assert!(matches!(error, crate::Error::Compilation(_)), "{error}");
         assert!(error.to_string().contains("test.Bad"), "{error}");
         assert!(!error.to_string().contains("test.Good"), "{error}");
-        // The types whose rules compiled are usable regardless.
+        // The types whose rules compiled can still be used.
         assert!(validator.is_compiled("test.Good"));
         let error = validator
             .validate_message("test.Bad", &Untyped, false)
@@ -463,6 +465,8 @@ mod tests {
     /// - `test.Choice` has a required oneof of two `test.Inner` fields.
     /// - `test.Nest` has a repeated `test.Inner` field `items` and a
     ///   `map<string, test.Inner>` field `named`.
+    /// - `test.Idle` has a oneof of two `test.Empty` fields.
+    /// - `test.Needs` has a required message field `inner` of `test.Inner`.
     fn read_schema() -> Vec<u8> {
         use buffa::{ExtensionSet as _, Message as _};
         use buffa_descriptor::generated::descriptor::field_descriptor_proto::{Label, Type};
@@ -560,8 +564,8 @@ mod tests {
         .encode_to_vec()
     }
 
-    /// A message with a oneof `kind` of two fields of `member_type`, `a`
-    /// and `b`.
+    /// A message with a oneof `kind` of two fields, `a` and `b`, of type
+    /// `member_type`.
     fn oneof_message(
         name: &str,
         member_type: &str,
@@ -608,8 +612,8 @@ mod tests {
         }
     }
 
-    /// `test.Nest`, in [`read_schema`]. Its map `named` has map rules with
-    /// only rules for its values, which read nothing.
+    /// `test.Nest`, from [`read_schema`]. Its map `named` has map rules that
+    /// only contain rules for its values, so they read nothing themselves.
     fn nest_message() -> buffa_descriptor::generated::descriptor::DescriptorProto {
         use buffa_descriptor::generated::descriptor::field_descriptor_proto::{Label, Type};
         use buffa_descriptor::generated::descriptor::{
@@ -673,9 +677,10 @@ mod tests {
         options
     }
 
-    /// A runtime whose messages have every field set, or none, which counts
-    /// presence and oneof checks and fails the test if a field's value is
-    /// read. Its oneofs may report a member the validator does not know.
+    /// A runtime whose messages have either every field set or none. It
+    /// counts presence and oneof checks, and fails the test if a field's
+    /// value is read. Its oneofs can report a member that the validator does
+    /// not know of.
     mod probe {
         use std::cell::Cell;
         use std::convert::Infallible;
@@ -683,7 +688,7 @@ mod tests {
 
         use crate::protobuf::{Field, List, Map, Message, Oneof, Reader, Resolver, Runtime, Val};
 
-        /// A field number that no member of the schema's oneofs has.
+        /// A field number that no oneof member in the schema has.
         pub(super) const UNKNOWN_MEMBER: u32 = 99;
 
         pub(super) struct Probe {
@@ -704,7 +709,7 @@ mod tests {
             }
 
             /// A probe whose oneofs have a member set that the validator
-            /// does not know.
+            /// does not know of.
             pub(super) fn unknown_member() -> Self {
                 Self {
                     unknown_member: true,
@@ -836,7 +841,7 @@ mod tests {
         }
     }
 
-    /// Validates a message of `type_name` through `probe`.
+    /// Validates a message of type `type_name` through `probe`.
     fn probe(type_name: &str, probe: &probe::Probe) -> Result<(), crate::Error> {
         let mut validator = Validator::<probe::Probe>::new();
         validator
@@ -946,8 +951,8 @@ mod tests {
     }
 
     /// A runtime for `test.Nest` whose map `named` has one entry, `"k"`,
-    /// with a valid or invalid `test.Inner`, counting reads of the key and
-    /// of the map's size.
+    /// whose value is a valid or invalid `test.Inner`. It counts reads of
+    /// the key and of the map's size.
     mod keys {
         use std::borrow::Cow;
         use std::cell::Cell;

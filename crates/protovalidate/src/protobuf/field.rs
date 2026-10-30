@@ -133,7 +133,7 @@ impl<R: Runtime> Field<R> {
         self.message_type.as_ref()
     }
 
-    /// The runtime's own handle for the field, from
+    /// The runtime's representation of the field, as returned by
     /// [`Resolver::resolve_field`](super::Resolver::resolve_field).
     #[must_use]
     pub fn field_type(&self) -> &R::FieldType {

@@ -82,7 +82,8 @@ impl<T, E> Read<T, E> for Result<T, E> {
 }
 
 /// The violations found so far. A violation's field path is built as the
-/// walk returns from each field, so a valid message costs no path.
+/// walk returns from each field, so validating a valid message builds no
+/// paths.
 pub(crate) struct Violations {
     fail_fast: bool,
     /// Whether the value being validated is a map key.
@@ -99,9 +100,9 @@ impl Violations {
         }
     }
 
-    /// Records a violation of the value being validated, whose field path
-    /// the fields the walk returns through fill in. When failing fast, the
-    /// walk stops here.
+    /// Records a violation of the value being validated. Its field path is
+    /// filled in by the fields that the walk returns through. When failing
+    /// fast, the walk stops here.
     fn push<E>(
         &mut self,
         id: &str,
@@ -126,10 +127,11 @@ impl Violations {
         }
     }
 
-    /// Appends `element` to the field path of each violation recorded
-    /// since index `recorded`, subscripted by `subscript`, which is only
-    /// computed if there is such a violation. Paths are built from the
-    /// innermost field out, and put in order by [`Self::finish`].
+    /// Appends `element`, with the subscript that `subscript` computes, to
+    /// the field path of each violation recorded since index `recorded`.
+    /// The subscript is only computed if there is such a violation. Paths
+    /// are built from the innermost field outward, and [`Self::finish`]
+    /// puts them in order.
     fn append<E>(
         &mut self,
         recorded: usize,
@@ -155,7 +157,7 @@ impl Violations {
         Ok(())
     }
 
-    /// The violations, with their field paths from the root.
+    /// The violations, with their field paths starting from the root.
     fn finish(mut self) -> Vec<Violation> {
         for violation in &mut self.list {
             if let Some(field) = violation.field.as_option_mut() {
@@ -193,8 +195,8 @@ impl<'a, R: Runtime> Walk<'a, R> {
         }
     }
 
-    /// Validates `message`, of type `message_type`, returning the
-    /// violations. The message is serialized, for CEL, only if a rule needs
+    /// Validates `message`, of type `message_type`, and returns the
+    /// violations. The message is only serialized for CEL if a rule needs
     /// it.
     pub(crate) fn validate(
         mut self,
@@ -209,8 +211,8 @@ impl<'a, R: Runtime> Walk<'a, R> {
         }
     }
 
-    /// Runs `f` within the field of `element`, which the field paths of the
-    /// violations it records go through.
+    /// Runs `f` within the field of `element`, adding that field to the
+    /// paths of the violations that `f` records.
     fn at<T>(
         &mut self,
         element: &'a FieldPathElement,
@@ -219,8 +221,9 @@ impl<'a, R: Runtime> Walk<'a, R> {
         self.at_item(element, || Ok(element.subscript.clone()), f)
     }
 
-    /// As [`at`](Self::at), within one item of a container field, which
-    /// `subscript` computes only if `f` records a violation.
+    /// Like [`at`](Self::at), but within one item of a container field. The
+    /// item's subscript is only computed, by `subscript`, if `f` records a
+    /// violation.
     fn at_item<T>(
         &mut self,
         element: &'a FieldPathElement,
@@ -228,14 +231,15 @@ impl<'a, R: Runtime> Walk<'a, R> {
         f: impl FnOnce(&mut Self) -> Result<T, Abort<R::Error>>,
     ) -> Result<T, Abort<R::Error>> {
         let recorded = self.out.list.len();
-        // Whether `f` failed or the walk stops, its violations are paths
-        // through this field.
+        // Whether `f` failed or the walk is stopping, the violations it
+        // recorded are within this field.
         let result = f(self);
         let appended = self.out.append(recorded, element, subscript);
         match (result, appended) {
-            // An error from `f` came first.
+            // An error from `f` happened first, so it takes precedence.
             (Err(Abort::Error(error)), _) => Err(Abort::Error(error)),
-            // Reading the subscript failed, even if the walk was stopping.
+            // Reading the subscript failed, which is reported even if the
+            // walk was already stopping.
             (_, Err(error)) => Err(error),
             (result, Ok(())) => result,
         }
@@ -402,8 +406,8 @@ impl<R: Runtime> MessageOneof<R> {
 }
 
 impl<R: Runtime> OneofValidator<R> {
-    /// Validates the set member, if any, or reports that none is when the
-    /// oneof is required.
+    /// Validates the set member, if there is one. If none is set and the
+    /// oneof is required, reports a violation.
     fn validate<'a>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -412,7 +416,7 @@ impl<R: Runtime> OneofValidator<R> {
         fields: &'a [Result<FieldValidator<R>, String>],
     ) -> Result<(), Abort<R::Error>> {
         if let Some(number) = message.which_oneof(&self.oneof).read()? {
-            // A member the validator does not know has no rules.
+            // A member that the validator does not know of has no rules.
             let Some(&(_, position)) = self.by_number.iter().find(|(member, _)| *member == number)
             else {
                 return Ok(());
@@ -436,9 +440,9 @@ impl<R: Runtime> OneofValidator<R> {
 }
 
 impl<R: Runtime> FieldValidator<R> {
-    /// Validates a [`Plan::Scalar`] field, reading it through the typed
-    /// getter for its kind, without a [`Val`]. `None` when its checks are
-    /// not for its kind, which the generic path reports.
+    /// Validates a [`Plan::Scalar`] field by reading it through the typed
+    /// getter for its kind, without a [`Val`]. Returns `None` if its checks
+    /// are not for its kind, which the generic path then reports.
     fn validate_scalar<'a>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -516,8 +520,9 @@ impl<R: Runtime> FieldValidator<R> {
         })
     }
 
-    /// The presence handling and checks of [`Self::validate_scalar`], for
-    /// a value of type `T`, which `get` reads only if it is used.
+    /// The presence handling and checks of [`Self::validate_scalar`] for a
+    /// value of type `T`. The value is only read, by `get`, if it is
+    /// needed.
     fn scalar<'a, T: Default>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -543,14 +548,14 @@ impl<R: Runtime> FieldValidator<R> {
                 return Ok(());
             }
         }
-        // A field the runtime's message lacks reads as its default, as on
-        // the generic path.
+        // A field that the runtime's message does not have reads as its
+        // default value, as on the generic path.
         let value = got.unwrap_or_default();
         walk.at(&self.element, |walk| check(&mut walk.out, &value))
     }
 
-    /// Validates a [`Plan::Presence`] field, whose value no rule reads: it
-    /// only needs to be present, if it is required.
+    /// Validates a [`Plan::Presence`] field, whose value no rule reads. It
+    /// only needs to be set, and only if it is required.
     fn validate_presence<'a>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -571,9 +576,9 @@ impl<R: Runtime> FieldValidator<R> {
         self.missing(walk)
     }
 
-    /// Validates a [`Plan::Message`] field: an unset one is skipped, unless
-    /// it is required, and a set one is validated by its type's rules alone,
-    /// without a [`Val`].
+    /// Validates a [`Plan::Message`] field. An unset field is skipped unless
+    /// it is required, and a set field is validated by its message type's
+    /// rules alone, without a [`Val`].
     fn validate_message<'a>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -591,7 +596,8 @@ impl<R: Runtime> FieldValidator<R> {
                 Ok(())
             };
         }
-        // A field the runtime's message lacks holds no message to validate.
+        // A field that the runtime's message does not have holds no message
+        // to validate.
         let Some(sub) = message.get_message(&self.field).read()? else {
             return Ok(());
         };
@@ -612,8 +618,8 @@ impl<R: Runtime> FieldValidator<R> {
         })
     }
 
-    /// Validates one field. `present` is whether it is set, when the caller
-    /// already knows, as for a oneof's set member.
+    /// Validates one field. `present` is whether the field is set, if the
+    /// caller already knows, as it does for the set member of a oneof.
     fn validate<'a>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -636,15 +642,16 @@ impl<R: Runtime> FieldValidator<R> {
         {
             return result;
         }
-        // An unset field whose value goes unused is not read, which skips
-        // the unset members of oneofs and message fields in particular.
+        // An unset field whose value would not be used is not read. In
+        // particular, this skips unset oneof members and message fields.
         let value = if present == Some(false) && (self.required || self.ignore_empty) {
             None
         } else {
             read::<R>(message, &self.field).read()?
         };
-        // Whether the field is set only matters if it is required or
-        // ignored when empty, and for a container takes reading its size.
+        // Whether the field is set only matters if it is required or ignored
+        // when empty, and for a container, finding out means reading its
+        // size.
         if self.required || self.ignore_empty {
             let set = match present {
                 Some(present) => present,
@@ -695,7 +702,7 @@ impl<R: Runtime> FieldValidator<R> {
 
 impl<R: Runtime> ItemValidator<R> {
     /// Validates each element of a list, of kind `element`, as an item of
-    /// the field of `field`, subscripted by its index.
+    /// the field `field`, with its index as the subscript.
     fn validate_list<'a>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -884,8 +891,8 @@ impl Checks {
     }
 
     /// `element_wrapper` is the `value` field of a list's wrapper elements,
-    /// which `unique` compares through. `wkt` holds the fields the rules of
-    /// a well-known type read.
+    /// which `unique` compares. `wkt` holds the fields that the rules of a
+    /// well-known type read.
     fn check_value<R: Runtime>(
         &self,
         walk: &mut Walk<'_, R>,
@@ -1177,7 +1184,8 @@ fn bytes_of<'v, R: Runtime>(value: Option<&'v Val<'_, R>>) -> Result<&'v [u8], A
     }
 }
 
-/// The rules of a well-known type were compiled without its fields.
+/// The error for rules of a well-known type that were compiled without the
+/// fields they read.
 fn missing_fields<E>(what: &str) -> Abort<E> {
     Error::Unexpected(format!(
         "the {what} rules were compiled without the fields they read"

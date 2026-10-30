@@ -82,8 +82,8 @@ pub(crate) enum Checks {
 }
 
 impl Checks {
-    /// Whether there is nothing to check, as when a rules message is set
-    /// with no native rules in it.
+    /// Whether there is nothing to check, as when a rules message is set but
+    /// contains no rules that are checked natively.
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::None => true,
@@ -331,19 +331,19 @@ fn chars(s: &str) -> u64 {
 }
 
 // A string of `b` bytes has between `b / 4` (rounded up) and `b` chars, which
-// settles most length rules without counting.
+// is enough to decide most length rules without counting.
 
-/// Whether `s` certainly has at least `n` chars.
+/// Whether `s` is known to have at least `n` chars.
 fn chars_at_least(s: &str, n: u64) -> bool {
     (s.len() as u64).div_ceil(4) >= n
 }
 
-/// Whether `s` certainly has at most `n` chars.
+/// Whether `s` is known to have at most `n` chars.
 fn chars_at_most(s: &str, n: u64) -> bool {
     s.len() as u64 <= n
 }
 
-/// Whether `s` could have exactly `n` chars.
+/// Whether `s` might have exactly `n` chars.
 fn chars_may_be(s: &str, n: u64) -> bool {
     let bytes = s.len() as u64;
     bytes >= n && bytes.div_ceil(4) <= n
