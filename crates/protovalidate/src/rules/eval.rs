@@ -39,7 +39,7 @@ use crate::Error;
 use crate::cel::{self, Env, Frame, ScalarValue, This, Value};
 use crate::descriptors::{self, Descriptors, Schema};
 use crate::protobuf::{
-    Field, Key, Kind, List as _, Map as _, Message as _, Runtime, Scalar, Singular, Val, read,
+    Field, Key, Kind, List as _, Map as _, Message as _, Runtime, Scalar, Singular, Val, kind, read,
 };
 use crate::validate::__buffa::oneof::field_path_element::Subscript;
 use crate::validate::{FieldPath, FieldPathElement, Violation};
@@ -440,9 +440,10 @@ impl<R: Runtime> OneofValidator<R> {
 }
 
 impl<R: Runtime> FieldValidator<R> {
-    /// Validates a [`Plan::Scalar`] field by reading it through the typed
-    /// getter for its kind, without a [`Val`]. Returns `None` if its checks
-    /// are not for its kind, which the generic path then reports.
+    /// Validates a [`Plan::Scalar`] field, reading its value with
+    /// [`Message::get`](crate::protobuf::Message::get) rather than as a
+    /// [`Val`]. Returns `None` if the field's checks do not match its kind;
+    /// the generic path then reports the mismatch.
     fn validate_scalar<'a>(
         &'a self,
         walk: &mut Walk<'a, R>,
@@ -458,42 +459,42 @@ impl<R: Runtime> FieldValidator<R> {
             (Checks::Bool(checks), Singular::Scalar(Scalar::Bool)) => self.scalar(
                 walk,
                 present,
-                || message.get_bool(field),
+                || message.get::<kind::Bool>(field),
                 |value| *value,
                 |out, value| run(checks, value, out),
             ),
             (Checks::Int(checks), Singular::Scalar(_)) => self.scalar(
                 walk,
                 present,
-                || message.get_int(field),
+                || message.get::<kind::Int>(field),
                 |value| *value != 0,
                 |out, value| run(checks, value, out),
             ),
             (Checks::Uint(checks), Singular::Scalar(_)) => self.scalar(
                 walk,
                 present,
-                || message.get_uint(field),
+                || message.get::<kind::Uint>(field),
                 |value| *value != 0,
                 |out, value| run(checks, value, out),
             ),
             (Checks::Double(checks), Singular::Scalar(_)) => self.scalar(
                 walk,
                 present,
-                || message.get_double(field),
+                || message.get::<kind::Double>(field),
                 |value| value.to_bits() != 0,
                 |out, value| run(checks, value, out),
             ),
             (Checks::String(checks), Singular::Scalar(Scalar::String)) => self.scalar(
                 walk,
                 present,
-                || message.get_str(field),
+                || message.get::<kind::Str>(field),
                 |value| !value.is_empty(),
                 |out, value| run(checks, &**value, out),
             ),
             (Checks::Bytes(checks), Singular::Scalar(Scalar::Bytes)) => self.scalar(
                 walk,
                 present,
-                || message.get_bytes(field),
+                || message.get::<kind::Bytes>(field),
                 |value| !value.is_empty(),
                 |out, value| run(checks, &**value, out),
             ),
@@ -502,7 +503,7 @@ impl<R: Runtime> FieldValidator<R> {
                 self.scalar(
                     walk,
                     present,
-                    || message.get_enum(field),
+                    || message.get::<kind::Enum>(field),
                     |value| *value != 0,
                     |out, &number| {
                         run_with(checks, out, |test| {
@@ -598,7 +599,7 @@ impl<R: Runtime> FieldValidator<R> {
         }
         // A field that the runtime's message does not have holds no message
         // to validate.
-        let Some(sub) = message.get_message(&self.field).read()? else {
+        let Some(sub) = message.get::<kind::Message>(&self.field).read()? else {
             return Ok(());
         };
         let Some(nested) = self.value.nested else {

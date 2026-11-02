@@ -183,8 +183,9 @@ pub(crate) enum Plan {
     /// No rule reads the value. Only whether it is set matters, and only if
     /// it is required.
     Presence,
-    /// A singular scalar or enum whose only rules are native checks. It is
-    /// read through the typed getter for its kind.
+    /// A singular scalar or enum field whose only rules are native checks.
+    /// Its value is read directly as its kind, rather than as a
+    /// [`Val`](crate::protobuf::Val).
     Scalar,
     /// A singular message field with no rules of its own, only those of its
     /// message type.

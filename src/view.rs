@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use protovalidate::protobuf::{
     Field, Key, Kind, List, Map, Message, Reader, Resolver, Runtime, Scalar, Singular, Val,
+    ValueKind, ValueKindId,
 };
 use pyo3::Borrowed;
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -251,10 +252,134 @@ impl<'a> MessageView<'a> {
             None => Fetched::Unset,
         })
     }
+
+    fn read_bool<T>(
+        &self,
+        field: &Field<PyRuntime>,
+        into: impl FnOnce(bool) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        self.fetch(field)?
+            .scalar(false, PyAnyMethods::extract, into)
+    }
+
+    fn read_int<T>(
+        &self,
+        field: &Field<PyRuntime>,
+        into: impl FnOnce(i64) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        self.fetch(field)?.scalar(0, PyAnyMethods::extract, into)
+    }
+
+    fn read_uint<T>(
+        &self,
+        field: &Field<PyRuntime>,
+        into: impl FnOnce(u64) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        self.fetch(field)?.scalar(0, PyAnyMethods::extract, into)
+    }
+
+    fn read_double<T>(
+        &self,
+        field: &Field<PyRuntime>,
+        into: impl FnOnce(f64) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        self.fetch(field)?.scalar(0.0, PyAnyMethods::extract, into)
+    }
+
+    fn read_enum<T>(
+        &self,
+        field: &Field<PyRuntime>,
+        into: impl FnOnce(i32) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        self.fetch(field)?.scalar(0, PyAnyMethods::extract, into)
+    }
+
+    fn read_str<'f, T>(
+        &'f self,
+        field: &'f Field<PyRuntime>,
+        into: impl FnOnce(Cow<'f, str>) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        self.fetch(field)?.scalar(
+            Cow::Borrowed(""),
+            |value| Ok(Cow::Borrowed(value.cast::<PyString>()?.to_str()?)),
+            into,
+        )
+    }
+
+    fn read_bytes<'f, T>(
+        &'f self,
+        field: &'f Field<PyRuntime>,
+        into: impl FnOnce(Cow<'f, [u8]>) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        self.fetch(field)?.scalar(
+            Cow::Borrowed(&[][..]),
+            |value| Ok(Cow::Borrowed(value.cast::<PyBytes>()?.as_bytes())),
+            into,
+        )
+    }
+
+    fn read_message<'f, T>(
+        &'f self,
+        field: &'f Field<PyRuntime>,
+        into: impl FnOnce(MessageView<'f>) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        let message_type = field.message_type().map(Arc::as_ref);
+        let value = match self.fetch(field)? {
+            Fetched::Set(value) => Some(value),
+            Fetched::Unset => None,
+            Fetched::Missing => return Ok(None),
+        };
+        Ok(into(message(self.ctx, value, message_type)?))
+    }
+
+    fn read_list<'f, T>(
+        &'f self,
+        field: &'f Field<PyRuntime>,
+        into: impl FnOnce(ListView<'f>) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        let Kind::List(element) = field.kind() else {
+            return Ok(None);
+        };
+        let object = match self.fetch(field)? {
+            Fetched::Set(value) => Some(value),
+            Fetched::Unset => None,
+            Fetched::Missing => return Ok(None),
+        };
+        Ok(into(ListView {
+            ctx: self.ctx,
+            element,
+            object,
+            message_type: field.message_type().map(Arc::as_ref),
+            items: OnceCell::new(),
+        }))
+    }
+
+    fn read_map<'f, T>(
+        &'f self,
+        field: &'f Field<PyRuntime>,
+        into: impl FnOnce(MapView<'f>) -> Option<T>,
+    ) -> Result<Option<T>, ReadError> {
+        let Kind::Map { key, value } = field.kind() else {
+            return Ok(None);
+        };
+        let object = match self.fetch(field)? {
+            Fetched::Set(value) => Some(value),
+            Fetched::Unset => None,
+            Fetched::Missing => return Ok(None),
+        };
+        Ok(into(MapView {
+            ctx: self.ctx,
+            key,
+            element: value,
+            object,
+            message_type: field.message_type().map(Arc::as_ref),
+        }))
+    }
 }
 
-/// The state of a field, as found by a getter.
+/// Whether a field is set, as found when reading it.
 enum Fetched<'v, 'a> {
+    /// The field is set to this object.
     Set(&'v Bound<'a, PyAny>),
     /// The field is not set and reads as its type's default value.
     Unset,
@@ -263,16 +388,17 @@ enum Fetched<'v, 'a> {
 }
 
 impl<'v, 'a> Fetched<'v, 'a> {
-    /// A scalar value converted by `extract`, or `default` if the field is
-    /// not set.
-    fn scalar<T>(
+    /// Converts the field's object with `extract`, or uses `default` if the
+    /// field is not set, and passes the result to `into`.
+    fn scalar<T, U>(
         self,
         default: T,
         extract: impl FnOnce(&'v Bound<'a, PyAny>) -> PyResult<T>,
-    ) -> Result<Option<T>, ReadError> {
+        into: impl FnOnce(T) -> Option<U>,
+    ) -> Result<Option<U>, ReadError> {
         Ok(match self {
-            Self::Set(value) => Some(extract(value)?),
-            Self::Unset => Some(default),
+            Self::Set(value) => into(extract(value)?),
+            Self::Unset => into(default),
             Self::Missing => None,
         })
     }
@@ -280,8 +406,7 @@ impl<'v, 'a> Fetched<'v, 'a> {
 
 impl Message<PyRuntime> for MessageView<'_> {
     fn encode(&self) -> Result<impl AsRef<[u8]>, ReadError> {
-        // An unset message reads as one with nothing set, which encodes to
-        // nothing.
+        // An unset message is empty, so it encodes to no bytes.
         Ok(match self.object {
             Some((object, _)) => self.ctx.runtime.serialize(object, self.ctx.constants)?,
             None => PyBytes::new(self.ctx.py, &[]),
@@ -301,97 +426,26 @@ impl Message<PyRuntime> for MessageView<'_> {
         )?)
     }
 
-    fn get_bool(&self, field: &Field<PyRuntime>) -> Result<Option<bool>, ReadError> {
-        self.fetch(field)?.scalar(false, PyAnyMethods::extract)
-    }
-
-    fn get_int(&self, field: &Field<PyRuntime>) -> Result<Option<i64>, ReadError> {
-        self.fetch(field)?.scalar(0, PyAnyMethods::extract)
-    }
-
-    fn get_uint(&self, field: &Field<PyRuntime>) -> Result<Option<u64>, ReadError> {
-        self.fetch(field)?.scalar(0, PyAnyMethods::extract)
-    }
-
-    fn get_double(&self, field: &Field<PyRuntime>) -> Result<Option<f64>, ReadError> {
-        self.fetch(field)?.scalar(0.0, PyAnyMethods::extract)
-    }
-
-    fn get_enum(&self, field: &Field<PyRuntime>) -> Result<Option<i32>, ReadError> {
-        self.fetch(field)?.scalar(0, PyAnyMethods::extract)
-    }
-
-    fn get_str<'f>(
+    fn get<'f, K: ValueKind<PyRuntime>>(
         &'f self,
         field: &'f Field<PyRuntime>,
-    ) -> Result<Option<Cow<'f, str>>, ReadError> {
-        self.fetch(field)?.scalar(Cow::Borrowed(""), |value| {
-            Ok(Cow::Borrowed(value.cast::<PyString>()?.to_str()?))
-        })
-    }
-
-    fn get_bytes<'f>(
-        &'f self,
-        field: &'f Field<PyRuntime>,
-    ) -> Result<Option<Cow<'f, [u8]>>, ReadError> {
-        self.fetch(field)?.scalar(Cow::Borrowed(&[][..]), |value| {
-            Ok(Cow::Borrowed(value.cast::<PyBytes>()?.as_bytes()))
-        })
-    }
-
-    fn get_message<'f>(
-        &'f self,
-        field: &'f Field<PyRuntime>,
-    ) -> Result<Option<MessageView<'f>>, ReadError> {
-        let message_type = field.message_type().map(Arc::as_ref);
-        let value = match self.fetch(field)? {
-            Fetched::Set(value) => Some(value),
-            Fetched::Unset => None,
-            Fetched::Missing => return Ok(None),
-        };
-        Ok(Some(message(self.ctx, value, message_type)?))
-    }
-
-    fn get_list<'f>(
-        &'f self,
-        field: &'f Field<PyRuntime>,
-    ) -> Result<Option<ListView<'f>>, ReadError> {
-        let Kind::List(element) = field.kind() else {
-            return Ok(None);
-        };
-        let object = match self.fetch(field)? {
-            Fetched::Set(value) => Some(value),
-            Fetched::Unset => None,
-            Fetched::Missing => return Ok(None),
-        };
-        Ok(Some(ListView {
-            ctx: self.ctx,
-            element,
-            object,
-            message_type: field.message_type().map(Arc::as_ref),
-            items: OnceCell::new(),
-        }))
-    }
-
-    fn get_map<'f>(
-        &'f self,
-        field: &'f Field<PyRuntime>,
-    ) -> Result<Option<MapView<'f>>, ReadError> {
-        let Kind::Map { key, value } = field.kind() else {
-            return Ok(None);
-        };
-        let object = match self.fetch(field)? {
-            Fetched::Set(value) => Some(value),
-            Fetched::Unset => None,
-            Fetched::Missing => return Ok(None),
-        };
-        Ok(Some(MapView {
-            ctx: self.ctx,
-            key,
-            element: value,
-            object,
-            message_type: field.message_type().map(Arc::as_ref),
-        }))
+    ) -> Result<Option<K::Value<'f>>, ReadError> {
+        // `K::ID` is a constant here, so only its arm is compiled. Each read
+        // passes the value it builds straight to the constructor, because
+        // moving a view through an intermediate `Result` or `Option` would
+        // copy it through the stack.
+        match K::ID {
+            ValueKindId::Bool => self.read_bool(field, K::from_bool),
+            ValueKindId::Int => self.read_int(field, K::from_int),
+            ValueKindId::Uint => self.read_uint(field, K::from_uint),
+            ValueKindId::Double => self.read_double(field, K::from_double),
+            ValueKindId::Enum => self.read_enum(field, K::from_enum),
+            ValueKindId::Str => self.read_str(field, K::from_str),
+            ValueKindId::Bytes => self.read_bytes(field, K::from_bytes),
+            ValueKindId::Message => self.read_message(field, K::from_message),
+            ValueKindId::List => self.read_list(field, K::from_list),
+            ValueKindId::Map => self.read_map(field, K::from_map),
+        }
     }
 }
 

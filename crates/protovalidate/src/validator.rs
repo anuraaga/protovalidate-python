@@ -686,7 +686,9 @@ mod tests {
         use std::convert::Infallible;
         use std::ops::ControlFlow;
 
-        use crate::protobuf::{Field, List, Map, Message, Oneof, Reader, Resolver, Runtime, Val};
+        use crate::protobuf::{
+            Field, List, Map, Message, Oneof, Reader, Resolver, Runtime, Val, ValueKind,
+        };
 
         /// A field number that no oneof member in the schema has.
         pub(super) const UNKNOWN_MEMBER: u32 = 99;
@@ -754,46 +756,10 @@ mod tests {
                 Ok(self.0.set)
             }
 
-            fn get_bool(&self, field: &Field<Probe>) -> Result<Option<bool>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_int(&self, field: &Field<Probe>) -> Result<Option<i64>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_uint(&self, field: &Field<Probe>) -> Result<Option<u64>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_double(&self, field: &Field<Probe>) -> Result<Option<f64>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_enum(&self, field: &Field<Probe>) -> Result<Option<i32>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_str<'f>(
+            fn get<'f, K: ValueKind<Probe>>(
                 &'f self,
                 field: &'f Field<Probe>,
-            ) -> Result<Option<std::borrow::Cow<'f, str>>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_bytes<'f>(
-                &'f self,
-                field: &'f Field<Probe>,
-            ) -> Result<Option<std::borrow::Cow<'f, [u8]>>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_message<'f>(
-                &'f self,
-                field: &'f Field<Probe>,
-            ) -> Result<Option<ProbeMessage<'f>>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_list<'f>(
-                &'f self,
-                field: &'f Field<Probe>,
-            ) -> Result<Option<Never>, Infallible> {
-                panic!("field {} is read", field.name())
-            }
-            fn get_map<'f>(&'f self, field: &'f Field<Probe>) -> Result<Option<Never>, Infallible> {
+            ) -> Result<Option<K::Value<'f>>, Infallible> {
                 panic!("field {} is read", field.name())
             }
 
@@ -958,7 +924,9 @@ mod tests {
         use std::cell::Cell;
         use std::ops::ControlFlow;
 
-        use crate::protobuf::{Field, Key, List, Map, Message, Reader, Resolver, Runtime, Val};
+        use crate::protobuf::{
+            Field, Key, List, Map, Message, Reader, Resolver, Runtime, Val, ValueKind, ValueKindId,
+        };
 
         pub(super) struct Keys {
             valid: bool,
@@ -1017,56 +985,19 @@ mod tests {
             fn has(&self, _field: &Field<Keys>) -> Result<bool, String> {
                 Ok(false)
             }
-            fn get_bool(&self, field: &Field<Keys>) -> Result<Option<bool>, String> {
-                unread(field)
-            }
-            fn get_int(&self, field: &Field<Keys>) -> Result<Option<i64>, String> {
-                unread(field)
-            }
-            fn get_uint(&self, field: &Field<Keys>) -> Result<Option<u64>, String> {
-                unread(field)
-            }
-            fn get_double(&self, field: &Field<Keys>) -> Result<Option<f64>, String> {
-                unread(field)
-            }
-            fn get_enum(&self, field: &Field<Keys>) -> Result<Option<i32>, String> {
-                unread(field)
-            }
-            fn get_str<'f>(
+            fn get<'f, K: ValueKind<Keys>>(
                 &'f self,
                 field: &'f Field<Keys>,
-            ) -> Result<Option<Cow<'f, str>>, String> {
-                match self {
-                    Self::Inner(keys) => Ok(Some(Cow::Borrowed(if keys.valid { "a" } else { "" }))),
-                    Self::Nest(_) => unread(field),
-                }
-            }
-            fn get_bytes<'f>(
-                &'f self,
-                field: &'f Field<Keys>,
-            ) -> Result<Option<Cow<'f, [u8]>>, String> {
-                unread(field)
-            }
-            fn get_message<'f>(
-                &'f self,
-                field: &'f Field<Keys>,
-            ) -> Result<Option<KeysMessage<'f>>, String> {
-                unread(field)
-            }
-            fn get_list<'f>(
-                &'f self,
-                _field: &'f Field<Keys>,
-            ) -> Result<Option<Entries<'f>>, String> {
-                Ok(Some(Entries(None)))
-            }
-            fn get_map<'f>(
-                &'f self,
-                field: &'f Field<Keys>,
-            ) -> Result<Option<Entries<'f>>, String> {
-                match self {
-                    Self::Nest(keys) => Ok(Some(Entries(Some(keys)))),
-                    Self::Inner(_) => unread(field),
-                }
+            ) -> Result<Option<K::Value<'f>>, String> {
+                let value = match (K::ID, self) {
+                    (ValueKindId::Str, Self::Inner(keys)) => {
+                        Val::String(Cow::Borrowed(if keys.valid { "a" } else { "" }))
+                    }
+                    (ValueKindId::List, _) => Val::List(Entries(None)),
+                    (ValueKindId::Map, Self::Nest(keys)) => Val::Map(Entries(Some(keys))),
+                    _ => return unread(field),
+                };
+                Ok(K::from_val(value))
             }
             #[expect(unreachable_code, reason = "the hidden type must be named")]
             fn encode(&self) -> Result<impl AsRef<[u8]>, String> {

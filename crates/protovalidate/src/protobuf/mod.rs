@@ -37,9 +37,11 @@ use std::borrow::Cow;
 use std::ops::ControlFlow;
 
 mod field;
+pub mod kind;
 mod oneof;
 
 pub use field::{Field, Kind, Scalar, Singular};
+pub use kind::{ValueKind, ValueKindId};
 pub use oneof::{Oneof, which_oneof_by_has};
 
 /// The resolver for a runtime whose message and field types hold no data.
@@ -134,84 +136,29 @@ pub trait Message<R: Runtime> {
     /// The runtime could not tell.
     fn has(&self, field: &Field<R>) -> Result<bool, R::Error>;
 
-    /// The value of a `bool` field.
+    /// Reads a field as the kind `K`.
     ///
-    /// Each getter is only called for a field of its kind, as given by
-    /// [`Field::kind`]. It returns the type's default value when the field
-    /// is not set, and `None` when the message has no such field, as when
-    /// the runtime has an older schema than the validator.
+    /// The validator only calls this with the field's own kind, as given by
+    /// [`Field::kind`]. If the field is not set, the result is the default
+    /// value for its type, and an unset message, list or map is empty. If
+    /// the message has no such field, as when the runtime has an older
+    /// schema than the validator, the result is `None`. The returned value
+    /// may borrow from `field`, for example to refer to the message type
+    /// stored there.
     ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_bool(&self, field: &Field<R>) -> Result<Option<bool>, R::Error>;
-
-    /// The value of a signed integer field of any width or encoding,
-    /// widened to 64 bits.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_int(&self, field: &Field<R>) -> Result<Option<i64>, R::Error>;
-
-    /// The value of an unsigned integer field of any width or encoding,
-    /// widened to 64 bits.
+    /// An implementation typically matches on [`K::ID`](ValueKind::ID) and
+    /// passes the value it reads to the constructor for that kind, such as
+    /// [`ValueKind::from_double`]. Because `K::ID` is a constant for each
+    /// kind, only the matching arm is compiled. A runtime that reads every
+    /// field as a [`Val`] can call [`ValueKind::from_val`] instead.
     ///
     /// # Errors
     ///
     /// The runtime could not read the field.
-    fn get_uint(&self, field: &Field<R>) -> Result<Option<u64>, R::Error>;
-
-    /// The value of a `float` or `double` field, widened to `f64`.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_double(&self, field: &Field<R>) -> Result<Option<f64>, R::Error>;
-
-    /// The numeric value of an enum field.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_enum(&self, field: &Field<R>) -> Result<Option<i32>, R::Error>;
-
-    /// The value of a `string` field.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_str<'f>(&'f self, field: &'f Field<R>) -> Result<Option<Cow<'f, str>>, R::Error>;
-
-    /// The value of a `bytes` field.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_bytes<'f>(&'f self, field: &'f Field<R>) -> Result<Option<Cow<'f, [u8]>>, R::Error>;
-
-    /// The value of a singular message field, which is an empty message
-    /// when the field is not set. The returned message may borrow from
-    /// `field` to keep a reference to the message type stored there.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_message<'f>(&'f self, field: &'f Field<R>) -> Result<Option<R::Message<'f>>, R::Error>;
-
-    /// A repeated field, which is empty when the field is not set.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_list<'f>(&'f self, field: &'f Field<R>) -> Result<Option<R::List<'f>>, R::Error>;
-
-    /// A map field, which is empty when the field is not set.
-    ///
-    /// # Errors
-    ///
-    /// The runtime could not read the field.
-    fn get_map<'f>(&'f self, field: &'f Field<R>) -> Result<Option<R::Map<'f>>, R::Error>;
+    fn get<'f, K: ValueKind<R>>(
+        &'f self,
+        field: &'f Field<R>,
+    ) -> Result<Option<K::Value<'f>>, R::Error>;
 
     /// The field number of the member of `oneof` that is set, or `None` if
     /// no member is set. A number that is not one of its
@@ -287,32 +234,33 @@ pub trait Map<R: Runtime> {
 /// without key rules only needs its keys to describe a violation.
 pub type Key<'k, R> = &'k dyn Fn() -> Result<Val<'k, R>, <R as Runtime>::Error>;
 
-/// Reads a field of any kind as a [`Val`], using the typed getter for its
-/// kind. The validator uses this where it handles fields of any kind.
+/// Reads a field of any kind as a [`Val`], by calling [`Message::get`] with
+/// the field's kind. The validator uses this on the code paths that handle
+/// every kind of field.
 pub(crate) fn read<'f, R: Runtime>(
     message: &'f R::Message<'_>,
     field: &'f Field<R>,
 ) -> Result<Option<Val<'f, R>>, R::Error> {
     Ok(match field.kind() {
         Kind::Singular(Singular::Scalar(scalar)) => match scalar {
-            Scalar::Bool => message.get_bool(field)?.map(Val::Bool),
+            Scalar::Bool => message.get::<kind::Bool>(field)?.map(Val::Bool),
             Scalar::Int32
             | Scalar::Int64
             | Scalar::Sint32
             | Scalar::Sint64
             | Scalar::Sfixed32
-            | Scalar::Sfixed64 => message.get_int(field)?.map(Val::Int),
+            | Scalar::Sfixed64 => message.get::<kind::Int>(field)?.map(Val::Int),
             Scalar::Uint32 | Scalar::Uint64 | Scalar::Fixed32 | Scalar::Fixed64 => {
-                message.get_uint(field)?.map(Val::Uint)
+                message.get::<kind::Uint>(field)?.map(Val::Uint)
             }
-            Scalar::Float | Scalar::Double => message.get_double(field)?.map(Val::Double),
-            Scalar::String => message.get_str(field)?.map(Val::String),
-            Scalar::Bytes => message.get_bytes(field)?.map(Val::Bytes),
+            Scalar::Float | Scalar::Double => message.get::<kind::Double>(field)?.map(Val::Double),
+            Scalar::String => message.get::<kind::Str>(field)?.map(Val::String),
+            Scalar::Bytes => message.get::<kind::Bytes>(field)?.map(Val::Bytes),
         },
-        Kind::Singular(Singular::Enum) => message.get_enum(field)?.map(Val::Enum),
-        Kind::Singular(Singular::Message) => message.get_message(field)?.map(Val::Message),
-        Kind::List(_) => message.get_list(field)?.map(Val::List),
-        Kind::Map { .. } => message.get_map(field)?.map(Val::Map),
+        Kind::Singular(Singular::Enum) => message.get::<kind::Enum>(field)?.map(Val::Enum),
+        Kind::Singular(Singular::Message) => message.get::<kind::Message>(field)?.map(Val::Message),
+        Kind::List(_) => message.get::<kind::List>(field)?.map(Val::List),
+        Kind::Map { .. } => message.get::<kind::Map>(field)?.map(Val::Map),
     })
 }
 
@@ -322,7 +270,7 @@ pub(crate) mod testing {
     use std::convert::Infallible;
     use std::ops::ControlFlow;
 
-    use super::{Field, List, Map, Message, Reader, Resolver, Runtime, Val};
+    use super::{Field, List, Map, Message, Reader, Resolver, Runtime, Val, ValueKind};
 
     /// A runtime whose message types hold no data. It is its own resolver
     /// and reader.
@@ -361,52 +309,10 @@ pub(crate) mod testing {
             unreachable!("the test does not read a message")
         }
 
-        fn get_bool(&self, field: &Field<Untyped>) -> Result<Option<bool>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_int(&self, field: &Field<Untyped>) -> Result<Option<i64>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_uint(&self, field: &Field<Untyped>) -> Result<Option<u64>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_double(&self, field: &Field<Untyped>) -> Result<Option<f64>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_enum(&self, field: &Field<Untyped>) -> Result<Option<i32>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_str<'f>(
+        fn get<'f, K: ValueKind<Untyped>>(
             &'f self,
             field: &'f Field<Untyped>,
-        ) -> Result<Option<std::borrow::Cow<'f, str>>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_bytes<'f>(
-            &'f self,
-            field: &'f Field<Untyped>,
-        ) -> Result<Option<std::borrow::Cow<'f, [u8]>>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_message<'f>(
-            &'f self,
-            field: &'f Field<Untyped>,
-        ) -> Result<Option<Unread>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_list<'f>(&'f self, field: &'f Field<Untyped>) -> Result<Option<Unread>, Infallible> {
-            let _ = field;
-            unreachable!("the test does not read a message")
-        }
-        fn get_map<'f>(&'f self, field: &'f Field<Untyped>) -> Result<Option<Unread>, Infallible> {
+        ) -> Result<Option<K::Value<'f>>, Infallible> {
             let _ = field;
             unreachable!("the test does not read a message")
         }
